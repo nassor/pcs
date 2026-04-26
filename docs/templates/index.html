@@ -1,0 +1,299 @@
+{% extends "base.html" %}
+
+{% block title %}PCS — Distributed Batch Processing for Rust, on Apache Arrow{% endblock %}
+{% block description %}PCS is a distributed batch processing engine for Rust built on Apache Arrow. Zero-copy IPC, field-granular DAG scheduling, and Raft-backed distribution.{% endblock %}
+{% block og_title %}PCS — Distributed Batch Processing for Rust, on Apache Arrow{% endblock %}
+{% block og_description %}Zero-copy IPC, field-granular DAG scheduling, and wide-schema cache efficiency for distributed batch pipelines.{% endblock %}
+
+{% block content %}
+
+<section class="hero">
+    <h1 class="animate-in">PCS</h1>
+    <p class="subtitle tagline-lede animate-in">
+        Distributed Batch Processing for Rust, on Apache Arrow.
+    </p>
+    <p class="hero-lede animate-in">
+        Typed columnar pipelines with field-granular DAG scheduling, zero-copy IPC checkpoints,
+        and Raft-backed distribution &mdash; assembled from plain Rust <code>System</code> impls.
+    </p>
+
+    <div class="badges animate-in">
+        <a href="https://crates.io/crates/pcs-core"><img src="https://img.shields.io/crates/v/pcs-core.svg" alt="Crates.io version"></a>
+        <a href="https://docs.rs/pcs-core"><img src="https://docs.rs/pcs-core/badge.svg" alt="docs.rs"></a>
+        <a href="https://github.com/nassor/pcs/actions"><img src="https://github.com/nassor/pcs/workflows/CI/badge.svg" alt="CI status"></a>
+        <a href="https://github.com/nassor/pcs/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/pcs.svg" alt="License"></a>
+        <img src="https://img.shields.io/badge/rust-1.89%2B-blue.svg" alt="Rust 1.89+">
+    </div>
+</section>
+
+<h2 id="what-is-pcs">What is PCS?</h2>
+<p>
+    PCS is a distributed batch processing engine for Rust, built on Apache Arrow.
+    You write typed <code>System</code> impls that declare which Arrow fields they
+    read and write; PCS derives the execution order, runs independent stages in
+    parallel, retries with exponential backoff, and distributes work across nodes
+    with at-least-once semantics backed by Raft consensus.
+</p>
+<p>
+    The columnar layout pays off where it matters most: IPC serialization runs
+    4&ndash;19&times; faster than row-oriented equivalents, wide-schema projection
+    runs 2&ndash;3&times; faster from cache behavior alone, and distributed
+    checkpoint recovery inherits those gains directly.
+</p>
+
+<div class="positioning-grid">
+    <div class="positioning-col positioning-is">
+        <div class="positioning-label">PCS is</div>
+        <ul>
+            <li>A columnar transform engine for <strong>100k&ndash;100M row</strong> batches</li>
+            <li>A place for <strong>imperative Rust</strong> that SQL cannot express cleanly</li>
+            <li>Optimized for <strong>wide schemas</strong> (tens to hundreds of columns)</li>
+            <li>Built for workloads where <strong>distributed recovery time</strong> is a first-class constraint</li>
+        </ul>
+    </div>
+    <div class="positioning-col positioning-isnot">
+        <div class="positioning-label">PCS is not</div>
+        <ul>
+            <li>A <strong>SQL engine</strong> &mdash; no query planner; DataFusion will beat it on SQL</li>
+            <li>A <strong>sub-millisecond stream processor</strong> &mdash; batch-first by design</li>
+            <li>A <strong>game ECS</strong> &mdash; despite the columnar vocabulary</li>
+            <li>A replacement for row-oriented workflows under ~10k rows</li>
+        </ul>
+    </div>
+</div>
+
+<h2 id="model">The mental model</h2>
+<p>
+    Five concepts compose every PCS workload:
+</p>
+
+<div class="concept-grid">
+    <a href="{{ get_url(path='@/dataset.md') }}" class="concept-card">
+        <div class="concept-num">01</div>
+        <h3>Dataset</h3>
+        <p>An Arrow-backed columnar container. One <code>RecordBatch</code> per registered <code>Component</code>; all batches share the same row count. Append, soft-delete, compact, IPC round-trip.</p>
+    </a>
+    <a href="{{ get_url(path='@/systems.md') }}" class="concept-card">
+        <div class="concept-num">02</div>
+        <h3>System</h3>
+        <p>Processing logic. <code>SystemMeta</code> declares which <code>(component, field)</code> pairs the system reads and writes. PCS uses these declarations to schedule.</p>
+    </a>
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="concept-card">
+        <div class="concept-num">03</div>
+        <h3>Pipeline</h3>
+        <p>One Dataset + one set of Systems. Builds a field-level DAG, sorts into stages, runs with per-system retry. The unit of single-workload execution.</p>
+    </a>
+    <a href="{{ get_url(path='@/scheduler.md') }}" class="concept-card">
+        <div class="concept-num">04</div>
+        <h3>Scheduler</h3>
+        <p>Multi-pipeline orchestrator. Drives several independent <code>Pipeline</code>s &mdash; sequentially or concurrently &mdash; with optional dependency edges and backpressure.</p>
+    </a>
+    <a href="{{ get_url(path='@/distributed.md') }}" class="concept-card">
+        <div class="concept-num">05</div>
+        <h3>Distributed Runner</h3>
+        <p>Claims row-range partitions from a shared store, executes a Pipeline template against each batch, checkpoints via Arrow IPC, replicates state via Raft.</p>
+    </a>
+</div>
+
+<h2 id="features">Features</h2>
+<div class="feature-grid">
+    <div class="feature-card animate-in">
+        <div class="feature-icon" aria-hidden="true">&#9670;</div>
+        <h3>Zero-copy Arrow IPC</h3>
+        <p>Checkpoint writes and recovery use Arrow IPC &mdash; a contiguous buffer copy, not per-field dispatch. Benchmarked at <strong>4.4&times; faster encode</strong> and <strong>19&times; faster decode</strong> than postcard row-oriented equivalents at 1M rows.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon secondary" aria-hidden="true">&#9889;</div>
+        <h3>Wide-schema cache efficiency</h3>
+        <p>Columnar layout reads only the columns a system touches. A pipeline reading 3 of 50 columns loads <strong>24&nbsp;MB instead of 400&nbsp;MB</strong> per 1M rows &mdash; a 2.7&times; throughput advantage from cache behavior alone.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon accent" aria-hidden="true">&#9881;</div>
+        <h3>Field-granular DAG scheduling</h3>
+        <p>Systems declare reads and writes per Arrow field. PCS builds a dependency graph, places systems with disjoint writes into the same parallel stage, and topologically sorts execution automatically.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon" aria-hidden="true">&#9784;</div>
+        <h3>Composable <code>System</code> trait</h3>
+        <p>Each transform is an independent, testable Rust struct &mdash; or a closure via <code>system_fn</code>. Pipelines are assembled from systems, not configured via a query DSL.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon secondary" aria-hidden="true">&#9741;</div>
+        <h3>Distributed with Raft</h3>
+        <p>The <code>distributed</code> and <code>distributed-raft</code> features add a <code>RedbSharedStore</code> that coordinates partition assignment and checkpointing across nodes using an embedded openraft state machine.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon accent" aria-hidden="true">&#8644;</div>
+        <h3>Cross-stage zero-copy handoff</h3>
+        <p>Passing a <code>RecordBatch</code> between pipeline stages is an <code>Arc</code> clone &mdash; one atomic increment, no buffer copy.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon" aria-hidden="true">&#8635;</div>
+        <h3>Configurable retry</h3>
+        <p>Per-system <code>RetryMode::ExponentialBackoff</code> with max retries, base delay, multiplier, cap, and jitter &mdash; all set at pipeline construction time.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon secondary" aria-hidden="true">&#9673;</div>
+        <h3>Integrated <code>tracing</code></h3>
+        <p>Span-level instrumentation throughout the pipeline execution path under the <code>tracing</code> feature. Drops into any existing tracing subscriber.</p>
+    </div>
+    <div class="feature-card animate-in">
+        <div class="feature-icon accent" aria-hidden="true">&#10148;</div>
+        <h3>Production-ready service</h3>
+        <p>The <code>service</code> feature ships a <code>pcs-service</code> binary with TOML config, factory registry, axum HTTP control plane, and built-in standalone &amp; Raft cluster runners.</p>
+    </div>
+</div>
+
+<h2 id="getting-started">Getting Started</h2>
+<p>Add PCS to your <code>Cargo.toml</code>:</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-toml">[dependencies]
+pcs-core = { version = "0.1.0", features = ["io"] }
+arrow-array = "58.1"
+arrow-schema = "58.1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }</code></pre>
+</div>
+
+<h3 id="example">A complete example</h3>
+<p>
+    Two systems over a <code>Transaction</code> component: <code>ValidateSystem</code> writes
+    only the <code>valid</code> field; <code>EnrichSystem</code> writes only <code>usd_amount</code>.
+    Their writes are disjoint, so PCS places them in the same parallel stage automatically.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use std::sync::Arc;
+use arrow_array::{BooleanArray, Float64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use pcs_core::prelude::*;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Transaction {
+    id: u64,
+    amount: f64,
+    currency: String,
+    valid: bool,
+    usd_amount: f64,
+}
+
+impl Component for Transaction {
+    fn name() -> &'static str { "Transaction" }
+    fn schema() -> Arc&lt;Schema&gt; {
+        Arc::new(Schema::new(vec![
+            Field::new("id",         DataType::UInt64,  false),
+            Field::new("amount",     DataType::Float64, false),
+            Field::new("currency",   DataType::Utf8,    false),
+            Field::new("valid",      DataType::Boolean, false),
+            Field::new("usd_amount", DataType::Float64, false),
+        ]))
+    }
+}
+
+impl Transaction {
+    const AMOUNT:     FieldRef&lt;Self&gt; = FieldRef::new("amount");
+    const CURRENCY:   FieldRef&lt;Self&gt; = FieldRef::new("currency");
+    const VALID:      FieldRef&lt;Self&gt; = FieldRef::new("valid");
+    const USD_AMOUNT: FieldRef&lt;Self&gt; = FieldRef::new("usd_amount");
+}
+
+struct ValidateSystem;
+
+#[async_trait]
+impl System for ValidateSystem {
+    fn meta(&amp;self) -&gt; SystemMeta {
+        SystemMeta::new("validate")
+            .reads(Transaction::AMOUNT)
+            .writes(Transaction::VALID)
+    }
+
+    async fn run(&amp;self, data: &amp;mut Dataset) -&gt; PcsResult&lt;()&gt; {
+        let txns = data.view::&lt;Transaction&gt;()?;
+        let amount = txns.f64(Transaction::AMOUNT)?;
+        let flags: Vec&lt;bool&gt; = (0..txns.len())
+            .map(|i| amount.value(i) &gt; 0.0)
+            .collect();
+        // ... rebuild the RecordBatch with the new `valid` column
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    let mut pipeline = Pipeline::builder("etl")
+        .with::&lt;Transaction&gt;()
+        .with_system(ValidateSystem)
+        // .with_system(EnrichSystem)
+        // .with_system(ReportSystem)
+        .build();
+
+    pipeline.append::&lt;Transaction&gt;(&amp;seed_data())?;
+    pipeline.run().await?;
+
+    println!("processed {} rows", pipeline.data().rows());
+    Ok(())
+}
+
+fn seed_data() -&gt; Vec&lt;Transaction&gt; { /* ... */ vec![] }</code></pre>
+</div>
+
+<h3 id="run-it">Run an example</h3>
+<div class="getting-started-code">
+    <pre><code class="language-bash">cargo run --example scheduler_etl                 # field-granular ETL
+cargo run --example scheduler_etl_parallel        # parallel-system slices
+cargo run --example scheduler_parquet_etl         # Parquet source/sink
+cargo run --example distributed_scheduler --features distributed
+cargo run --example datafusion_interop --features datafusion</code></pre>
+</div>
+
+<h2 id="next-steps">Next steps</h2>
+<p>Dive deeper into each part of PCS:</p>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/dataset.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Dataset &amp; Components</h3>
+        <p>The columnar container, the <code>Component</code> trait, and how Arrow <code>RecordBatch</code>es are stored, appended, and soft-deleted.</p>
+    </a>
+    <a href="{{ get_url(path='@/systems.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Systems</h3>
+        <p>Implementing the <code>System</code> trait, declaring field-level access in <code>SystemMeta</code>, sync fast-path, and parallel slice systems.</p>
+    </a>
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Pipeline</h3>
+        <p>DAG construction, conflict rules, stage parallelism, per-system retry, and IO integration.</p>
+    </a>
+    <a href="{{ get_url(path='@/scheduler.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Scheduler</h3>
+        <p>Driving multiple independent <code>Pipeline</code>s with sequential or concurrent ticks, dependency edges, and backpressure.</p>
+    </a>
+    <a href="{{ get_url(path='@/io.md') }}" class="next-card">
+        <div class="next-card-label">I/O</div>
+        <h3>Sources &amp; Sinks</h3>
+        <p>Built-in Parquet, CSV, JSON Lines, and in-memory channel transports &mdash; plus the <code>Source</code> / <code>Sink</code> traits.</p>
+    </a>
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p><code>PartitionSource</code>, <code>CheckpointStore</code>, Raft-backed <code>RedbSharedStore</code>, and the at-least-once runner loop.</p>
+    </a>
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Service</h3>
+        <p>The production <code>pcs-service</code> binary: TOML config, factory registry, HTTP control plane, standalone &amp; cluster runners.</p>
+    </a>
+    <a href="{{ get_url(path='@/tracing.md') }}" class="next-card">
+        <div class="next-card-label">Observability</div>
+        <h3>Tracing</h3>
+        <p>Span-level instrumentation of pipeline execution under the <code>tracing</code> feature flag.</p>
+    </a>
+</div>
+{% endblock %}

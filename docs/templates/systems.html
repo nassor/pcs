@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+
+{% block title %}Systems — PCS{% endblock %}
+{% block description %}PCS's System trait: field-granular read/write declarations via SystemMeta, the system_fn closure helper, per-system retry, and the parallel slice fast-path.{% endblock %}
+{% block og_title %}Systems — PCS{% endblock %}
+{% block og_description %}PCS's System trait: field-granular read/write declarations via SystemMeta, the system_fn closure helper, per-system retry, and the parallel slice fast-path.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Systems</h1>
+<p class="subtitle animate-in">Typed processing units that declare exactly which Arrow fields they read and write.</p>
+
+<h2 id="trait">The System trait</h2>
+<p>
+    A <code>System</code> is the unit of processing logic. It carries metadata, optional config, and an async <code>run</code> method that operates on a mutable <code>Dataset</code>:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">#[async_trait]
+pub trait System: Send + Sync {
+    fn meta(&amp;self) -&gt; SystemMeta {
+        SystemMeta::new(std::any::type_name::&lt;Self&gt;())
+    }
+
+    fn config(&amp;self) -&gt; SystemConfig { SystemConfig::default() }
+
+    async fn run(&amp;self, data: &amp;mut Dataset) -&gt; PcsResult&lt;()&gt;;
+
+    /// Optional sync fast-path; default returns None.
+    fn run_sync(&amp;self, _data: &amp;mut Dataset) -&gt; Option&lt;PcsResult&lt;()&gt;&gt; { None }
+}</code></pre>
+</div>
+
+<h2 id="systemmeta">SystemMeta &mdash; field-level declarations</h2>
+<p>
+    <code>SystemMeta</code> declares what a system reads and writes at <code>(component, field)</code> granularity. The pipeline uses these declarations to build a DAG and place independent systems into the same parallel stage.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">SystemMeta::new("enrich")
+    .reads(Transaction::AMOUNT)         // typed FieldRef variant
+    .reads(Transaction::CURRENCY)
+    .writes(Transaction::USD_AMOUNT)
+    .read_resource::&lt;FxRates&gt;()
+    .write_resource::&lt;Report&gt;();</code></pre>
+</div>
+
+<p>
+    The string-based variants are useful when the field name is dynamic or when you don&rsquo;t want to commit to <code>FieldRef</code> constants:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">SystemMeta::new("rebalance")
+    .read("Order", "amount")
+    .write("Order", "total")
+    .read_component("Inventory")        // expands to all fields
+    .write_component("Audit");</code></pre>
+</div>
+
+<h2 id="conflicts">Conflict rules &amp; stage placement</h2>
+<p>
+    For two systems A (registered first) and B, PCS adds an edge B &rarr; A whenever:
+</p>
+<ol>
+    <li>A writes field <em>F</em>, B reads <em>F</em> &mdash; <strong>read-after-write</strong>.</li>
+    <li>A reads <em>F</em>, B writes <em>F</em> &mdash; <strong>write-after-read</strong>.</li>
+    <li>A writes <em>F</em>, B writes <em>F</em> &mdash; <strong>write-write</strong>.</li>
+    <li>Resource conflicts: same as above but at <code>TypeId</code> granularity (whole resource).</li>
+</ol>
+<p>
+    Disjoint writes pay nothing. Two systems that write different fields of the same component end up in the same stage with no edge between them.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-text">Stage 0:  IngestSystem      writes_component("Transaction")
+Stage 1:  ValidateSystem    reads "amount", writes "valid"
+          EnrichSystem      reads "amount" + "currency", writes "usd_amount"
+                            (disjoint writes → same stage, runs in parallel)
+Stage 2:  ReportSystem      reads "valid" and "usd_amount"</code></pre>
+</div>
+
+<h2 id="impl">Implementing a System</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use std::sync::Arc;
+use arrow_array::BooleanArray;
+use async_trait::async_trait;
+use pcs_core::prelude::*;
+
+struct ValidateSystem;
+
+#[async_trait]
+impl System for ValidateSystem {
+    fn meta(&amp;self) -&gt; SystemMeta {
+        SystemMeta::new("validate")
+            .reads(Transaction::AMOUNT)
+            .writes(Transaction::VALID)
+    }
+
+    async fn run(&amp;self, data: &amp;mut Dataset) -&gt; PcsResult&lt;()&gt; {
+        let batch = data
+            .columns::&lt;Transaction&gt;()
+            .ok_or_else(|| PcsError::generic("Transaction not registered"))?
+            .clone();
+
+        let flags: Vec&lt;bool&gt; = {
+            let txns = data.view::&lt;Transaction&gt;()?;
+            let amount = txns.f64(Transaction::AMOUNT)?;
+            (0..txns.len()).map(|i| amount.value(i) &gt; 0.0).collect()
+        };
+
+        // Replace the `valid` column with the freshly computed array.
+        let new_valid = Arc::new(BooleanArray::from(flags));
+        let schema = batch.schema();
+        let valid_idx = schema.index_of("valid").unwrap();
+        let cols: Vec&lt;_&gt; = (0..schema.fields().len())
+            .map(|i| if i == valid_idx { new_valid.clone() as _ } else { batch.column(i).clone() })
+            .collect();
+
+        let new_batch = arrow_array::RecordBatch::try_new(schema, cols)
+            .map_err(|e| PcsError::generic(format!("rebuild: {e}")))?;
+
+        data.replace_batch::&lt;Transaction&gt;(new_batch)?;
+        Ok(())
+    }
+}</code></pre>
+</div>
+
+<h2 id="system-fn">The system_fn closure helper</h2>
+<p>
+    For one-off systems &mdash; data ingestion, reporting, ad-hoc transforms &mdash; <code>system_fn</code> wraps a closure into a <code>System</code> with explicit metadata:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">let load = system_fn(
+    SystemMeta::new("load").write_component("Transaction"),
+    |data: &amp;mut Dataset| {
+        let rows = vec![
+            Transaction { id: 1, amount: 100.0, ..Default::default() },
+            Transaction { id: 2, amount: 250.0, ..Default::default() },
+        ];
+        data.append::&lt;Transaction&gt;(&amp;rows)?;
+        Ok(())
+    },
+);
+
+pipeline.add_system(load);</code></pre>
+</div>
+
+<h2 id="retry">Retry configuration</h2>
+<p>
+    Each system can return its own <code>SystemConfig</code> from <code>config()</code>. The pipeline wraps every <code>run</code> call in the system&rsquo;s configured retry strategy.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">impl System for FlakyApiCall {
+    fn config(&amp;self) -&gt; SystemConfig {
+        SystemConfig::new(RetryMode::ExponentialBackoff {
+            max_retries:   5,
+            base_delay_ms: 100,
+            multiplier:    2.0,
+            max_delay_ms:  30_000,
+            jitter:        0.2,
+        })
+    }
+    // ... meta() and run()
+}</code></pre>
+</div>
+
+<p>
+    Other modes: <code>RetryMode::None</code> (one-shot) and <code>RetryMode::Fixed { max_retries, delay_ms }</code>. The default for systems that don&rsquo;t override <code>config()</code> is exponential backoff with 3 retries.
+</p>
+
+<h2 id="parallel">ParallelSystem &mdash; slice-level parallelism</h2>
+<p>
+    For systems that scan a dataset and produce per-row outputs, <code>ParallelSystem</code> exposes a read-only <code>run</code> that returns a <code>WriteSet</code>. The pipeline can split the dataset into slices, run multiple parallel systems concurrently across them, and merge their <code>WriteSet</code>s back into the dataset.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">#[async_trait]
+impl ParallelSystem for ScoreSystem {
+    fn meta(&amp;self) -&gt; SystemMeta {
+        SystemMeta::new("score")
+            .reads(Transaction::AMOUNT)
+            .writes(Transaction::SCORE)
+    }
+
+    async fn run(&amp;self, data: &amp;Dataset) -&gt; PcsResult&lt;WriteSet&gt; {
+        let txns = data.view::&lt;Transaction&gt;()?;
+        let amount = txns.f64(Transaction::AMOUNT)?;
+        let scores: Vec&lt;f64&gt; = (0..txns.len())
+            .map(|i| amount.value(i).log10())
+            .collect();
+
+        let mut ws = WriteSet::new();
+        ws.set_column::&lt;Transaction&gt;("score", Arc::new(Float64Array::from(scores)));
+        Ok(ws)
+    }
+}
+
+pipeline.add_parallel_system(ScoreSystem);</code></pre>
+</div>
+
+<p>
+    See <code>cargo run --example scheduler_etl_parallel</code> for a working slice-parallel pipeline.
+</p>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Pipeline</h3>
+        <p>Bring systems and a dataset together; let PCS build the DAG, sort into stages, and run with retry.</p>
+    </a>
+    <a href="{{ get_url(path='@/scheduler.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Scheduler</h3>
+        <p>Orchestrate multiple independent pipelines from one process &mdash; sequentially or concurrently.</p>
+    </a>
+</div>
+{% endblock %}

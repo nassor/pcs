@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+
+{% block title %}Sources & Sinks — PCS{% endblock %}
+{% block description %}PCS's I/O layer: Source and Sink traits with Parquet, CSV, JSON Lines, and in-memory channel transports for getting Arrow data into and out of pipelines.{% endblock %}
+{% block og_title %}Sources & Sinks — PCS{% endblock %}
+{% block og_description %}PCS's I/O layer: Source and Sink traits with Parquet, CSV, JSON Lines, and in-memory channel transports.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Sources &amp; Sinks</h1>
+<p class="subtitle animate-in">Pull Arrow data into a <code>Pipeline</code>, push it out &mdash; in Arrow-native format, end to end.</p>
+
+<h2 id="overview">Overview</h2>
+<p>
+    The <code>io</code> feature adds two traits and a small registry of built-in implementations:
+</p>
+<ul>
+    <li><strong><code>Source</code></strong> &mdash; produces a stream of <code>RecordBatch</code>es to be appended to a registered component.</li>
+    <li><strong><code>Sink</code></strong> &mdash; consumes a stream of <code>RecordBatch</code>es from a component, in append-only fashion, with a <code>finish</code> hook for flush/close.</li>
+</ul>
+<p>
+    Both traits are async. The pipeline integrates them via <code>drain_into_dataset</code> (run sources before systems) and <code>drain_dataset</code> (run sinks after).
+</p>
+
+<h2 id="source">The Source trait</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">#[async_trait]
+pub trait Source: Send + Sync {
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
+    async fn next_batch(&amp;mut self) -&gt; PcsResult&lt;Option&lt;RecordBatch&gt;&gt;;
+    fn estimated_rows(&amp;self) -&gt; Option&lt;usize&gt; { None }
+}</code></pre>
+</div>
+
+<h2 id="sink">The Sink trait</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">#[async_trait]
+pub trait Sink: Send {
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
+    async fn write_batch(&amp;mut self, batch: &amp;RecordBatch) -&gt; PcsResult&lt;()&gt;;
+    async fn finish(&amp;mut self) -&gt; PcsResult&lt;()&gt;;
+    fn pending_rows(&amp;self) -&gt; Option&lt;usize&gt; { None }
+}</code></pre>
+</div>
+
+<h2 id="builtins">Built-in implementations</h2>
+<table class="rule-table">
+    <thead>
+        <tr><th>Format</th><th>Source</th><th>Sink</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Parquet</td><td><code>ParquetSource</code></td><td><code>ParquetSink</code></td>
+            <td>The fastest path. Uses Arrow&rsquo;s native Parquet reader/writer with the <code>parquet</code> crate.</td>
+        </tr>
+        <tr>
+            <td>CSV</td><td><code>CsvSource</code></td><td>&mdash;</td>
+            <td>Schema-on-read with type inference; slower than Parquet, fine for small files.</td>
+        </tr>
+        <tr>
+            <td>JSON Lines</td><td>&mdash;</td><td><code>JsonLinesSink</code></td>
+            <td>One JSON object per row per line. Useful for human-debuggable output.</td>
+        </tr>
+        <tr>
+            <td>Channel</td><td><code>ChannelSource</code></td><td><code>ChannelSink</code></td>
+            <td>In-memory <code>tokio::sync::mpsc</code> bridge. Use to wire a pipeline to another async task.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="parquet-example">Parquet example</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::prelude::*;
+use pcs_core::io::{ParquetSource, ParquetSink};
+
+#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    let mut pipeline = Pipeline::builder("etl")
+        .with::&lt;Trade&gt;()
+        .with_source("Trade", ParquetSource::open("input.parquet")?)
+        .with_sink  ("Trade", ParquetSink::create("output.parquet", Trade::schema())?)
+        .with_system(EnrichTradeSystem)
+        .build();
+
+    // Drains source → runs systems → drains to sink → calls Sink::finish().
+    pipeline.run_with_io().await?;
+    Ok(())
+}</code></pre>
+</div>
+
+<p>
+    See <code>cargo run --example scheduler_parquet_etl</code> for a full Parquet-source/Parquet-sink pipeline.
+</p>
+
+<h2 id="custom-source">Implementing a custom Source</h2>
+<p>
+    Anything that produces Arrow <code>RecordBatch</code>es can be a source. Here&rsquo;s a minimal example that yields a single batch from a hard-coded slice of structs:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use std::sync::Arc;
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
+use async_trait::async_trait;
+use pcs_core::io::Source;
+use pcs_core::PcsResult;
+
+struct InMemorySource&lt;C: Component + Serialize&gt; {
+    schema: Arc&lt;Schema&gt;,
+    batches: std::vec::IntoIter&lt;Vec&lt;C&gt;&gt;,
+}
+
+#[async_trait]
+impl&lt;C: Component + Serialize + Send + Sync&gt; Source for InMemorySource&lt;C&gt; {
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt; { self.schema.clone() }
+
+    async fn next_batch(&amp;mut self) -&gt; PcsResult&lt;Option&lt;RecordBatch&gt;&gt; {
+        let Some(rows) = self.batches.next() else { return Ok(None) };
+        Ok(Some(C::to_record_batch(&amp;rows)?))
+    }
+}</code></pre>
+</div>
+
+<h2 id="manual-drain">Driving sources and sinks manually</h2>
+<p>
+    If you don&rsquo;t want to attach IO to the pipeline itself, the helpers <code>drain_into_dataset</code> and <code>drain_dataset</code> let you wire a source or sink to any <code>Dataset</code>:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::io::{drain_into_dataset, drain_dataset, ParquetSource, ParquetSink};
+
+let mut data = Dataset::new();
+data.register_component::&lt;Trade&gt;()?;
+
+let mut src  = ParquetSource::open("input.parquet")?;
+let mut sink = ParquetSink::create("output.parquet", Trade::schema())?;
+
+let n_in  = drain_into_dataset(&amp;mut src, &amp;mut data, "Trade").await?;
+// ... mutate `data` ...
+let n_out = drain_dataset(&amp;data, "Trade", &amp;mut sink).await?;
+sink.finish().await?;</code></pre>
+</div>
+
+<h2 id="datafusion">DataFusion interop (feature = "datafusion")</h2>
+<p>
+    The <code>datafusion</code> feature implies <code>io</code> and adds adapters that let you use a PCS <code>Dataset</code> as a DataFusion <code>TableProvider</code>, or expose a DataFusion <code>SendableRecordBatchStream</code> as a <code>Source</code>. Useful for combining SQL queries with imperative Rust transforms.
+</p>
+<p>
+    See <code>cargo run --example datafusion_interop --features datafusion</code>.
+</p>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p>Scale a single pipeline across nodes with Raft-replicated partition coordination and Arrow IPC checkpoints.</p>
+    </a>
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Service</h3>
+        <p>The production <code>pcs-service</code> binary with TOML config, source/sink factories, and an HTTP control plane.</p>
+    </a>
+</div>
+{% endblock %}

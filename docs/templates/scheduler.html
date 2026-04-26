@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block title %}Scheduler — PCS{% endblock %}
+{% block description %}PCS's Scheduler orchestrates multiple independent Pipelines from one process — sequentially or concurrently, with optional dependency edges and backpressure.{% endblock %}
+{% block og_title %}Scheduler — PCS{% endblock %}
+{% block og_description %}PCS's Scheduler orchestrates multiple independent Pipelines from one process.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Scheduler</h1>
+<p class="subtitle animate-in">A multi-pipeline orchestrator. Drives several independent <code>Pipeline</code>s from one process, sequentially or concurrently.</p>
+
+<h2 id="overview">Overview</h2>
+<p>
+    <code>Pipeline</code> is the unit of one workload. <code>Scheduler</code> is the unit of many. It owns a <code>Vec&lt;Pipeline&gt;</code> and provides two tick modes plus dependency edges between pipelines.
+</p>
+<p>
+    Each pipeline owns its own <code>Dataset</code> &mdash; there is no shared mutable state between pipelines. That makes parallel execution trivially sound: <code>tick_parallel</code> just calls <code>Pipeline::run</code> on every pipeline concurrently via <code>futures::try_join_all</code>.
+</p>
+
+<h2 id="add-pipelines">Adding pipelines</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::prelude::*;
+
+let mut sched = Scheduler::new();
+
+// Pipeline 1: ingest raw transactions.
+let ingest = Pipeline::builder("ingest")
+    .with::&lt;Transaction&gt;()
+    .with_system(IngestSystem)
+    .build();
+sched.add_pipeline(ingest);
+
+// Pipeline 2: produce daily reports.
+let report = Pipeline::builder("report")
+    .with::&lt;Transaction&gt;()
+    .with_system(ReportSystem)
+    .build();
+sched.add_pipeline(report);</code></pre>
+</div>
+
+<h2 id="tick-modes">Tick modes</h2>
+<p>
+    A <em>tick</em> runs every pipeline once. Choose a mode based on what you&rsquo;re optimizing for:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">// Sequential — pipelines run in registration order, one after another.
+// Easiest to reason about; preferred when pipelines are fast or when
+// deterministic ordering matters for logging/metrics.
+sched.tick().await?;
+
+// Concurrent — pipelines run in parallel within each scheduling stage.
+// Preferred when pipelines are IO-heavy or CPU-bound and independent.
+sched.tick_parallel().await?;</code></pre>
+</div>
+
+<h2 id="dependencies">Dependencies between pipelines</h2>
+<p>
+    <code>add_pipeline_with_config</code> attaches a <code>PipelineConfig</code> describing dependency edges, priority, and optional backpressure. Edges express two semantics:
+</p>
+<ul>
+    <li><code>DependencyKind::Order</code> &mdash; B runs after A in the same tick.</li>
+    <li><code>DependencyKind::Data</code> &mdash; B runs after A <em>and</em> is skipped if A produced zero rows. Useful when B has nothing to do unless A appended new data.</li>
+</ul>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::DependencyKind;
+
+sched.add_pipeline_with_config(
+    enrich,
+    PipelineConfig::new()
+        .after("ingest", DependencyKind::Data)   // skip if ingest is empty
+        .priority(10),
+);
+
+sched.add_pipeline_with_config(
+    report,
+    PipelineConfig::new()
+        .after("enrich", DependencyKind::Order), // always run, but after enrich
+);</code></pre>
+</div>
+
+<p>
+    Dependency edges define a DAG over pipelines (much like <code>SystemMeta</code> defines one over systems within a single pipeline). <code>tick_parallel</code> respects the DAG: independent pipelines run concurrently; dependents wait.
+</p>
+
+<h2 id="getting-pipelines">Inspecting pipelines</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">// All pipelines, in registration order.
+for p in sched.pipelines() {
+    let stats = p.last_stats();
+    println!("{:&lt;12} {:&gt;6} systems  {:&gt;6} ms",
+        p.name(), stats.systems_run, stats.duration_millis);
+}
+
+// Lookup by name (immutable or mutable).
+if let Some(p) = sched.get_mut("ingest") {
+    p.append::&lt;Transaction&gt;(&amp;new_rows)?;
+}</code></pre>
+</div>
+
+<h2 id="full-example">Full example</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::prelude::*;
+
+#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    let mut sched = Scheduler::new();
+
+    sched.add_pipeline(
+        Pipeline::builder("ingest")
+            .with::&lt;Transaction&gt;()
+            .with_system(IngestSystem)
+            .build(),
+    );
+
+    sched.add_pipeline_with_config(
+        Pipeline::builder("enrich")
+            .with::&lt;Transaction&gt;()
+            .with_system(ValidateSystem)
+            .with_system(EnrichSystem)
+            .build(),
+        PipelineConfig::new().after("ingest", DependencyKind::Data),
+    );
+
+    sched.add_pipeline_with_config(
+        Pipeline::builder("report")
+            .with::&lt;Transaction&gt;()
+            .with_system(ReportSystem)
+            .build(),
+        PipelineConfig::new().after("enrich", DependencyKind::Order),
+    );
+
+    // Drive a few ticks; each respects the dependency DAG.
+    for _ in 0..3 {
+        sched.tick_parallel().await?;
+    }
+
+    Ok(())
+}</code></pre>
+</div>
+
+<h2 id="when">When to use Scheduler vs. just a Pipeline</h2>
+<table class="rule-table">
+    <thead><tr><th>Use</th><th>When</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><strong>Just a Pipeline</strong></td>
+            <td>You have a single workload. Stage parallelism inside the pipeline already runs systems concurrently.</td>
+        </tr>
+        <tr>
+            <td><strong>Scheduler</strong></td>
+            <td>You have several independent workloads (different schemas or different cadences) that should share a process &mdash; e.g. an ingest pipeline that runs continuously plus a reporting pipeline that runs every 5 minutes.</td>
+        </tr>
+        <tr>
+            <td><strong>Distributed Runner</strong></td>
+            <td>You have a single workload but want it to run across multiple nodes with at-least-once semantics and crash recovery. See <a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a>.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/io.md') }}" class="next-card">
+        <div class="next-card-label">I/O</div>
+        <h3>Sources &amp; Sinks</h3>
+        <p>Plug pipelines into Parquet, CSV, JSON, or in-memory channel transports.</p>
+    </a>
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p>Scale a single pipeline template across nodes with Raft-replicated coordination.</p>
+    </a>
+</div>
+{% endblock %}

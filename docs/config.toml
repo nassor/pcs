@@ -1,0 +1,19 @@
+base_url = "https://nassor.github.io/pcs"
+title = "PCS Documentation"
+description = "Distributed Batch Processing for Rust, on Apache Arrow."
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+
+# Output to docs/public so GitHub Pages workflow can upload it.
+output_dir = "public"
+
+# Pretty URLs (default true): /world.md → /world/
+[markdown]
+render_emoji = false
+
+[extra]
+github_repo = "https://github.com/nassor/pcs"
+crates_io = "https://crates.io/crates/pcs"
+docs_rs = "https://docs.rs/pcs"

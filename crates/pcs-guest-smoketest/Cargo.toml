@@ -1,0 +1,38 @@
+[package]
+name = "pcs-guest-smoketest"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+publish = false
+description = "Minimal pcs-guest consumer used as a build fixture and Arrow IPC round-trip fixture."
+
+# This crate exists to verify:
+#   1. `cargo component build -p pcs-guest-smoketest --target wasm32-wasip2`
+#      produces a valid WebAssembly component against the pcs-pipeline world.
+#   2. The `export_pipeline!` macro in pcs-guest expands cleanly against
+#      cargo-component-generated `crate::bindings`.
+#   3. arrow-ipc stays pinned at the exact workspace version between host and
+#      guest (enforced via the workspace dep graph — this crate IS a workspace
+#      member, so the pin propagates).
+#
+# On the host target, the `export_pipeline!` invocation is gated behind
+# `#[cfg(target_arch = "wasm32")]` in src/lib.rs, so `cargo check --workspace`
+# compiles this as an empty cdylib — no reference to `crate::bindings` exists
+# on the host target and the crate stays green in the normal workspace build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcs-guest      = { path = "../pcs-guest" }
+serde          = { workspace = true }
+# cargo-component generates src/bindings.rs against the WIT target and requires
+# this runtime crate at link time. Matches cargo-component 0.21.1 template.
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "pcs:smoketest"
+
+[package.metadata.component.target]
+path = "../pcs-guest/wit"
+world = "pcs-pipeline"

@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+      branches: [ "main" ]
+  pull_request:
+      branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+        components: rustfmt, clippy
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it
+    # needs `examples/wasm/order_processing/src/bindings.rs` on disk even
+    # though the host build never compiles it. cargo-component generates the
+    # file as part of a wasm32-wasip2 build.
+    - name: Install wasm32-wasip2 target
+      run: rustup target add wasm32-wasip2
+
+    - name: Install cargo-component
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component
+
+    - name: Generate WASM bindings
+      run: cargo component build -p order-processing-wasm --target wasm32-wasip2
+
+    # Generated bindings ship unformatted; normalize before the workspace-wide
+    # fmt check so `--check` only fails on hand-written code.
+    - name: Pre-format generated bindings
+      run: rustfmt examples/wasm/order_processing/src/bindings.rs
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build
+      run: cargo build
+
+    - name: Check benchmarks
+      run: cargo check --benches
+
+    - name: Check examples
+      run: cargo check --examples
+
+    - name: Run tests
+      run: cargo test --lib
+
+    - name: Run doctests
+      run: cargo test --doc
+
+  wasm_guest:
+    name: WASM Guest (wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-wasm-guest-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check pcs-core for wasm32-wasip2
+      run: bash scripts/check-wasm-guest.sh
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@cargo-audit
+    
+    - name: Run security audit
+      run: cargo audit

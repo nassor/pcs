@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+
+{% block title %}Distributed Runner — PCS{% endblock %}
+{% block description %}PCS's DistributedRunner coordinates row-range claims, Arrow IPC checkpoints, and Raft-replicated shared state across nodes for at-least-once batch processing.{% endblock %}
+{% block og_title %}Distributed Runner — PCS{% endblock %}
+{% block og_description %}At-least-once batch processing across instances, backed by Raft-replicated shared state.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Distributed Runner</h1>
+<p class="subtitle animate-in">At-least-once batch processing across instances, backed by an embedded redb store and (optionally) Raft-replicated coordination.</p>
+
+<h2 id="overview">Overview</h2>
+<p>
+    The distributed runner takes a <code>Pipeline</code> as a template and runs it against many partitions of data spread across instances. The mechanics are:
+</p>
+<ol>
+    <li>An instance calls <code>PartitionSource::claim_next_batch</code> to lease a row-range partition.</li>
+    <li>It reconstructs a <code>Dataset</code> for the partition (via a user-provided <code>world_factory</code> closure).</li>
+    <li>It calls <code>Pipeline::run_on(&amp;mut partition_dataset)</code> &mdash; the template&rsquo;s own data, sources, and sinks are <em>never</em> used.</li>
+    <li>Between (configurable) stages, it persists Arrow IPC checkpoints via <code>CheckpointStore::save_checkpoint</code>.</li>
+    <li>On success it acks the claim; on crash, the lease expires and another instance picks the partition up, optionally resuming from the latest checkpoint.</li>
+</ol>
+<p>
+    The runner is feature-gated. Plain <code>distributed</code> gives you the traits, redb-backed store, and runner. Adding <code>distributed-raft</code> wires the store&rsquo;s state machine to openraft so coordination state is replicated across nodes.
+</p>
+
+<h2 id="building-blocks">Building blocks</h2>
+<table class="rule-table">
+    <thead><tr><th>Type</th><th>Role</th></tr></thead>
+    <tbody>
+        <tr><td><code>PartitionSource</code></td><td>Claims, renews, acks, and releases row-range batches across instances. Lease-based to handle crashes.</td></tr>
+        <tr><td><code>CheckpointStore</code></td><td>Persists Arrow IPC snapshots keyed by <code>(claim_id, stage_idx)</code> for crash recovery.</td></tr>
+        <tr><td><code>RedbSharedStore</code></td><td>Implements both traits over <a href="https://github.com/cberner/redb">redb</a>. Single-node mode applies state directly; cluster mode proposes through a Raft channel.</td></tr>
+        <tr><td><code>DistributedRunner</code></td><td>The driver. Holds a pipeline template, a runtime, and a <code>RunnerConfig</code>. <code>run(world_factory)</code> loops until exhausted.</td></tr>
+        <tr><td><code>RunnerConfig</code></td><td><code>instance_id</code>, <code>checkpoint_strategy</code>, <code>schema_id</code>, <code>max_batches</code>, lease renewal interval.</td></tr>
+        <tr><td><code>CheckpointStrategy</code></td><td>How often to checkpoint: <code>EveryStage</code>, <code>EveryNStages(n)</code>, or <code>None</code>.</td></tr>
+    </tbody>
+</table>
+
+<h2 id="single-node">Single-node example</h2>
+<p>
+    The simplest setup uses one process, one redb file, and a single instance running its own coordinator. There is no Raft, but the same code works in cluster mode by switching the store constructor.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use std::sync::Arc;
+use uuid::Uuid;
+
+use pcs_core::prelude::*;
+use pcs_service::distributed::{
+    DistributedRunner, RunnerConfig, CheckpointStrategy, RedbSharedStore,
+};
+
+#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    // 1. Open the shared redb store.
+    let store = RedbSharedStore::open("/tmp/pcs.redb")?;
+
+    // 2. Register a master batch — the data this runner will partition over.
+    let trades: Vec&lt;Trade&gt; = load_trades_from_parquet("/data/trades.parquet")?;
+    let batch = Trade::to_record_batch(&amp;trades)?;
+    let mut buf = Vec::new();
+    arrow_ipc::writer::FileWriter::try_new(&amp;mut buf, &amp;Trade::schema())?
+        .write(&amp;batch)?;
+    store.register_master_batch(/*schema_id=*/ 1, "Trade", buf).await?;
+
+    // 3. Build the pipeline template.
+    let template = Pipeline::builder("trade-processor")
+        .with::&lt;Trade&gt;()
+        .with_system(ValidateTradeSystem)
+        .with_system(EnrichTradeSystem)
+        .build();
+
+    // 4. Drive the runner.
+    let mut runner = DistributedRunner::new(
+        store,
+        Box::new(template),
+        RunnerConfig {
+            instance_id: Uuid::new_v4(),
+            checkpoint_strategy: CheckpointStrategy::EveryStage,
+            schema_id: 1,
+            max_batches: None,
+            lease_renewal_check_interval_millis: 250,
+            ..Default::default()
+        },
+    );
+
+    // For each claim, the runner asks `world_factory` to produce a fresh
+    // Dataset and copies the partition's IPC snapshot into it before running.
+    let processed = runner.run(|| Dataset::new()).await?;
+    println!("processed {} batches", processed);
+    Ok(())
+}</code></pre>
+</div>
+
+<h2 id="checkpoints">Checkpoints &amp; recovery</h2>
+<p>
+    Checkpoints serialize the partition&rsquo;s <code>Dataset</code> after a stage completes and persist the bytes via <code>CheckpointStore</code>. If the instance crashes mid-pipeline, the next claim of the same partition restores the latest checkpoint and resumes from the next stage.
+</p>
+<p>
+    Three policies trade durability against throughput:
+</p>
+<ul>
+    <li><code>EveryStage</code> &mdash; safest; one fsync per stage.</li>
+    <li><code>EveryNStages(n)</code> &mdash; tunable; pick <code>n</code> based on stage cost.</li>
+    <li><code>None</code> &mdash; fastest; on crash, the entire partition replays from scratch.</li>
+</ul>
+
+<h2 id="cluster">Cluster mode (feature = "distributed-raft")</h2>
+<p>
+    The <code>distributed-raft</code> feature replaces the single-node store with a Raft-coordinated one. Two redb files back the cluster:
+</p>
+<ul>
+    <li><strong>Log file</strong> &mdash; written by <code>ArrowRedbLogStore</code>, openraft&rsquo;s <code>RaftLogStorage</code> implementation.</li>
+    <li><strong>State machine file</strong> &mdash; written by <code>ArrowRedbStateMachine</code>, applying <code>ConsensusCommand</code> ops.</li>
+</ul>
+<p>
+    A <code>ConsensusCommand</code> is the deterministic op type proposed via Raft &mdash; claim, renew, ack, release, register-batch, save-checkpoint. The leader serializes ops, replicates them to followers, and applies them to the redb state machine on commit.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_service::distributed::{
+    ArrowRaftDriver, ArrowRaftDriverConfig, TcpNetworkFactory, PcsTypeConfig,
+};
+
+let driver = ArrowRaftDriver::new(ArrowRaftDriverConfig {
+    node_id: 1,
+    listen_addr: "0.0.0.0:7001".parse()?,
+    log_db_path:   "/var/lib/pcs/raft-log.redb".into(),
+    state_db_path: "/var/lib/pcs/state-machine.redb".into(),
+    ..Default::default()
+}).await?;
+
+let store = RedbSharedStore::with_raft(driver.handle()).await?;
+// ... same pipeline template, same runner.run(...) call as single-node.</code></pre>
+</div>
+
+<p>
+    Network framing is length-prefixed TCP (<code>TcpNetworkFactory</code> &rarr; <code>TcpNetwork</code>), so adding nodes only requires reachable TCP ports.
+</p>
+
+<h2 id="examples">Examples</h2>
+<table class="rule-table">
+    <thead><tr><th>Example</th><th>What it shows</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><code>distributed_scheduler.rs</code></td>
+            <td>Single-node <code>DistributedRunner</code> over <code>RedbSharedStore</code>, with IPC serialization end-to-end.</td>
+        </tr>
+        <tr>
+            <td><code>distributed_windowed.rs</code></td>
+            <td>Distributed windowed aggregation with checkpoint recovery between window stages.</td>
+        </tr>
+        <tr>
+            <td><code>distributed_fulfillment/</code></td>
+            <td>Multi-file order fulfillment example exercising claim/ack/checkpoint flow under Raft.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Service</h3>
+        <p>The production <code>pcs-service</code> binary that wires standalone or cluster runners to a TOML config and HTTP control plane.</p>
+    </a>
+    <a href="{{ get_url(path='@/tracing.md') }}" class="next-card">
+        <div class="next-card-label">Observability</div>
+        <h3>Tracing</h3>
+        <p>Span-level instrumentation for runner ticks, claim lifecycles, and Raft proposals.</p>
+    </a>
+</div>
+{% endblock %}

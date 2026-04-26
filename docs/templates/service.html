@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+
+{% block title %}Service — PCS{% endblock %}
+{% block description %}The pcs-service binary: TOML configuration, factory registry, axum HTTP control plane, and built-in standalone & Raft cluster runners.{% endblock %}
+{% block og_title %}Service — PCS{% endblock %}
+{% block og_description %}The pcs-service binary: TOML configuration, factory registry, axum HTTP control plane, and built-in runners.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Service</h1>
+<p class="subtitle animate-in">The production <code>pcs-service</code> binary: TOML config, factory registry, HTTP control plane, and built-in standalone &amp; Raft cluster runners.</p>
+
+<h2 id="overview">Overview</h2>
+<p>
+    The <code>service</code> feature ships a runnable binary along with a small framework for plugging custom systems, components, sources, and sinks into a TOML-driven service. It implies <code>io</code>, <code>distributed</code>, <code>distributed-raft</code>, and <code>tracing</code>.
+</p>
+<p>
+    Two top-level modes:
+</p>
+<ul>
+    <li><strong><code>standalone</code></strong> &mdash; a single instance with a local redb store. Good for simple deployments and testing.</li>
+    <li><strong><code>cluster</code></strong> (feature = "service-cluster") &mdash; a Raft-coordinated cluster of instances sharing partition assignment and checkpoint state.</li>
+</ul>
+
+<h2 id="install">Install &amp; build</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-bash">cargo install --path crates/pcs-service --features service-cluster
+# or, build from source:
+cargo build --release --bin pcs-service --features service-cluster</code></pre>
+</div>
+
+<h2 id="config">TOML configuration</h2>
+<p>
+    A <code>ServiceConfig</code> describes the mode, registered components and resources, the pipeline DAG, and optional sources / sinks. The control plane (<code>[http]</code>) is always available.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-toml">mode = "standalone"
+
+[http]
+bind = "0.0.0.0:8080"
+
+[[components]]
+name = "Trade"
+
+[[components.schema]]
+name = "id"
+type = "u64"
+
+[[components.schema]]
+name = "amount"
+type = "f64"
+
+[[components.schema]]
+name = "currency"
+type = "utf8"
+
+[[components.schema]]
+name = "usd_amount"
+type = "f64"
+
+[[pipelines]]
+name = "enrich"
+
+[[pipelines.systems]]
+name = "ValidateTradeSystem"
+
+[[pipelines.systems]]
+name = "EnrichTradeSystem"
+
+[pipelines.systems.config]
+fx_provider = "ecb_daily"
+
+[[pipelines.sources]]
+component = "Trade"
+type = "parquet"
+path = "/data/in/trades.parquet"
+
+[[pipelines.sinks]]
+component = "Trade"
+type = "parquet"
+path = "/data/out/trades.parquet"</code></pre>
+</div>
+
+<h2 id="factories">Plugging in your own types</h2>
+<p>
+    The TOML refers to systems, components, sources, and sinks by name. To map names to your own implementations, register factories on the <code>ServiceBuilder</code> before calling <code>build()</code>.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_service::service::{ServiceBuilder, ServiceConfig};
+
+let config: ServiceConfig =
+    toml::from_str(&amp;std::fs::read_to_string("service.toml")?)?;
+
+let service = ServiceBuilder::from_config(config)
+    .register_component_factory("Trade",    Box::new(TradeFactory))
+    .register_system_factory   ("ValidateTradeSystem", Box::new(ValidateFactory))
+    .register_system_factory   ("EnrichTradeSystem",   Box::new(EnrichFactory))
+    .register_source_factory   ("parquet", Box::new(ParquetSourceFactory))
+    .register_sink_factory     ("parquet", Box::new(ParquetSinkFactory))
+    .build()?;
+
+service.run().await?;</code></pre>
+</div>
+
+<p>
+    Each factory takes a <code>toml::Value</code> &mdash; the <code>config</code> field from the TOML &mdash; and returns a boxed instance of the corresponding trait. Built-in factories for Parquet, CSV, and JSON Lines are registered automatically.
+</p>
+
+<h2 id="cli">CLI</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-bash"># Single-node:
+pcs-service serve --config service.toml
+
+# Validate config without starting:
+pcs-service validate --config service.toml
+
+# Inspect a running instance:
+pcs-service status --server http://localhost:8080
+
+# Cluster lifecycle (requires service-cluster feature):
+pcs-service cluster init   --config cluster.toml --node-id 1
+pcs-service cluster join   --server http://leader:8081 --node-id 2
+pcs-service cluster leave  --server http://leader:8081 --node-id 2
+pcs-service cluster status --server http://leader:8081</code></pre>
+</div>
+
+<h2 id="http">HTTP control plane</h2>
+<table class="rule-table">
+    <thead><tr><th>Endpoint</th><th>Returns</th></tr></thead>
+    <tbody>
+        <tr><td><code>GET /health</code></td><td>200 if the process is up; cheap liveness probe.</td></tr>
+        <tr><td><code>GET /ready</code></td><td>200 once the service has loaded config and registered factories. Use as Kubernetes readiness probe.</td></tr>
+        <tr><td><code>GET /metrics</code></td><td>Prometheus exposition format. Pipeline durations, retry counts, claim lifecycles, Raft term/leader.</td></tr>
+        <tr><td><code>GET /status</code></td><td>JSON snapshot of pipeline state, last <code>RunStats</code>, claim ledger, current Raft membership.</td></tr>
+    </tbody>
+</table>
+
+<h2 id="cluster-deploy">Deploying a cluster</h2>
+<p>
+    A 3-node Raft cluster is the typical production target. Start the leader with <code>cluster init</code>, then have followers <code>cluster join</code> against the leader&rsquo;s control-plane URL. Each node needs:
+</p>
+<ul>
+    <li>A unique <code>node_id</code>.</li>
+    <li>A reachable Raft TCP listen address (default 7001).</li>
+    <li>Two redb files: log store + state machine. Pre-create the parent directory.</li>
+</ul>
+<p>
+    See the operations guide for full deployment steps, capacity planning, and runbooks for common failure scenarios.
+</p>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p>The runtime sitting underneath the service: claims, checkpoints, and Raft replication.</p>
+    </a>
+    <a href="{{ get_url(path='@/tracing.md') }}" class="next-card">
+        <div class="next-card-label">Observability</div>
+        <h3>Tracing</h3>
+        <p>Span-level instrumentation that lights up automatically when the service starts.</p>
+    </a>
+</div>
+{% endblock %}

@@ -1,0 +1,66 @@
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "tmp/data"
+
+[run_mode]
+kind = "one_shot"
+
+[pipeline.wasm]
+module = "../pcs-example-pipeline/target/wasm32-wasip1/release/pcs_example_pipeline.wasm"
+watch = false
+
+[pipeline.wasm.config]
+tax_rate = "0.1"
+
+[[sources]]
+name = "orders_in"
+type = "CsvSource"
+target_component = "Order"
+
+[sources.config]
+path = "./tmp/data/orders.csv"
+has_headers = true
+
+[[sources.config.schema_fields]]
+name = "id"
+type = "UInt64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "tax"
+type = "Float64"
+nullable = false
+
+[[sinks]]
+name = "orders_out"
+type = "CsvSink"
+source_component = "Order"
+
+[sinks.config]
+path = "./tmp/data/orders_out.csv"
+has_headers = true
+
+[[sinks.config.schema_fields]]
+name = "id"
+type = "UInt64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "tax"
+type = "Float64"
+nullable = false
+
+[http]
+bind = "0.0.0.0:8080"

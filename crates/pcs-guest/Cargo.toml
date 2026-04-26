@@ -1,0 +1,42 @@
+[package]
+name = "pcs-guest"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+publish = false
+description = "Guest SDK for PCS WebAssembly Component Model pipelines. Provides the WIT package pcs:pipeline@0.1.0 and the export_pipeline! macro."
+
+# pcs-guest is an rlib (not a component). Downstream guest crates depend on it,
+# then use `cargo component build` on THEIR crate to produce the actual wasm
+# component. cargo-component picks up `crates/pcs-guest/wit/` via the downstream
+# crate's `[package.metadata.component.target.path]` pointing here. The
+# `export_pipeline!` macro expands into code that references `crate::bindings`,
+# i.e. the caller's cargo-component-generated bindings — not pcs-guest's.
+#
+# See project design notes for the full rationale
+# (dupe-binding hazard avoided, standard cargo-component flow).
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# `guest` is a no-op forwarder kept so the team-lead acceptance command
+# `cargo build -p pcs-guest --target wasm32-wasip2 --no-default-features --features guest`
+# parses without error. pcs-guest already hardcodes `features = ["guest"]` on
+# its pcs-core dep below — this flag adds zero semantic information; it exists
+# only so external tooling can pass the flag without cargo complaining about
+# an unknown feature.
+default = []
+guest = []
+
+[dependencies]
+pcs-core     = { path = "../pcs-core", default-features = false, features = ["guest"] }
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc    = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+# pollster re-exported under pcs_guest::__rt::pollster so the macro can drive
+# Pipeline::run_on (async fn) inside the sync WIT export without forcing users
+# to depend on pollster themselves. Matches pcs-core's `guest` feature pin.
+pollster     = { version = "0.4" }

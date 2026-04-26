@@ -1,0 +1,140 @@
+# PCS cluster service configuration — uses only built-in factories.
+# Three-node Raft cluster with at-least-once processing semantics.
+# Each node runs with its own PCS_NODE_ID and PCS_DATA_DIR env vars.
+#
+# HOW TO VALIDATE (does not start a cluster):
+#   PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
+#   cargo run --features service --bin pcs-service -- validate \
+#     --config examples/configs/cluster.toml
+#
+# HOW TO RUN A 3-NODE CLUSTER (requires three terminals or a process manager):
+#   Terminal 1:
+#     PCS_NODE_ID=1 PCS_BOOTSTRAP=true PCS_DATA_DIR=/tmp/pcs-node-1 \
+#     cargo run --features service --bin pcs-service -- serve \
+#       --config examples/configs/cluster.toml
+#   Terminal 2:
+#     PCS_NODE_ID=2 PCS_DATA_DIR=/tmp/pcs-node-2 \
+#     cargo run --features service --bin pcs-service -- serve \
+#       --config examples/configs/cluster.toml
+#   Terminal 3:
+#     PCS_NODE_ID=3 PCS_DATA_DIR=/tmp/pcs-node-3 \
+#     cargo run --features service --bin pcs-service -- serve \
+#       --config examples/configs/cluster.toml
+#
+# NOTE: In cluster mode, [[sources]] must NOT be declared. The cluster runner
+# ingests via the PartitionSource distributed pull mechanism — batches are
+# registered by a separate producer or via the admin API. Declaring sources
+# here will cause validation to fail with a clear error message.
+#
+# BUILT-IN FACTORIES USED:
+#   component: GenericComponent — schema-forward component declared in TOML
+#   sinks:     CsvSink         — writes output rows to CSV files
+#   sources:   (none)          — cluster mode uses PartitionSource
+#   systems:   (none)          — add your own via a custom binary
+
+# mode: cluster enables the distributed Raft runner.
+mode = "cluster"
+
+# bootstrap: true on the initial cluster bring-up when data_dir is empty.
+# Set to false for nodes joining an already-bootstrapped cluster.
+# NOTE: env-var placeholder is unquoted because `bootstrap` is a bool — the
+# substituted text becomes `bootstrap = false`. Until substitution runs at
+# load time the file is not strict-TOML; treat it as a template.
+bootstrap = "${PCS_BOOTSTRAP:-false}"
+
+# Raft timing parameters.
+# Invariant: lease_ttl_ms >= 3 * election_timeout_ms
+lease_ttl_ms = 30000          # 30 s  (30000 >= 3 * 1500 = 4500 ✓)
+election_timeout_ms = 1500    # 1.5 s
+heartbeat_interval_ms = 300   # 300 ms — must be < election_timeout_ms
+snapshot_log_interval = 10000 # snapshot every 10 000 committed log entries
+
+[node]
+# id is a u64 — env-var placeholder is unquoted (substitutes to a bare integer).
+id = "${PCS_NODE_ID}"            # 1, 2, or 3 — set per-instance via env var
+name = "pcs-node-${PCS_NODE_ID}"
+data_dir = "${PCS_DATA_DIR:-/tmp/pcs-cluster}"
+
+# All cluster members, including this node. IDs must match node.id values.
+# Each peer.addr is the Raft transport address (not the HTTP control-plane port).
+[[peers]]
+id = 1
+addr = "10.0.0.1:9000"
+
+[[peers]]
+id = 2
+addr = "10.0.0.2:9000"
+
+[[peers]]
+id = 3
+addr = "10.0.0.3:9000"
+
+# GenericComponent declares the columnar schema the pipeline operates on.
+[[pipeline.components]]
+name = "events"
+type = "GenericComponent"
+
+[[pipeline.components.config.fields]]
+name = "event_id"
+type = "Int64"
+nullable = false
+
+[[pipeline.components.config.fields]]
+name = "event_type"
+type = "Utf8"
+nullable = true
+
+[[pipeline.components.config.fields]]
+name = "payload"
+type = "Utf8"
+nullable = true
+
+# Systems run in DAG order. No built-in processing systems ship with
+# pcs-service — register your own via a custom binary.
+pipeline.systems = []
+
+# [[sources]] entries must be ABSENT in cluster mode.
+# The cluster runner ingests through PartitionSource (distributed pull), not
+# the Source trait used by standalone sources.  Adding entries here causes
+# ServiceConfig::validate() to return an error.
+
+# Sinks write processed rows out. CsvSink is built-in.
+# In a real cluster deployment you would likely use a user-defined sink
+# (e.g. KafkaSink, PostgresSink) registered in a custom binary.
+# NOTE: CsvSink opens (creates) the output file immediately when the factory is
+# built — including during `pcs-service validate`.  The parent directory must
+# exist.  The path below writes directly to /tmp to avoid a missing-dir error.
+# In production, use a stable path and ensure the directory is pre-created.
+[[sinks]]
+name = "csv_events_out"
+type = "CsvSink"
+source_component = "events"
+
+[sinks.config]
+path = "/tmp/pcs-cluster-events-out.csv"
+has_headers = true
+
+[[sinks.config.schema_fields]]
+name = "event_id"
+type = "Int64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "event_type"
+type = "Utf8"
+nullable = true
+
+[[sinks.config.schema_fields]]
+name = "payload"
+type = "Utf8"
+nullable = true
+
+# HTTP control plane — each node binds its own port.
+[http]
+bind = "0.0.0.0:8080"
+disabled = false
+
+# Logging — use JSON for structured log aggregators (Loki, CloudWatch, etc.).
+[observability]
+log_format = "json"
+log_level = "${LOG_LEVEL:-info}"

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block title %}Page Not Found — PCS{% endblock %}
+{% block description %}The requested page could not be found in the PCS documentation.{% endblock %}
+
+{% block content %}
+<section class="hero">
+    <h1>404</h1>
+    <p class="subtitle">Page not found.</p>
+    <p><a href="{{ get_url(path='/') }}">Back to home →</a></p>
+</section>
+{% endblock %}

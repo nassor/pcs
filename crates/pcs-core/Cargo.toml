@@ -1,0 +1,75 @@
+[package]
+name = "pcs-core"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Core columnar processing types for PCS: Dataset, Pipeline, System, Scheduler."
+license = "AGPL-3.0-only"
+
+[features]
+default = ["runtime"]
+# Full async runtime: tokio + rayon parallelism. Enabled by default; disable for wasm guest builds.
+runtime = ["dep:tokio", "dep:rayon", "dep:num_cpus"]
+# Guest feature: wasm32-wasip2 target; sequential-only execution, pollster sync executor.
+guest = ["dep:pollster"]
+tracing = ["dep:tracing"]
+windows = []
+io = ["runtime"]
+distributed = ["runtime"]
+
+[dependencies]
+arrow-array   = { workspace = true }
+arrow-schema  = { workspace = true }
+arrow-buffer  = { workspace = true }
+arrow-select  = { workspace = true }
+arrow-cast    = { workspace = true }
+arrow-arith   = { workspace = true }
+arrow-ord     = { workspace = true }
+arrow-ipc     = { workspace = true }
+serde_arrow   = { workspace = true }
+async-trait   = { workspace = true }
+tokio         = { workspace = true, optional = true }
+futures       = { workspace = true }
+serde         = { workspace = true }
+tracing       = { workspace = true, optional = true }
+rayon         = { workspace = true, optional = true }
+num_cpus      = { workspace = true, optional = true }
+pollster      = { version = "0.4", optional = true }
+fnv           = { workspace = true }
+rand          = { workspace = true }
+
+[dev-dependencies]
+criterion    = { workspace = true }
+postcard     = { workspace = true }
+serde        = { workspace = true }
+tokio        = { workspace = true }
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc    = { workspace = true }
+tempfile     = "3.27.0"
+sha3         = { workspace = true }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "parallelism"
+harness = false
+
+[[bench]]
+name = "parallelism_compute"
+harness = false
+
+[[bench]]
+name = "tpch_q1"
+harness = false
+
+[[bench]]
+name = "tpch_q6"
+harness = false
+
+[[bench]]
+name = "ipc_checkpoint"
+harness = false

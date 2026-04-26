@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+
+{% block title %}Dataset & Components — PCS{% endblock %}
+{% block description %}PCS's Dataset stores one Arrow RecordBatch per registered Component. Register components, append rows, read columns, soft-delete, compact, and serialize via IPC.{% endblock %}
+{% block og_title %}Dataset & Components — PCS{% endblock %}
+{% block og_description %}PCS's Dataset stores one Arrow RecordBatch per registered Component. Register components, append rows, read columns, soft-delete, compact, and serialize via IPC.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Dataset &amp; Components</h1>
+<p class="subtitle animate-in">A columnar container that stores one Arrow <code>RecordBatch</code> per registered component, plus typed Rust singletons.</p>
+
+<h2 id="overview">Overview</h2>
+<p>
+    A <code>Dataset</code> is the unit of data inside PCS. It owns:
+</p>
+<ul>
+    <li>One Arrow <code>RecordBatch</code> per registered <code>Component</code>. All batches share the same row count, so any <code>Row</code> index is valid across every component.</li>
+    <li>A <code>SchemaRegistry</code> that records the schema and version of every registered component.</li>
+    <li>A <code>ResourceMap</code> &mdash; a <code>TypeId</code>-keyed map of arbitrary Rust singletons that live alongside the columns.</li>
+    <li>An alive bitmap, so rows can be soft-deleted with <code>mark_dead</code> and removed in bulk by <code>compact</code>.</li>
+</ul>
+<p>
+    A <code>Pipeline</code> wraps a <code>Dataset</code> together with a set of <code>System</code>s, but you can use a <code>Dataset</code> on its own for ad-hoc data manipulation.
+</p>
+
+<h2 id="component">The Component trait</h2>
+<p>
+    A <code>Component</code> is any Rust type that names itself and provides an Arrow <code>Schema</code>. Serialization to and from <code>RecordBatch</code> goes through <code>serde_arrow</code>, so deriving <code>Serialize</code> + <code>Deserialize</code> is enough for most types.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use std::sync::Arc;
+use arrow_schema::{DataType, Field, Schema};
+use pcs_core::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Price {
+    symbol: String,
+    value: f64,
+}
+
+impl Component for Price {
+    fn name() -&gt; &amp;'static str { "Price" }
+
+    fn schema() -&gt; Arc&lt;Schema&gt; {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8,    false),
+            Field::new("value",  DataType::Float64, false),
+        ]))
+    }
+}</code></pre>
+</div>
+
+<p>
+    Optionally, declare typed <code>FieldRef</code> constants on your component. Systems use them to declare access in <code>SystemMeta</code>, and <code>ComponentView</code> uses them to fetch typed columns &mdash; both with no runtime cost beyond a string compare.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">impl Price {
+    pub const SYMBOL: FieldRef&lt;Price&gt; = FieldRef::new("symbol");
+    pub const VALUE:  FieldRef&lt;Price&gt; = FieldRef::new("value");
+}</code></pre>
+</div>
+
+<h2 id="register-and-append">Register and append</h2>
+<p>
+    Components must be registered before any rows are appended. Registration validates the schema and reserves a slot for the component&rsquo;s <code>RecordBatch</code>.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">let mut data = Dataset::new();
+data.register_component::&lt;Price&gt;()?;
+
+let rows = vec![
+    Price { symbol: "AAPL".into(), value: 150.0 },
+    Price { symbol: "MSFT".into(), value: 300.0 },
+    Price { symbol: "GOOG".into(), value: 2_800.0 },
+];
+
+let range: std::ops::Range&lt;Row&gt; = data.append::&lt;Price&gt;(&amp;rows)?;
+assert_eq!(data.rows(), 3);</code></pre>
+</div>
+
+<p>
+    Or use the builder for a fluent setup with components, resources, and systems all wired in one chain. The same <code>DatasetBuilder</code> is also used by <code>PipelineBuilder</code> under the hood.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">let data = Dataset::builder()
+    .with::&lt;Price&gt;()
+    .with::&lt;Volume&gt;()
+    .with_resource(MarketCalendar::default())
+    .build();</code></pre>
+</div>
+
+<h2 id="reading">Reading columns</h2>
+<p>
+    Three patterns, increasing in ergonomics:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">// 1. Raw Arrow access — useful for batch-level operations
+let batch: &amp;RecordBatch  = data.columns::&lt;Price&gt;().expect("registered");
+let value: &amp;ArrayRef     = data.column::&lt;Price&gt;("value").expect("field");
+
+// 2. Typed view — borrowing the batch and exposing typed accessors
+let prices = data.view::&lt;Price&gt;()?;
+let value = prices.f64(Price::VALUE)?;
+let symbol = prices.str(Price::SYMBOL)?;
+for i in 0..prices.len() {
+    println!("{} = {}", symbol.value(i), value.value(i));
+}
+
+// 3. Decode back into Rust structs (allocates) — for small batches
+let restored: Vec&lt;Price&gt; = Price::from_record_batch(batch)?;</code></pre>
+</div>
+
+<p>
+    <code>ComponentView</code> exposes typed accessors named after the Arrow data type: <code>f64(...)</code>, <code>i64(...)</code>, <code>u64(...)</code>, <code>bool(...)</code>, <code>str(...)</code>, and so on. They return concrete Arrow array types like <code>&amp;Float64Array</code>, so you index directly without downcasting.
+</p>
+
+<h2 id="lifecycle">Soft delete &amp; compaction</h2>
+<p>
+    Marking a row dead is O(1) &mdash; it flips a bit in the alive bitmap. The row stays in the underlying Arrow buffers until you call <code>compact</code>, which filters every component&rsquo;s <code>RecordBatch</code> in one pass.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">data.mark_dead(Row::new(0));
+assert!(!data.is_alive(Row::new(0)));
+assert_eq!(data.live_rows(), data.rows() - 1);
+
+if data.should_compact() {
+    data.compact()?;  // invalidates existing Row indices
+}</code></pre>
+</div>
+
+<p>
+    <strong>Important:</strong> compaction renumbers rows. Don&rsquo;t hold a <code>Row</code> across a compaction unless you&rsquo;ve recomputed it.
+</p>
+
+<h2 id="resources">Resources</h2>
+<p>
+    Resources are arbitrary Rust singletons stored in the dataset, keyed by <code>TypeId</code>. They&rsquo;re not columnar &mdash; use them for things like configuration values, FX-rate tables, lookup caches, or summary outputs.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">struct FxRates { eur: f64, gbp: f64 }
+
+data.insert_resource(FxRates { eur: 1.08, gbp: 1.27 });
+
+let rates = data.get_resource::&lt;FxRates&gt;().expect("inserted");
+assert_eq!(rates.eur, 1.08);
+
+// Mutable access requires &amp;mut Dataset
+data.get_resource_mut::&lt;FxRates&gt;().unwrap().gbp = 1.30;</code></pre>
+</div>
+
+<p>
+    Systems can declare resource access too:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">SystemMeta::new("convert")
+    .read_resource::&lt;FxRates&gt;()    // shared resource read
+    .write_resource::&lt;Report&gt;();   // exclusive resource write</code></pre>
+</div>
+
+<p>
+    Resource conflicts in the DAG are at <code>TypeId</code> granularity (whole resource, not field-level). Two systems writing the same resource type are forced into different stages.
+</p>
+
+<h2 id="ipc">Arrow IPC round-trip</h2>
+<p>
+    A <code>Dataset</code> serializes to Arrow IPC &mdash; the same format the distributed runner uses for checkpoints. Encode is a contiguous buffer write; decode is zero-copy from a borrowed byte slice.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">// Encode
+let mut buf = Vec::new();
+data.write_ipc(&amp;mut buf)?;
+
+// Decode
+let restored = Dataset::read_ipc(&amp;buf)?;
+assert_eq!(restored.rows(), data.rows());</code></pre>
+</div>
+
+<p>
+    Resources are not part of the IPC payload &mdash; only the columnar component data is. Re-attach resources after decoding.
+</p>
+
+<h2 id="row-type">The Row type</h2>
+<p>
+    A <code>Row</code> is a transparent <code>u32</code> wrapper used as a stable index into the dataset&rsquo;s columnar storage. <code>append</code> returns a <code>Range&lt;Row&gt;</code> covering the rows you just inserted.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">let range = data.append::&lt;Price&gt;(&amp;rows)?;
+for row in range.clone() {
+    if /* some condition */ true {
+        data.mark_dead(row);
+    }
+}</code></pre>
+</div>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/systems.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Systems</h3>
+        <p>Declare field-level access in <code>SystemMeta</code> and let PCS schedule disjoint writes into the same parallel stage.</p>
+    </a>
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Pipeline</h3>
+        <p>Wrap a Dataset and a list of Systems; PCS builds the DAG, sorts into stages, and runs with retry.</p>
+    </a>
+</div>
+{% endblock %}

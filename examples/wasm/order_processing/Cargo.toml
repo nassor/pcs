@@ -1,0 +1,28 @@
+[package]
+name = "order-processing-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+publish = false
+description = "WASM Component Model port of the scheduler_etl example. Demonstrates field-granular DAG scheduling running inside a WASM guest via pcs-guest."
+
+# This is a guest pipeline component, NOT a binary. cargo-component wraps the
+# cdylib into a valid Component Model component targeting the pcs-pipeline
+# world from pcs-guest's WIT package.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcs-guest      = { path = "../../../crates/pcs-guest" }
+serde          = { workspace = true }
+# cargo-component generates src/bindings.rs against the WIT target and
+# requires this runtime crate at link time.
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "pcs:order-processing"
+
+[package.metadata.component.target]
+path = "../../../crates/pcs-guest/wit"
+world = "pcs-pipeline"

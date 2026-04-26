@@ -1,0 +1,33 @@
+# rust-coder Agent Memory
+
+- [Canudo ECS Rewrite](project_ecs_rewrite.md) — ECS rewrite completed on ecs-rewrite branch; new module structure and API
+- [Phase 2 ArrowWorld](project_phase2_arrowworld.md) — Arrow-backed world under src/arrow/; design decisions and benchmark results for Phase 3 coders
+- [Phase 3 ArrowSystem+Pipeline](project_phase3_arrow_pipeline.md) — ArrowSystem trait, ArrowPipeline with field-level DAG scheduling; key design decisions recorded
+- [Phase 4 Parallelism](project_phase4_parallelism.md) — ParallelArrowSystem, WriteSet, slice parallelism; critical diagnosis: sqrt workload is DRAM-bound, not compute-bound
+- [Phase 5 IO Layer](project_phase5_io_layer.md) — Source/Sink traits, format impls, CastingSource, pipeline run_with_io; key gotchas (Mutex for ParquetSink, ?Sized bounds)
+- [Phase 6 Distributed](project_phase6_distributed.md) — Arrow-IPC distributed layer; feature flags, redb borrow pattern, 1 MiB cap, lease semantics, 289 tests passing
+- [Phase 7 Benchmarks](project_phase7_benchmarks.md) — TPC-H Q1/Q6, SHA-256 parallelism, IPC checkpoint, DataFusion comparison; actual numbers for Phase 8 README
+- [Phase 8 Promotion](project_phase8_promotion.md) — ECS path deleted, Arrow path at src/, Arrow* prefixes gone, version 1.0.0-alpha.1; 172 tests, migration guide written
+- [Service S3 Config](project_service_s3_config.md) — ServiceConfig YAML schema; ServiceMode flatten pattern, serde_yaml::Value for opaque configs, env-var substitution, validation rules
+- [Service S4 Registry+Builder](project_s4_service_builder.md) — Registry traits, ServiceBuilder, BuiltService; Box::leak for static names, BuiltSystem enum, Box<dyn Source> not Debug gotcha
+- [Service S5 Standalone Runner](project_s5_standalone_runner.md) — run_standalone loop, StandaloneStats, BurstSource test helper, World::clear behavior, ChannelSource EOF gotcha
+- [Service S7 HTTP+Shutdown](project_s7_http_shutdown.md) — axum 0.8 control plane, ShutdownCoordinator, init_logging, PrometheusHandle sharing, StandaloneStats from standalone.rs
+- [Service S8 CLI+Binary](project_s8_cli_binary.md) — pcs-service binary (was canudo-service), serde_yaml_ng swap, doc test alias pattern, integration tests with libc SIGTERM
+- [Pipeline Soundness Fixes](project_pipeline_soundness.md) — Arc<dyn ParallelSystem>, indexed DAG O(n·k), structured RetryExhausted, blocking sleep for backoff
+- [Task #28 Raft SM Secondary Index](project_task28_raft_sm_index.md) — CLAIMS_BY_BATCH 24-byte key secondary index; two-phase claim; O(k) overlap check; transport.rs latent errors fixed
+- [Phase 1 Windows](project_phase1_windows.md) — WindowedSystem builder API, Phase 1 Sum/Float64 constraint, integration test import gotcha (need `use pcs::system::System`)
+- [Phase 2e Streaming Semantics](project_phase2e_streaming.md) — WatermarkState, WindowContext, SideOutput<DroppedLate>, late re-firing FSM, .allowed_lateness() builder; key gotchas: classify-then-advance, side_output in WindowResults not world resource
+- [Phase 2c Distributed Checkpointing](project_phase2c_checkpointing.md) — WindowAccumulator component, accumulator_store helpers, KeyPartition, runner integration; ACCUMULATOR_STAGE_SENTINEL=u32::MAX, write_component_ipc
+- [Pass 2 World→Pipeline Rename](project_rename_pass2.md) — World→Pipeline (src/pipeline.rs), Scheduler at src/scheduler.rs; PipelineSpec/pipeline: YAML preserved; IPC key is now __pcs_component
+- [Canudo→PCS Rename](project_rename_pcs.md) — Full project rename; PcsError/PcsResult, pcs-service binary, __pcs_component IPC key, PCS_ env vars, all metrics renamed
+- [Source Tree Reorg Phases 1–5](project_reorg_source_tree.md) — Final flat-sibling layout for dataset/, pipeline/, system/; test count baseline 479/55; visibility rules and doc-fix gotchas
+- [Schema Versioning (Task #19)](project_phase_schema_versioning.md) — Component::version/migrate, SchemaEntry, IPC __pcs_schema_version, fingerprint, service layer threading
+- [Scheduler V2 (Task #20)](project_scheduler_v2.md) — DependencyKind, BackpressureSpec, PipelineConfig, RunStats, Kahn topo sort, pending_rows; key gotchas on closure Debug and cfg-gated enum variants
+- [Hardening Tasks #7+#8](project_hardening_tasks7_8.md) — BatchClaim+Instant, should_renew math fix, background renewal pattern, atomic Parquet write, graceful shutdown
+- [Task #14 WasmPipelineRuntime Scope](project_task14_wasm_scope.md) — Standalone WASM only; KeyPartition excluded; distributed+WASM is a future phase owned by dist-expert
+- [Task #14 bindgen! Layout Sketch](project_task14_bindgen_sketch.md) — wasmtime 43 component::bindgen! module layout for pcs-service/src/wasm/; 5-file structure, Store reuse, Mutex pattern, spawn_blocking scope
+- [Task #14 wasmtime host integration](project_task14_wasm_host.md) — wasm/ module landed; HasSelf pattern, TypesHost gotcha, OnceLock for names, epoch ticker needs tokio::test
+- [Workspace Manifest Atomicity](feedback_manifest_atomicity.md) — [[bench]]/[[bin]]/[[example]] entries must be removed atomically with file moves; never leave stale entries that block other agents
+- [No Unilateral Cross-Task Edits](feedback_cross_task_edits.md) — compile errors touching another agent's in-flight task design surface: stop, SendMessage owner+team-lead, wait for ack before editing
+- [Task #11 RuntimeHolder Escape Hatch](project_task11_runtime_holder.md) — BuiltService refactor: RuntimeHolder enum, 4 escape hatches, native_parts_mut disjoint borrow pattern, flush_sinks split
+- [Phase 3 Host Service Layer Complete](project_phase3_host_complete.md) — Tasks #11,#14,#15,#16,#17 shipped; PipelineRuntime trait+template_dataset, WASM host, ServiceBuilder rewrite, 3-gate validation; 306 tests

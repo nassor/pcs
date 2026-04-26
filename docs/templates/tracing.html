@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block title %}Tracing — PCS{% endblock %}
+{% block description %}Turn on the tracing feature to get span-level instrumentation for pipelines, stages, systems, retries, and distributed runner events.{% endblock %}
+{% block og_title %}Tracing — PCS{% endblock %}
+{% block og_description %}Span-level instrumentation across pipeline, stage, system, retry, and runner boundaries.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Tracing</h1>
+<p class="subtitle animate-in">Span-level instrumentation for every pipeline, stage, system, retry, and distributed-runner boundary &mdash; under the <code>tracing</code> feature flag.</p>
+
+<h2 id="enable">Enabling the feature</h2>
+<div class="getting-started-code">
+    <pre><code class="language-toml">[dependencies]
+pcs-core = { version = "0.1.0", features = ["tracing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }</code></pre>
+</div>
+
+<p>
+    Set up the subscriber in <code>main</code> and PCS spans flow into your sink of choice (terminal, JSON, OTLP, &hellip;):
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use tracing_subscriber::{fmt, EnvFilter};
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())  // RUST_LOG=info,pcs_core=debug
+        .with_target(false)
+        .compact()
+        .init();
+
+    // run your pipeline...
+}</code></pre>
+</div>
+
+<h2 id="spans">Spans you&rsquo;ll see</h2>
+<table class="rule-table">
+    <thead><tr><th>Span</th><th>Fields</th><th>Where</th></tr></thead>
+    <tbody>
+        <tr><td><code>pipeline.run</code></td><td><code>name</code>, <code>systems</code></td><td>Wraps an entire <code>Pipeline::run</code> call.</td></tr>
+        <tr><td><code>pipeline.stage</code></td><td><code>idx</code>, <code>systems</code></td><td>One per stage; child of <code>pipeline.run</code>.</td></tr>
+        <tr><td><code>system.execute</code></td><td><code>name</code>, <code>retries</code></td><td>Per-system run, wrapped in retry.</td></tr>
+        <tr><td><code>system.retry</code></td><td><code>attempt</code>, <code>delay_ms</code></td><td>Emitted whenever a system retry kicks in.</td></tr>
+        <tr><td><code>dataset.compact</code></td><td><code>before</code>, <code>after</code></td><td>Compaction sweep over all components.</td></tr>
+        <tr><td><code>distributed.claim</code></td><td><code>claim_id</code>, <code>partition</code></td><td>Lifecycle of a row-range claim.</td></tr>
+        <tr><td><code>distributed.checkpoint</code></td><td><code>stage_idx</code>, <code>bytes</code></td><td>Per-stage Arrow IPC checkpoint write.</td></tr>
+        <tr><td><code>raft.propose</code></td><td><code>op</code>, <code>term</code></td><td>One per <code>ConsensusCommand</code> proposed via Raft.</td></tr>
+    </tbody>
+</table>
+
+<p>
+    Span names use a stable dotted scheme (<code>area.event</code>) so filtering with <code>RUST_LOG</code> or <code>EnvFilter</code> remains predictable.
+</p>
+
+<h2 id="filters">Useful filter recipes</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-bash"># Pipeline-level info, system retries at debug:
+RUST_LOG="info,pcs_core::pipeline=debug" cargo run --example scheduler_etl
+
+# Quietly run, but capture every Raft proposal:
+RUST_LOG="warn,pcs_service::distributed::raft=trace" pcs-service serve --config service.toml
+
+# Drop everything except the distributed runner:
+RUST_LOG="off,pcs_service::distributed::runner=info" cargo run --example distributed_scheduler --features distributed</code></pre>
+</div>
+
+<h2 id="otel">Exporting to OpenTelemetry</h2>
+<p>
+    PCS does not depend on any specific exporter &mdash; it only emits standard <code>tracing</code> events. Wire it up to OTLP, Honeycomb, Jaeger, or any other backend by stacking an <code>opentelemetry</code> layer onto the subscriber.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+let tracer = opentelemetry_otlp::new_pipeline()
+    .tracing()
+    .with_exporter(opentelemetry_otlp::new_exporter().tonic())
+    .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+tracing_subscriber::registry()
+    .with(tracing_subscriber::EnvFilter::from_default_env())
+    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+    .with(tracing_subscriber::fmt::layer())
+    .init();</code></pre>
+</div>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Pipeline</h3>
+        <p>The DAG that the spans you&rsquo;re seeing actually trace through.</p>
+    </a>
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p>Where most of the interesting cross-node spans &mdash; claim, checkpoint, raft.propose &mdash; come from.</p>
+    </a>
+</div>
+{% endblock %}

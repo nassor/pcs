@@ -1,0 +1,132 @@
+# PCS standalone service configuration — uses only built-in factories.
+# Single-node operation: no Raft consensus required.
+#
+# HOW TO RUN:
+#   cargo build --features service --bin pcs-service
+#   cargo run --features service --bin pcs-service -- validate \
+#     --config examples/configs/standalone.toml
+#   cargo run --features service --bin pcs-service -- serve \
+#     --config examples/configs/standalone.toml
+#
+# The pipeline reads from examples/configs/fixtures/orders.csv (CSV source),
+# passes rows through (no user systems registered), and writes results to
+# /tmp/pcs-standalone-orders-out.csv (CSV sink).  /tmp always exists;
+# if you change the path, create the parent directory first.
+#
+# BUILT-IN FACTORIES USED:
+#   source:    CsvSource    — reads newline-delimited CSV with a declared schema
+#   sink:      CsvSink      — writes CSV with a declared schema
+#   component: GenericComponent — schema-forward component declared inline
+#   systems:   (none)       — the pipeline is a pure pass-through; add your own
+#                             by registering system factories in a custom binary
+
+# mode: standalone — single process, no distributed coordination.
+mode = "standalone"
+
+[node]
+id = 1
+name = "pcs-standalone"
+data_dir = "${PCS_DATA_DIR:-/tmp/pcs-standalone}"
+
+# run_mode controls how the standalone runner paces repeated iterations.
+# one_shot: run once then exit.  continuous: loop forever.  interval: loop
+# every N ms.  Defaults to continuous if omitted.
+[run_mode]
+kind = "one_shot"
+
+# Components declare the typed columnar data the pipeline operates on.
+# GenericComponent derives its Arrow schema from the 'fields' list below.
+[[pipeline.components]]
+name = "orders"
+type = "GenericComponent"
+
+[[pipeline.components.config.fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[pipeline.components.config.fields]]
+name = "amount"
+type = "Float64"
+nullable = true
+
+[[pipeline.components.config.fields]]
+name = "status"
+type = "Utf8"
+nullable = true
+
+# Systems run in registration order; DAG scheduling applies.
+# No built-in processing systems ship with pcs-service — add your own by
+# forking the binary and registering system factories via ServiceBuilder.
+# Empty array is required when no systems are declared.
+pipeline.systems = []
+
+# Sources feed rows into component columns before the pipeline runs.
+# CsvSource requires: path (string), schema_fields (array), has_headers (bool,
+# optional, default true).
+[[sources]]
+name = "csv_orders"
+type = "CsvSource"
+target_component = "orders"
+
+[sources.config]
+path = "examples/configs/fixtures/orders.csv"
+has_headers = true
+
+[[sources.config.schema_fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = true
+
+[[sources.config.schema_fields]]
+name = "status"
+type = "Utf8"
+nullable = true
+
+# Sinks drain rows from component columns after the pipeline finishes.
+# CsvSink requires: path (string), schema_fields (array), has_headers (bool,
+# optional, default true).
+#
+# NOTE: CsvSink opens (creates) the output file immediately when the service
+# builds the factory — including during `pcs-service validate`.  The parent
+# directory must exist before validate or serve is run.
+# /tmp is always present; subdirectories must be created in advance.
+[[sinks]]
+name = "csv_out"
+type = "CsvSink"
+source_component = "orders"
+
+[sinks.config]
+path = "/tmp/pcs-standalone-orders-out.csv"
+has_headers = true
+
+[[sinks.config.schema_fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = true
+
+[[sinks.config.schema_fields]]
+name = "status"
+type = "Utf8"
+nullable = true
+
+# HTTP control plane (health check at /health, metrics at /metrics).
+# Use port 0 to get an OS-assigned ephemeral port (useful in CI).
+[http]
+bind = "127.0.0.1:0"
+disabled = false
+
+# Logging.
+[observability]
+log_format = "pretty"   # use "json" in production log aggregators
+log_level = "info"

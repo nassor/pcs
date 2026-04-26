@@ -1,0 +1,84 @@
+# PCS extension example — user-defined factories.
+#
+# WARNING: THIS CONFIG WILL NOT RUN WITH THE STOCK pcs-service BINARY.
+#
+# The types used here (KafkaSource, PostgresSink, OrderComponent, ValidateOrder,
+# EnrichOrder) are NOT built into pcs-service.  You must build a custom binary
+# that registers these factories before this config will work.
+#
+# See examples/configs/README.md for guidance on building a custom binary.
+#
+# This file is provided as a template for teams building their own service
+# binary on top of PCS.  It preserves the educational value of showing what
+# real-world factory types might look like.
+
+mode = "standalone"
+
+[node]
+id = 1
+name = "order-processor"
+data_dir = "${PCS_DATA_DIR:-/var/lib/pcs-orders}"
+
+[run_mode]
+kind = "interval"
+interval_ms = 5000   # re-run the pipeline every 5 seconds
+
+# User-defined component: OrderComponent is a custom Rust type registered via
+# ServiceBuilder::register_component(OrderComponentFactory).
+[[pipeline.components]]
+name = "orders"
+type = "OrderComponent"     # REQUIRES: OrderComponentFactory registered
+
+[pipeline.components.config]
+max_rows = 10000
+
+# User-defined systems, registered via ServiceBuilder::register_system.
+# The pipeline builds a dependency DAG from SystemMeta read/write declarations.
+[[pipeline.systems]]
+name = "validate_orders"
+type = "ValidateOrder"      # REQUIRES: ValidateOrderFactory registered
+
+[pipeline.systems.config]
+strict = true
+
+[[pipeline.systems]]
+name = "enrich_orders"
+type = "EnrichOrder"        # REQUIRES: EnrichOrderFactory registered
+
+[pipeline.systems.config]
+lookup_table = "products"
+
+[[pipeline.systems]]
+name = "aggregate_revenue"
+type = "AggregateRevenue"   # REQUIRES: AggregateRevenueFactory registered
+
+# User-defined source: KafkaSource reads from a Kafka topic.
+# Registered via ServiceBuilder::register_source(KafkaSourceFactory).
+[[sources]]
+name = "kafka_orders"
+type = "KafkaSource"        # REQUIRES: KafkaSourceFactory registered
+target_component = "orders"
+
+[sources.config]
+brokers = "${KAFKA_BROKERS:-localhost:9092}"
+topic = "orders-raw"
+group_id = "pcs-order-processor"
+
+# User-defined sink: PostgresSink writes enriched rows to a database.
+# Registered via ServiceBuilder::register_sink(PostgresSinkFactory).
+[[sinks]]
+name = "pg_enriched_orders"
+type = "PostgresSink"        # REQUIRES: PostgresSinkFactory registered
+source_component = "orders"
+
+[sinks.config]
+dsn = "${POSTGRES_DSN:-postgres://user:pass@localhost:5432/warehouse}"
+table = "enriched_orders"
+
+[http]
+bind = "0.0.0.0:8080"
+disabled = false
+
+[observability]
+log_format = "pretty"
+log_level = "${LOG_LEVEL:-info}"

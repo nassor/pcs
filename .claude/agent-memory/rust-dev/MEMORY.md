@@ -1,0 +1,1 @@
+- [ECS Performance Research](project_ecs_performance_research.md) -- Optimization patterns from bevy/hecs/specs applied to Canudo's pipeline and storage

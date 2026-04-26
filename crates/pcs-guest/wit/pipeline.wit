@@ -1,0 +1,143 @@
+package pcs:pipeline@0.1.0;
+
+// NOTE: intentionally no `required-host-io-version` field on pipeline-descriptor
+// in v0.1.0. The WIT package version (`@0.1.0`) already signals host-io
+// compatibility; adding a forward-compat knob before we know what backward
+// incompat looks like is speculative. Revisit for v0.2 if host-io grows.
+
+/// Types shared by the pipeline interface.
+interface types {
+    /// Arrow IPC stream bytes (schema + batches). Host serializes a Dataset
+    /// on input; guest re-serializes the (possibly mutated) Dataset on output.
+    type ipc-bytes = list<u8>;
+
+    /// Opaque guest-owned checkpoint blob. Host persists verbatim via
+    /// pcs-core CheckpointStore; guest owns the layout.
+    type checkpoint = list<u8>;
+
+    /// One component declared by the guest pipeline. `arrow-schema-ipc`
+    /// is the Arrow IPC schema-message bytes for that component's RecordBatch
+    /// shape. Host validates source/sink target_component names against this
+    /// list at load time.
+    record component-descriptor {
+        name: string,
+        arrow-schema-ipc: list<u8>,
+    }
+
+    /// Stable identity of the pipeline. Host gates config + checkpoint
+    /// compatibility on this. `schema-fingerprint` is computed from the
+    /// concatenation of all component schemas (see pcs-core SchemaRegistry).
+    record pipeline-descriptor {
+        name: string,
+        version: string,
+        components: list<component-descriptor>,
+        stateful: bool,
+        schema-fingerprint: string,
+    }
+
+    /// Lightweight metrics the guest reports after each batch. Host surfaces
+    /// to prometheus via host-io::metric.
+    record run-metrics {
+        wall-ns: u64,
+        rows-in: u64,
+        rows-out: u64,
+        systems-run: u32,
+        retries: u32,
+    }
+
+    record run-result {
+        output: ipc-bytes,
+        checkpoint: option<checkpoint>,
+        metrics: run-metrics,
+    }
+
+    /// Structured errors so host can distinguish "release claim and retry"
+    /// from "ack claim and surface to operator".
+    ///
+    /// Variant naming matches DistributedRunner vocabulary:
+    /// `retryable` → runner calls `release_claim`
+    /// `permanent` → runner calls `ack_claim`
+    ///
+    /// v0.1.0 is deliberately a three-arm variant. A `host-denied(string)`
+    /// arm for host-io capability refusals was considered and rejected:
+    /// v0.1.0's host-io surface (log / metric / get-config) cannot fail,
+    /// so the slot would be dead weight. When v0.2 grows the host-io
+    /// surface (e.g. filesystem or network), the WIT package version bump
+    /// to 0.2.0 is itself the right moment to add the variant — no need
+    /// to reserve it speculatively here.
+    variant run-error {
+        /// Transient — retry-worthy failure. Host releases claim, retries
+        /// next tick. Maps to `release_claim`.
+        retryable(string),
+        /// Permanent — bad input shape, guest logic bug, unknown error.
+        /// Host acks claim, logs, surfaces to /status. Maps to `ack_claim`.
+        permanent(string),
+        /// Fingerprint mismatch. Emitted ONLY from `restore()`. `run-batch`
+        /// MUST NOT emit this; any mid-batch schema error is folded into
+        /// `permanent`. Host refuses to replay.
+        schema-mismatch(string),
+    }
+}
+
+/// Host capabilities the guest may call during init or run-batch.
+/// Deliberately minimal in v0.1.0: logging, metric counters, static config read.
+/// NO filesystem, NO network, NO clock (epoch-driven cancellation only).
+interface host-io {
+    enum log-level { trace, debug, info, warn, error }
+
+    /// Structured log line bridged to tracing on the host.
+    log: func(level: log-level, target: string, message: string);
+
+    /// Increment or observe a named metric. Host routes to prometheus.
+    /// Value is f64 to cover counters, gauges, and histograms.
+    metric: func(name: string, value: f64);
+
+    /// Pull a string-typed config value the host injected via
+    /// `pipeline.wasm.config` in service TOML. Returns none if absent.
+    /// Guest is expected to parse numerics itself.
+    get-config: func(key: string) -> option<string>;
+}
+
+/// The sole guest export. All functions are sync from the WIT perspective;
+/// the host wraps each call in spawn_blocking + epoch interruption.
+interface pipeline {
+    use types.{pipeline-descriptor, ipc-bytes, checkpoint, run-result, run-error};
+
+    /// Called once at load time. Host validates the descriptor against
+    /// ServiceConfig (declared components cover sources/sinks, schema
+    /// fingerprint matches any persisted checkpoint).
+    describe: func() -> pipeline-descriptor;
+
+    /// Called once after describe(), before any run-batch. Host passes the
+    /// full `pipeline.wasm.config` TOML table as a JSON string. Guest parses
+    /// and stores locally. Returning err aborts service startup.
+    init: func(config: string) -> result<_, string>;
+
+    /// The hot path. Host marshals the partition batch to Arrow IPC and
+    /// hands it in alongside any prior checkpoint. Guest runs its internal
+    /// Pipeline::run_on DAG against a fresh Dataset, returns IPC bytes +
+    /// optional new checkpoint + metrics.
+    ///
+    /// Invariant: run-batch MUST NOT return run-error::schema-mismatch.
+    /// Schema/fingerprint validation is a startup concern and lives only
+    /// in describe() + restore(). A mismatch surfacing mid-batch is a
+    /// guest bug and must be collapsed to `permanent`.
+    run-batch: func(input: ipc-bytes, prior: option<checkpoint>) -> result<run-result, run-error>;
+
+    /// Emit a point-in-time checkpoint without running a batch. Used by
+    /// CheckpointStrategy::EveryNStages path if the guest chooses to snapshot
+    /// between ticks. May return err if the guest has no persistent state.
+    snapshot: func() -> result<checkpoint, string>;
+
+    /// Restore from a persisted checkpoint during cold-start recovery.
+    /// Returning err forces the host to refuse startup. The `schema-mismatch`
+    /// variant of run-error is conceptually at home here, but restore uses a
+    /// plain string error because the host can't act differently on mismatch
+    /// vs. other restore failures at cold-start — both abort startup.
+    restore: func(cp: checkpoint) -> result<_, string>;
+}
+
+world pcs-pipeline {
+    import host-io;
+    export pipeline;
+}

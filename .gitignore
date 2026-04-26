@@ -1,0 +1,9 @@
+/target
+/tmp
+/docs/public
+**/.DS_Store
+prototypes/
+
+# Avoid IDE files
+.idea/
+.vscode/

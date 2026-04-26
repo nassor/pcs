@@ -1,0 +1,5 @@
+- [Design Review April 2026](project_review_2026_04.md) -- P0/P1/P2 findings across FSM, split/join, retry, composition, scheduler, API
+- [User: Nassor](user_nassor.md) -- Canudo creator, senior Rust dev, values API ergonomics
+- [ECS Rewrite Review](project_ecs_rewrite_review.md) -- Split/join gap, SystemMeta limits, no conditional routing, retry shift
+- [Pipeline DAG Design](project_pipeline_dag_design.md) -- Sequential stages + &mut World; Kahn's algorithm; write-write conflict rule
+- [Windows FSM Design](project_windows_design.md) -- Flink-style windows: 7-state FSM, injected systems, per-assigner watermark, distributed gaps

@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+
+{% block title %}Pipeline — PCS{% endblock %}
+{% block description %}PCS's Pipeline pairs a Dataset with a list of Systems, builds a field-level DAG from SystemMeta, sorts it into parallel stages, and runs with per-system retry.{% endblock %}
+{% block og_title %}Pipeline — PCS{% endblock %}
+{% block og_description %}PCS's Pipeline pairs a Dataset with a list of Systems, builds a field-level DAG, and runs with per-system retry.{% endblock %}
+
+{% block content %}
+
+<h1 class="animate-in">Pipeline</h1>
+<p class="subtitle animate-in">Pairs a <code>Dataset</code> with a list of <code>System</code>s, builds a field-level DAG, sorts into parallel stages, and runs with per-system retry.</p>
+
+<h2 id="anatomy">Anatomy</h2>
+<p>A <code>Pipeline</code> is a self-contained workload:</p>
+<ul>
+    <li>A <code>name: Arc&lt;str&gt;</code> for logging and identification</li>
+    <li>A <code>Dataset</code> &mdash; the columnar data the systems operate on</li>
+    <li>A list of <code>System</code>s, registered in the order they were added</li>
+    <li>An (optional) DAG: stages computed from <code>SystemMeta</code> on first run</li>
+    <li>(With <code>io</code> feature) Per-component <code>Source</code>s and <code>Sink</code>s</li>
+</ul>
+<p>
+    The pipeline is the unit of single-workload execution. To run several independent workloads from one process, see <a href="{{ get_url(path='@/scheduler.md') }}">Scheduler</a>.
+</p>
+
+<h2 id="builder">Building a pipeline</h2>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::prelude::*;
+
+let pipeline = Pipeline::builder("etl")
+    .with::&lt;Transaction&gt;()                  // register Component
+    .with_resource(FxRates::default())      // register Resource
+    .with_system(IngestSystem)              // stage 0: writes_component("Transaction")
+    .with_system(ValidateSystem)            // stage 1: writes "valid"
+    .with_system(EnrichSystem)              // stage 1: writes "usd_amount" (parallel-safe)
+    .with_system(ReportSystem)              // stage 2: reads "valid" + "usd_amount"
+    .build();</code></pre>
+</div>
+
+<p>
+    The inline form is also fine when you need to mutate the pipeline after construction:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">let mut pipeline = Pipeline::new("etl");
+pipeline.register_component::&lt;Transaction&gt;()?;
+pipeline.append::&lt;Transaction&gt;(&amp;seed_data)?;
+pipeline.add_system(ValidateSystem);
+pipeline.add_system(EnrichSystem);
+pipeline.add_parallel_system(ScoreSystem);   // slice-parallel</code></pre>
+</div>
+
+<h2 id="run">Running</h2>
+<p>
+    <code>run()</code> validates declared fields against the dataset&rsquo;s <code>SchemaRegistry</code>, builds the conflict graph, topologically sorts into stages, and runs each stage with per-system retry. Systems within a stage run concurrently via <code>tokio::join</code> when the runtime is enabled.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">pipeline.run().await?;
+
+let stats: RunStats = pipeline.last_stats();
+println!(
+    "{} systems in {}ms ({} retries this batch)",
+    stats.systems_run, stats.duration_millis, stats.retries_this_batch,
+);</code></pre>
+</div>
+
+<p>
+    Inspect the computed stage layout with <code>pipeline.stages()</code>:
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-text">Stage 0: ["ingest"]
+Stage 1: ["validate", "enrich"]
+Stage 2: ["report"]</code></pre>
+</div>
+
+<h2 id="run-on">run_on &mdash; the distributed escape hatch</h2>
+<p>
+    <code>Pipeline::run_on(&amp;self, &amp;mut Dataset)</code> executes the system DAG against an external dataset without touching the pipeline&rsquo;s own data, sources, or sinks. The <a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a> uses this to apply a pipeline template to per-batch datasets reconstructed from a shared store.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">// Template pipeline carries only the systems and component schemas.
+let template = Pipeline::builder("processor")
+    .with::&lt;Transaction&gt;()
+    .with_system(ValidateSystem)
+    .with_system(EnrichSystem)
+    .build();
+
+// Apply the same DAG to many independent datasets.
+for mut batch in incoming_batches {
+    template.run_on(&amp;mut batch).await?;
+}</code></pre>
+</div>
+
+<h2 id="io">Sources &amp; sinks (feature = "io")</h2>
+<p>
+    With the <code>io</code> feature, you can attach per-component <code>Source</code>s and <code>Sink</code>s directly to a pipeline. <code>run_with_io()</code> drains all sources into the dataset, runs the systems, then drains the dataset to all sinks.
+</p>
+
+<div class="getting-started-code">
+    <pre><code class="language-rust">use pcs_core::io::{ParquetSource, ParquetSink};
+
+let mut pipeline = Pipeline::builder("etl")
+    .with::&lt;Transaction&gt;()
+    .with_source("Transaction", ParquetSource::open("input.parquet")?)
+    .with_sink("Transaction",   ParquetSink::create("output.parquet", Transaction::schema())?)
+    .with_system(ValidateSystem)
+    .with_system(EnrichSystem)
+    .build();
+
+pipeline.run_with_io().await?;</code></pre>
+</div>
+
+<p>
+    See <a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a> for built-in implementations and the underlying traits.
+</p>
+
+<h2 id="conflict-rules">Conflict rules in detail</h2>
+<p>
+    For systems registered in order, A then B, an edge B &rarr; A is added when:
+</p>
+<table class="rule-table">
+    <thead><tr><th>Case</th><th>A declares</th><th>B declares</th><th>Result</th></tr></thead>
+    <tbody>
+        <tr><td>Read-after-write</td><td>writes <em>F</em></td><td>reads <em>F</em></td><td>B follows A</td></tr>
+        <tr><td>Write-after-read</td><td>reads <em>F</em></td><td>writes <em>F</em></td><td>B follows A</td></tr>
+        <tr><td>Write-write</td><td>writes <em>F</em></td><td>writes <em>F</em></td><td>B follows A</td></tr>
+        <tr><td>Disjoint writes</td><td>writes <em>F</em></td><td>writes <em>G</em></td><td>same stage</td></tr>
+        <tr><td>Resource conflict</td><td>writes <code>R</code></td><td>reads <code>R</code></td><td>B follows A (TypeId-level)</td></tr>
+    </tbody>
+</table>
+<p>
+    <code>read_component(C)</code> and <code>write_component(C)</code> expand to all current fields of C at validation time, so they are coarser than per-field declarations.
+</p>
+
+<h2 id="retry">Retry</h2>
+<p>
+    Each system carries its own <code>SystemConfig</code>. The pipeline runs the system, catches errors, and retries according to the system&rsquo;s <code>RetryMode</code>:
+</p>
+<ul>
+    <li><code>RetryMode::None</code> &mdash; fail-fast.</li>
+    <li><code>RetryMode::Fixed { max_retries, delay_ms }</code> &mdash; constant delay between attempts.</li>
+    <li><code>RetryMode::ExponentialBackoff { max_retries, base_delay_ms, multiplier, max_delay_ms, jitter }</code> &mdash; default for systems that don&rsquo;t override <code>config()</code> (3 retries, 100&nbsp;ms base, 2&times; multiplier, 30&nbsp;s cap, 10% jitter).</li>
+</ul>
+<p>
+    Failures that exhaust the retry budget surface as <code>PcsError::RetryExhausted</code>.
+</p>
+
+<h2 id="next">Next steps</h2>
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/scheduler.md') }}" class="next-card">
+        <div class="next-card-label">Core</div>
+        <h3>Scheduler</h3>
+        <p>Run multiple independent pipelines from one process with sequential or concurrent ticks.</p>
+    </a>
+    <a href="{{ get_url(path='@/io.md') }}" class="next-card">
+        <div class="next-card-label">I/O</div>
+        <h3>Sources &amp; Sinks</h3>
+        <p>Get Arrow data into and out of pipelines via Parquet, CSV, JSON, or in-memory channels.</p>
+    </a>
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <div class="next-card-label">Distributed</div>
+        <h3>Distributed Runner</h3>
+        <p>Run a pipeline template across nodes with at-least-once semantics and Arrow IPC checkpoints.</p>
+    </a>
+</div>
+{% endblock %}

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ config.title }}{% endblock %}</title>
+    <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="{% block og_title %}{{ config.title }}{% endblock %}">
+    <meta property="og:description" content="{% block og_description %}{{ config.description }}{% endblock %}">
+    <link rel="stylesheet" href="{{ get_url(path='styles.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;700&family=Fira+Code&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.14.0/dist/mermaid.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="{{ get_url(path='script.js') }}" defer></script>
+</head>
+<body>
+    <button id="menu-toggle" class="menu-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="sidebar-overlay"></div>
+
+    <nav class="sidebar" role="navigation" aria-label="Main navigation">
+        <a href="{{ get_url(path='/') }}" class="logo">
+            <img src="{{ get_url(path='logo.png') }}" alt="PCS" style="height: 24px; vertical-align: middle; margin-right: 8px;">
+            PCS
+        </a>
+        <ul class="nav-links">
+            <li><a href="{{ get_url(path='/') }}">Home</a></li>
+        </ul>
+        <div class="nav-section-label">Core</div>
+        <ul class="nav-links">
+            <li><a href="{{ get_url(path='@/dataset.md') }}">Dataset &amp; Components</a></li>
+            <li><a href="{{ get_url(path='@/systems.md') }}">Systems</a></li>
+            <li><a href="{{ get_url(path='@/pipeline.md') }}">Pipeline</a></li>
+            <li><a href="{{ get_url(path='@/scheduler.md') }}">Scheduler</a></li>
+        </ul>
+        <div class="nav-section-label">I/O</div>
+        <ul class="nav-links">
+            <li><a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a></li>
+        </ul>
+        <div class="nav-section-label">Distributed</div>
+        <ul class="nav-links">
+            <li><a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a></li>
+            <li><a href="{{ get_url(path='@/service.md') }}">Service</a></li>
+        </ul>
+        <div class="nav-section-label">Observability</div>
+        <ul class="nav-links">
+            <li><a href="{{ get_url(path='@/tracing.md') }}">Tracing</a></li>
+        </ul>
+    </nav>
+
+    <main class="main-content">
+        {% block content %}{% endblock %}
+
+        <button class="back-to-top" aria-label="Back to top">
+            <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+    </main>
+</body>
+</html>

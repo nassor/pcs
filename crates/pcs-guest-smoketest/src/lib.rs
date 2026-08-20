@@ -87,6 +87,20 @@ impl Component for Counter {
 ///
 /// The state resource is installed by the macro before any system runs, so its
 /// absence is a bug in the SDK rather than a recoverable condition.
+///
+/// The `eprintln!` is load-bearing, not debug output. It is the only thing in
+/// this fixture that touches a WASI import at run time (`wasi:cli/stderr` →
+/// `wasi:io/streams`), and the host links the *synchronous* WASI
+/// implementation, whose `in_tokio` bridge calls `Handle::block_on`. Without a
+/// guest that actually reaches for WASI, no test would notice the host calling
+/// the guest from a thread that is driving a tokio runtime — which panics and
+/// which is exactly how `pcs-service` runs. Real pipelines log; this fixture
+/// has to as well, or it stops standing in for one.
+///
+/// Do not go looking for the text. The host builds its `WasiCtx` with no
+/// `inherit_*`, so guest stdout and stderr are discarded — the invocation is
+/// what matters here, not the bytes. `host-io::log` is the channel a real guest
+/// should use to say something a human will read.
 fn count_batches(data: &mut Dataset) -> Result<(), PcsError> {
     let state = data
         .get_resource_mut::<GuestState<Counter>>()
@@ -96,6 +110,9 @@ fn count_batches(data: &mut Dataset) -> Result<(), PcsError> {
         Some(counter) => counter.count += 1,
         None => state.rows.push(Counter { count: 1 }),
     }
+
+    let count = state.rows.first().map_or(0, |c| c.count);
+    eprintln!("smoketest: batch {count}");
     Ok(())
 }
 

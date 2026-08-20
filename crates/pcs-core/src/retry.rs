@@ -28,6 +28,8 @@
 use crate::error::PcsError;
 use rand::RngExt;
 use std::time::Duration;
+#[cfg(feature = "tracing")]
+use tracing::{Instrument, error, info_span, warn};
 
 /// Retry modes for task execution
 ///
@@ -253,6 +255,19 @@ impl<'a> Attempts<'a> {
         self.attempt as u32
     }
 
+    /// The span covering the attempt about to run.
+    ///
+    /// This is the only span `pcs-core` emits. It is the unit operators care
+    /// about, because a stage that looks slow is usually a system being retried.
+    #[cfg(feature = "tracing")]
+    fn span(&self) -> tracing::Span {
+        info_span!(
+            "task_attempt",
+            attempt = self.attempt + 1,
+            max_attempts = self.max_attempts
+        )
+    }
+
     /// Fold a failed attempt.
     ///
     /// `Ok(Some(delay))` — wait that long, then retry.
@@ -261,9 +276,24 @@ impl<'a> Attempts<'a> {
     fn failed(&mut self, e: PcsError) -> Result<Option<Duration>, PcsError> {
         self.attempt += 1;
         if self.attempt >= self.max_attempts {
+            #[cfg(feature = "tracing")]
+            error!(
+                error = %e,
+                attempts = self.attempt,
+                "retry exhausted, giving up"
+            );
             return Err(PcsError::retry_exhausted(e, self.attempt));
         }
-        Ok(self.config.retry_mode.delay_for_attempt(self.attempt - 1))
+        let delay = self.config.retry_mode.delay_for_attempt(self.attempt - 1);
+        #[cfg(feature = "tracing")]
+        warn!(
+            error = %e,
+            attempt = self.attempt,
+            max_attempts = self.max_attempts,
+            delay_ms = delay.unwrap_or_default().as_millis(),
+            "attempt failed, retrying"
+        );
+        Ok(delay)
     }
 }
 
@@ -278,8 +308,9 @@ impl<'a> Attempts<'a> {
 /// have no async timer, so delays are skipped and retries are immediate.
 /// Use [`run_with_retries_blocking`] from a blocking thread.
 ///
-/// This is the hot path for every system in a pipeline stage, so it emits no
-/// tracing of its own; callers that want per-attempt visibility log around it.
+/// Each attempt runs inside a `task_attempt` span carrying `attempt` and
+/// `max_attempts`, under the `tracing` feature. That span is the only one
+/// `pcs-core` emits.
 ///
 /// # Example
 ///
@@ -304,7 +335,15 @@ pub async fn run_with_retries<T>(
 ) -> Result<(T, u32), PcsError> {
     let mut attempts = Attempts::new(config);
     loop {
-        match run_fn().await {
+        // The span must wrap the future, not be `enter`ed around an await: an
+        // entered guard held across a yield attributes another task's work to
+        // this attempt.
+        #[cfg(feature = "tracing")]
+        let result = run_fn().instrument(attempts.span()).await;
+        #[cfg(not(feature = "tracing"))]
+        let result = run_fn().await;
+
+        match result {
             Ok(value) => return Ok((value, attempts.retries())),
             Err(e) => {
                 if let Some(delay) = attempts.failed(e)? {
@@ -330,7 +369,18 @@ pub fn run_with_retries_blocking<T>(
 ) -> Result<(T, u32), PcsError> {
     let mut attempts = Attempts::new(config);
     loop {
-        match run_fn() {
+        // No await here, so a plain guard is correct.
+        #[cfg(feature = "tracing")]
+        let span = attempts.span();
+        #[cfg(feature = "tracing")]
+        let guard = span.enter();
+
+        let result = run_fn();
+
+        #[cfg(feature = "tracing")]
+        drop(guard);
+
+        match result {
             Ok(value) => return Ok((value, attempts.retries())),
             Err(e) => {
                 if let Some(delay) = attempts.failed(e)? {

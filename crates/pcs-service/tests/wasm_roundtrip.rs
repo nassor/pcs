@@ -308,3 +308,34 @@ async fn guest_state_resets_when_prior_is_dropped() {
         );
     }
 }
+
+/// Regression: `run_on` must survive being awaited on a **multi-threaded**
+/// tokio runtime, which is what `#[tokio::main]` gives `pcs-service`.
+///
+/// The guest is linked against the synchronous WASI implementation
+/// (`add_to_linker_sync`), so every WASI import the guest touches funnels into
+/// `wasmtime_wasi::runtime::in_tokio` → `Handle::block_on`. Called from a
+/// thread that is driving a tokio runtime, that panics with "Cannot start a
+/// runtime from within a runtime" and takes the whole service down on its first
+/// batch. `WasmPipelineRuntime::run_on_with_state` therefore has to hand the
+/// call to `spawn_blocking`.
+///
+/// The other tests in this file pin `current_thread` and so never exercised the
+/// flavour the binary actually runs under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_on_works_on_a_multi_thread_runtime() {
+    let runtime = load_runtime(HashMap::new());
+    let mut dataset = seeded_dataset(&runtime, 3);
+    let before = dataset.rows();
+
+    runtime
+        .run_on(&mut dataset)
+        .await
+        .expect("run_on must not panic or fail on a multi-thread runtime");
+
+    assert_eq!(
+        dataset.rows(),
+        before,
+        "the smoketest is an identity pipeline, so the row count must survive"
+    );
+}

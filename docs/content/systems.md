@@ -1,5 +1,5 @@
 +++
 title = "Systems"
-description = "PCS's System trait: field-granular read/write declarations via SystemMeta, the system_fn closure helper, per-system retry, and the sync fast-path."
+description = "A System is a struct with a run method plus a meta() that names every Arrow field it reads and writes. Field-level declarations, system_fn, resource access, and ParallelSystem row slices."
 template = "systems.html"
 +++

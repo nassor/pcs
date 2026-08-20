@@ -1,5 +1,6 @@
 +++
 title = "Phase 7 Benchmark Results"
+description = "TPC-H Q1 and Q6, Arrow IPC versus postcard, and a DataFusion comparison — with an honest diagnosis of each result."
 template = "page.html"
 +++
 

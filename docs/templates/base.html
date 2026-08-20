@@ -5,58 +5,96 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}{{ config.title }}{% endblock %}</title>
     <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
+    <meta name="color-scheme" content="dark">
     <meta property="og:type" content="website">
     <meta property="og:title" content="{% block og_title %}{{ config.title }}{% endblock %}">
     <meta property="og:description" content="{% block og_description %}{{ config.description }}{% endblock %}">
+    <link rel="icon" href="{{ get_url(path='logo.svg') }}" type="image/svg+xml">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+
+    {# Runs before the stylesheet is applied, so the reveal animations never
+       flash. Everything that starts at opacity 0 is gated on `.js`: with
+       scripting off those selectors never match and the content is simply
+       there, which is what "usable without JavaScript" has to mean. #}
+    <script>document.documentElement.classList.add('js');</script>
     <link rel="stylesheet" href="{{ get_url(path='styles.css') }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;700&family=Fira+Code&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.14.0/dist/mermaid.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
     <script src="{{ get_url(path='script.js') }}" defer></script>
 </head>
 <body>
-    <button id="menu-toggle" class="menu-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <a class="skip-link" href="#content">Skip to content</a>
+
+    <button id="menu-toggle" class="menu-toggle" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav">&#9776;</button>
     <div class="sidebar-overlay"></div>
 
-    <nav class="sidebar" role="navigation" aria-label="Main navigation">
+    <nav class="sidebar" id="site-nav" aria-label="Documentation">
         <a href="{{ get_url(path='/') }}" class="logo">
-            <img src="{{ get_url(path='logo.svg') }}" alt="PCS" style="height: 24px; vertical-align: middle; margin-right: 8px;">
-            PCS
+            <img src="{{ get_url(path='logo.svg') }}" alt="">
+            <span>PCS</span>
         </a>
-        <ul class="nav-links">
-            <li><a href="{{ get_url(path='/') }}">Home</a></li>
-        </ul>
-        <div class="nav-section-label">Core</div>
-        <ul class="nav-links">
-            <li><a href="{{ get_url(path='@/dataset.md') }}">Dataset &amp; Components</a></li>
-            <li><a href="{{ get_url(path='@/systems.md') }}">Systems</a></li>
-            <li><a href="{{ get_url(path='@/pipeline.md') }}">Pipeline</a></li>
-            <li><a href="{{ get_url(path='@/scheduler.md') }}">Scheduler</a></li>
-        </ul>
-        <div class="nav-section-label">I/O</div>
-        <ul class="nav-links">
-            <li><a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a></li>
-        </ul>
-        <div class="nav-section-label">Distributed</div>
-        <ul class="nav-links">
-            <li><a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a></li>
-            <li><a href="{{ get_url(path='@/service.md') }}">Service</a></li>
-        </ul>
-        <div class="nav-section-label">Observability</div>
-        <ul class="nav-links">
-            <li><a href="{{ get_url(path='@/tracing.md') }}">Tracing</a></li>
-        </ul>
+
+        {# The first two groups are a reading order, so they are numbered.
+           The reference groups below are not a sequence, so they are not. #}
+        <div class="nav-group">
+            <div class="nav-group-label"><span class="nav-num">01</span> Start</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='/') }}">What PCS is</a></li>
+                <li><a href="{{ get_url(path='@/getting-started.md') }}">Build your first pipeline</a></li>
+            </ul>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-group-label"><span class="nav-num">02</span> Core concepts</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='@/dataset.md') }}">Dataset &amp; Components</a></li>
+                <li><a href="{{ get_url(path='@/systems.md') }}">Systems</a></li>
+                <li><a href="{{ get_url(path='@/pipeline.md') }}">Pipeline</a></li>
+                <li><a href="{{ get_url(path='@/scheduler.md') }}">Scheduler</a></li>
+            </ul>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-group-label">Moving data</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a></li>
+            </ul>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-group-label">Running at scale</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a></li>
+                <li><a href="{{ get_url(path='@/service.md') }}">Service</a></li>
+                <li><a href="{{ get_url(path='@/operations/running-pcs.md') }}">Operating pcs-service</a></li>
+            </ul>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-group-label">Reference</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='@/tracing.md') }}">Tracing</a></li>
+                <li><a href="{{ get_url(path='@/benchmarks/phase7-results.md') }}">Benchmarks</a></li>
+            </ul>
+        </div>
+
+        <p class="nav-note">
+            PCS is an exploration, not a production system yet.
+            <a href="{{ config.extra.github_repo }}">Source on GitHub</a>
+        </p>
     </nav>
 
-    <main class="main-content">
+    <main class="main-content" id="content">
         {% block content %}{% endblock %}
 
         <button class="back-to-top" aria-label="Back to top">
-            <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
         </button>
     </main>
 </body>

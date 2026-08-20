@@ -1,177 +1,263 @@
-document.addEventListener('DOMContentLoaded', () => {
-  // --------------------------------------------------------------------------
-  // Mermaid initialization
-  // --------------------------------------------------------------------------
-  if (window.mermaid) {
-    mermaid.initialize({
-      startOnLoad: true,
-      theme: 'dark',
-      securityLevel: 'loose',
-      fontFamily: 'Outfit, sans-serif'
+/* ==========================================================================
+   PCS Documentation — behaviour
+   No framework. Every block here is a small, independent enhancement; the
+   site is fully usable with JavaScript disabled.
+   ========================================================================== */
+
+(() => {
+  'use strict';
+
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /** Normalise a pathname for comparison: strip trailing slash and index.html. */
+  function normalisePath(pathname) {
+    return pathname.replace(/index\.html$/, '').replace(/\/+$/, '') || '/';
+  }
+
+  /** Same-origin check that survives absolute internal URLs. */
+  function isExternal(anchor) {
+    // `anchor.href` is always absolute and already resolved by the browser.
+    return anchor.origin !== window.location.origin;
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const sidebar = document.querySelector('.sidebar');
+    const menuToggle = document.getElementById('menu-toggle');
+    const overlay = document.querySelector('.sidebar-overlay');
+
+    // ------------------------------------------------------------------------
+    // External links open in a new tab. Internal ones must not.
+    //
+    // Zola's `get_url` emits absolute URLs because `base_url` is absolute, so
+    // a naive `a[href^="http"]` selector matches every internal nav link and
+    // sends the whole site to new tabs. Compare origins instead.
+    // ------------------------------------------------------------------------
+    document.querySelectorAll('a[href]').forEach((link) => {
+      if (link.hasAttribute('target')) return;
+      if (!isExternal(link)) return;
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+      link.classList.add('is-external');
     });
-  }
 
-  // --------------------------------------------------------------------------
-  // DOM references
-  // --------------------------------------------------------------------------
-  const menuToggle = document.getElementById('menu-toggle');
-  const sidebar = document.querySelector('.sidebar');
-  const overlay = document.querySelector('.sidebar-overlay');
+    // ------------------------------------------------------------------------
+    // Active nav link
+    //
+    // Compare normalised pathnames, not raw href strings: the hrefs are
+    // absolute and the current URL may or may not carry a trailing slash.
+    // ------------------------------------------------------------------------
+    const here = normalisePath(window.location.pathname);
+    let activeLink = null;
 
-  // --------------------------------------------------------------------------
-  // Mobile menu toggle
-  // --------------------------------------------------------------------------
-  function openSidebar() {
-    if (!sidebar) return;
-    sidebar.classList.add('open');
-    if (overlay) overlay.classList.add('visible');
-    if (menuToggle) menuToggle.setAttribute('aria-expanded', 'true');
-    if (menuToggle) menuToggle.innerHTML = '&#10005;';
-  }
-
-  function closeSidebar() {
-    if (!sidebar) return;
-    sidebar.classList.remove('open');
-    if (overlay) overlay.classList.remove('visible');
-    if (menuToggle) menuToggle.setAttribute('aria-expanded', 'false');
-    if (menuToggle) menuToggle.innerHTML = '&#9776;';
-  }
-
-  if (menuToggle) {
-    menuToggle.addEventListener('click', () => {
-      if (sidebar && sidebar.classList.contains('open')) {
-        closeSidebar();
-      } else {
-        openSidebar();
+    document.querySelectorAll('.nav-links a').forEach((link) => {
+      if (isExternal(link)) return;
+      const target = normalisePath(link.pathname);
+      if (target === here) {
+        link.classList.add('active');
+        link.setAttribute('aria-current', 'page');
+        activeLink = link;
       }
     });
-  }
 
-  // Close sidebar when clicking overlay
-  if (overlay) {
-    overlay.addEventListener('click', closeSidebar);
-  }
-
-  // Close sidebar when clicking outside on mobile (fallback if no overlay)
-  document.addEventListener('click', (e) => {
-    if (window.innerWidth <= 768 && sidebar && sidebar.classList.contains('open')) {
-      if (!sidebar.contains(e.target) && menuToggle && !menuToggle.contains(e.target)) {
-        closeSidebar();
+    // The sidebar links to leaf pages, so a section landing page like
+    // /benchmarks/ matches nothing above and the nav goes blank. Fall back to
+    // the first link that lives under the current directory, and mark it as an
+    // ancestor rather than the page itself.
+    if (!activeLink && here !== '/') {
+      const prefix = here.endsWith('/') ? here : here + '/';
+      for (const link of document.querySelectorAll('.nav-links a')) {
+        if (isExternal(link)) continue;
+        if (normalisePath(link.pathname).startsWith(prefix)) {
+          link.classList.add('active');
+          link.setAttribute('aria-current', 'true');
+          activeLink = link;
+          break;
+        }
       }
     }
-  });
 
-  // Close sidebar on Escape key
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && sidebar && sidebar.classList.contains('open')) {
-      closeSidebar();
-      if (menuToggle) menuToggle.focus();
+    // Mark the enclosing group so its label can highlight too.
+    if (activeLink) {
+      const group = activeLink.closest('.nav-group');
+      if (group) group.classList.add('has-active');
     }
-  });
 
-  // --------------------------------------------------------------------------
-  // Active nav link highlighting
-  // --------------------------------------------------------------------------
-  const currentPath = window.location.pathname;
-  const currentPage = currentPath.substring(currentPath.lastIndexOf('/') + 1) || 'index.html';
+    // ------------------------------------------------------------------------
+    // Keep the sidebar's scroll position across navigations.
+    //
+    // The site is server-rendered, so each click is a real page load. Restoring
+    // scroll makes the nav feel like a persistent shell rather than a page that
+    // jumps back to the top every time.
+    // ------------------------------------------------------------------------
+    if (sidebar) {
+      const KEY = 'pcs:sidebar-scroll';
+      const saved = sessionStorage.getItem(KEY);
+      if (saved !== null) sidebar.scrollTop = parseInt(saved, 10) || 0;
 
-  const navLinks = document.querySelectorAll('.nav-links a');
-  navLinks.forEach((link) => {
-    const href = link.getAttribute('href');
-    if (href === currentPage) {
-      link.classList.add('active');
-    } else {
-      link.classList.remove('active');
+      // If the active link ended up off-screen, bring it into view instead.
+      if (activeLink) {
+        const linkBox = activeLink.getBoundingClientRect();
+        const navBox = sidebar.getBoundingClientRect();
+        if (linkBox.top < navBox.top || linkBox.bottom > navBox.bottom) {
+          activeLink.scrollIntoView({ block: 'center' });
+        }
+      }
+
+      window.addEventListener('beforeunload', () => {
+        sessionStorage.setItem(KEY, String(sidebar.scrollTop));
+      });
     }
-  });
 
-  // --------------------------------------------------------------------------
-  // Entrance animations (staggered fade-in for hero/feature elements)
-  // --------------------------------------------------------------------------
-  const animateElements = document.querySelectorAll('.animate-in');
-  if (animateElements.length > 0) {
-    // Use IntersectionObserver for elements below the fold
-    if ('IntersectionObserver' in window) {
-      const observer = new IntersectionObserver(
+    // ------------------------------------------------------------------------
+    // Prefetch documentation pages on intent, so navigation feels immediate.
+    // ------------------------------------------------------------------------
+    if (!navigator.connection || !navigator.connection.saveData) {
+      const prefetched = new Set([normalisePath(window.location.pathname)]);
+
+      const prefetch = (href) => {
+        const path = normalisePath(new URL(href).pathname);
+        if (prefetched.has(path)) return;
+        prefetched.add(path);
+        const hint = document.createElement('link');
+        hint.rel = 'prefetch';
+        hint.href = href;
+        document.head.appendChild(hint);
+      };
+
+      document.querySelectorAll('.sidebar a, .next-card, .concept-card').forEach((link) => {
+        if (!link.href || isExternal(link)) return;
+        link.addEventListener('pointerenter', () => prefetch(link.href), { once: true });
+        link.addEventListener('focus', () => prefetch(link.href), { once: true });
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // Mobile navigation drawer
+    // ------------------------------------------------------------------------
+    function setDrawer(open) {
+      if (!sidebar) return;
+      sidebar.classList.toggle('open', open);
+      if (overlay) overlay.classList.toggle('visible', open);
+      if (menuToggle) menuToggle.setAttribute('aria-expanded', String(open));
+      document.body.classList.toggle('nav-open', open);
+    }
+
+    if (menuToggle) {
+      menuToggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setDrawer(!sidebar.classList.contains('open'));
+      });
+    }
+
+    if (overlay) overlay.addEventListener('click', () => setDrawer(false));
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') setDrawer(false);
+    });
+
+    // Following a link inside the drawer should close it.
+    if (sidebar) {
+      sidebar.addEventListener('click', (e) => {
+        if (e.target.closest('a')) setDrawer(false);
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // On-page contents: highlight the section currently in view
+    // ------------------------------------------------------------------------
+    const tocLinks = Array.from(document.querySelectorAll('.page-toc a[href^="#"]'));
+    if (tocLinks.length > 0 && 'IntersectionObserver' in window) {
+      const byId = new Map();
+      tocLinks.forEach((link) => {
+        const target = document.getElementById(decodeURIComponent(link.hash.slice(1)));
+        if (target) byId.set(target, link);
+      });
+
+      const spy = new IntersectionObserver(
         (entries) => {
           entries.forEach((entry) => {
+            const link = byId.get(entry.target);
+            if (!link) return;
             if (entry.isIntersecting) {
-              entry.target.style.animationPlayState = 'running';
-              observer.unobserve(entry.target);
+              tocLinks.forEach((l) => l.classList.remove('reading'));
+              link.classList.add('reading');
             }
           });
         },
-        { threshold: 0.1, rootMargin: '0px 0px -40px 0px' }
+        { rootMargin: '-80px 0px -70% 0px' }
       );
 
-      animateElements.forEach((el) => {
-        // Only observe elements that aren't already visible above fold
-        const rect = el.getBoundingClientRect();
-        if (rect.top > window.innerHeight) {
-          el.style.animationPlayState = 'paused';
-          observer.observe(el);
-        }
+      byId.forEach((_link, target) => spy.observe(target));
+    }
+
+    // ------------------------------------------------------------------------
+    // Reveal-on-scroll for elements marked `.animate-in`
+    // ------------------------------------------------------------------------
+    const revealTargets = document.querySelectorAll('.animate-in');
+    if (revealTargets.length > 0) {
+      if (reduceMotion || !('IntersectionObserver' in window)) {
+        revealTargets.forEach((el) => el.classList.add('revealed'));
+      } else {
+        const reveal = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (!entry.isIntersecting) return;
+              entry.target.classList.add('revealed');
+              reveal.unobserve(entry.target);
+            });
+          },
+          { threshold: 0.05, rootMargin: '0px 0px -32px 0px' }
+        );
+        revealTargets.forEach((el) => reveal.observe(el));
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Back to top
+    // ------------------------------------------------------------------------
+    const backToTop = document.querySelector('.back-to-top');
+    if (backToTop) {
+      const main = document.querySelector('.main-content') || document.documentElement;
+      const onScroll = () => {
+        backToTop.classList.toggle('visible', window.scrollY > 600);
+      };
+      onScroll();
+      window.addEventListener('scroll', onScroll, { passive: true });
+      backToTop.addEventListener('click', () => {
+        window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
+        const heading = main.querySelector('h1');
+        if (heading) heading.focus?.();
       });
     }
-  }
 
-  // --------------------------------------------------------------------------
-  // External link handling — open in new tab
-  // --------------------------------------------------------------------------
-  document.querySelectorAll('a[href^="http"]').forEach((link) => {
-    if (!link.hasAttribute('target')) {
-      link.setAttribute('target', '_blank');
-      link.setAttribute('rel', 'noopener noreferrer');
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // Back to top button
-  // --------------------------------------------------------------------------
-  const backToTop = document.querySelector('.back-to-top');
-  if (backToTop) {
-    const toggleBackToTop = () => {
-      if (window.scrollY > 400) {
-        backToTop.classList.add('visible');
-      } else {
-        backToTop.classList.remove('visible');
-      }
-    };
-
-    window.addEventListener('scroll', toggleBackToTop, { passive: true });
-    toggleBackToTop();
-
-    backToTop.addEventListener('click', () => {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
-  }
-
-  // --------------------------------------------------------------------------
-  // Copy button for code blocks
-  // --------------------------------------------------------------------------
-  document.querySelectorAll('pre').forEach((pre) => {
-    const btn = document.createElement('button');
-    btn.className = 'copy-btn';
-    btn.setAttribute('aria-label', 'Copy code');
-    btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-
-    btn.addEventListener('click', async () => {
+    // ------------------------------------------------------------------------
+    // Copy button on code blocks
+    // ------------------------------------------------------------------------
+    document.querySelectorAll('pre').forEach((pre) => {
       const code = pre.querySelector('code');
-      const text = code ? code.textContent : pre.textContent;
-      try {
-        await navigator.clipboard.writeText(text);
-        btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-          btn.classList.remove('copied');
-        }, 2000);
-      } catch (err) {
-        // Fallback: silent fail
-      }
-    });
+      if (!code) return;
 
-    pre.style.position = 'relative';
-    pre.appendChild(btn);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy-btn';
+      button.textContent = 'Copy';
+      button.setAttribute('aria-label', 'Copy code to clipboard');
+
+      button.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(code.innerText);
+          button.textContent = 'Copied';
+          button.classList.add('copied');
+        } catch {
+          button.textContent = 'Press Ctrl+C';
+        }
+        setTimeout(() => {
+          button.textContent = 'Copy';
+          button.classList.remove('copied');
+        }, 1800);
+      });
+
+      pre.appendChild(button);
+    });
   });
-});
+})();

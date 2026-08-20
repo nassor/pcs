@@ -1,5 +1,5 @@
 +++
 title = "Tracing"
-description = "Turn on the tracing feature to get span-level instrumentation for pipeline, stage, system, and retry boundaries, plus distributed runner events."
+description = "Structured tracing events behind the tracing feature flag, the [observability] TOML keys, the Prometheus /metrics endpoint, and an honest account of what is still uninstrumented."
 template = "tracing.html"
 +++

@@ -60,21 +60,44 @@ impl WasmPipelineRuntime {
         })
     }
 
-    fn make_store_and_instance(&self) -> PcsResult<(Store<HostState>, PcsPipeline)> {
-        let host = HostState::new(self.name.clone(), self.config.clone());
-        let mut store = Store::new(&self.engine.engine, host);
-        store.set_epoch_deadline(self.epoch_deadline);
+    /// Build a fresh `Store` and instantiate the component.
+    ///
+    /// Associated rather than a method so it can run inside `spawn_blocking`
+    /// without borrowing `self` across the thread boundary.
+    fn make_store_and_instance(
+        engine: &WasmEngine,
+        component: &Component,
+        name: &str,
+        config: &HashMap<String, String>,
+        epoch_deadline: u64,
+    ) -> PcsResult<(Store<HostState>, PcsPipeline)> {
+        let host = HostState::new(name.to_string(), config.clone());
+        let mut store = Store::new(&engine.engine, host);
+        store.set_epoch_deadline(epoch_deadline);
 
-        let mut linker: Linker<HostState> = Linker::new(&self.engine.engine);
+        let mut linker: Linker<HostState> = Linker::new(&engine.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| PcsError::Configuration(format!("wasi linker error: {e}")))?;
         PcsPipeline::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)
             .map_err(|e| PcsError::Configuration(format!("wasm linker error: {e}")))?;
 
-        let instance = PcsPipeline::instantiate(&mut store, &self.component, &linker)
+        let instance = PcsPipeline::instantiate(&mut store, component, &linker)
             .map_err(|e| PcsError::SystemExecution(format!("guest trap (instantiate): {e}")))?;
 
         Ok((store, instance))
+    }
+
+    /// Everything `self` contributes to a guest call, owned so the call can be
+    /// moved onto a blocking thread. All three clones are `Arc` bumps or a
+    /// small config map.
+    fn call_parts(&self) -> (WasmEngine, Component, String, HashMap<String, String>, u64) {
+        (
+            self.engine.clone(),
+            self.component.clone(),
+            self.name.clone(),
+            self.config.clone(),
+            self.epoch_deadline,
+        )
     }
 
     /// Call `describe()` and cache the result.
@@ -89,7 +112,9 @@ impl WasmPipelineRuntime {
             }
         }
 
-        let (mut store, instance) = self.make_store_and_instance()?;
+        let (engine, component, name, config, epoch_deadline) = self.call_parts();
+        let (mut store, instance) =
+            Self::make_store_and_instance(&engine, &component, &name, &config, epoch_deadline)?;
         let iface = instance.pcs_pipeline_pipeline();
         let desc = iface
             .call_describe(&mut store)
@@ -134,20 +159,37 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
         let mut ipc_bytes: Vec<u8> = Vec::new();
         data.write_ipc(&mut ipc_bytes)?;
 
-        let (mut store, instance) = self.make_store_and_instance()?;
-        let iface = instance.pcs_pipeline_pipeline();
-
         // A fresh Store per call means guest linear memory never survives a
         // batch, so `prior` is the only channel by which guest state returns.
         // `bindgen!` lowers `option<list<u8>>` to `Option<&Vec<u8>>`, so the
         // slice has to be owned for the call; the copy is state-blob-sized and
         // sits next to the full-dataset IPC serialisation above.
         let prior_owned = prior.map(<[u8]>::to_vec);
-        let run_result = iface
-            .call_run_batch(&mut store, &ipc_bytes, prior_owned.as_ref())
-            .map_err(|e| PcsError::SystemExecution(format!("guest trap (run-batch): {e}")))?;
+        let (engine, component, name, config, epoch_deadline) = self.call_parts();
 
-        match run_result {
+        // The guest is linked against the *synchronous* WASI implementation
+        // (`add_to_linker_sync`). Any WASI import the guest touches routes
+        // through `wasmtime_wasi::runtime::in_tokio`, which calls
+        // `Handle::block_on` — and that panics outright when the calling thread
+        // is driving a tokio runtime ("Cannot start a runtime from within a
+        // runtime"). Awaiting the call inline therefore kills the service on
+        // the first batch of any guest that so much as writes to stdout.
+        //
+        // `spawn_blocking` threads are not async execution contexts, so
+        // `block_on` is legal there. Nothing borrowed from `data` crosses the
+        // boundary: IPC bytes in, IPC bytes out.
+        let joined = tokio::task::spawn_blocking(move || -> PcsResult<_> {
+            let (mut store, instance) =
+                Self::make_store_and_instance(&engine, &component, &name, &config, epoch_deadline)?;
+            instance
+                .pcs_pipeline_pipeline()
+                .call_run_batch(&mut store, &ipc_bytes, prior_owned.as_ref())
+                .map_err(|e| PcsError::SystemExecution(format!("guest trap (run-batch): {e}")))
+        })
+        .await
+        .map_err(|e| PcsError::SystemExecution(format!("guest task join failed: {e}")))?;
+
+        match joined? {
             Ok(result) => {
                 let mut out_slice: &[u8] = &result.output;
                 *data = Dataset::read_ipc(&mut out_slice)?;

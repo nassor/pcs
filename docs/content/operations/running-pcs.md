@@ -1,5 +1,6 @@
 +++
 title = "Running PCS Service"
+description = "Building the binary, writing the config, bootstrapping a three-node cluster, monitoring it, and recovering from the failure modes that actually occur."
 template = "page.html"
 +++
 
@@ -16,13 +17,13 @@ and handling common failure scenarios.
 **Standalone mode** (no Raft, single-process):
 
 ```bash
-cargo build --release --features service --bin pcs-service
+cargo build --release --features service,wasm --bin pcs-service
 ```
 
 **Cluster mode** (Raft consensus, multi-node):
 
 ```bash
-cargo build --release --features service-cluster --bin pcs-service
+cargo build --release --features service-cluster,wasm --bin pcs-service
 ```
 
 The `service` feature pulls in `io`, `distributed`, and `tracing`. It does

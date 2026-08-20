@@ -4,21 +4,21 @@
 #
 # HOW TO VALIDATE (does not start a cluster):
 #   PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-#   cargo run --features service --bin pcs-service -- validate \
+#   cargo run --features service-cluster,wasm --bin pcs-service -- validate \
 #     --config examples/configs/cluster.toml
 #
 # HOW TO RUN A 3-NODE CLUSTER (requires three terminals or a process manager):
 #   Terminal 1:
 #     PCS_NODE_ID=1 PCS_BOOTSTRAP=true PCS_DATA_DIR=/tmp/pcs-node-1 \
-#     cargo run --features service --bin pcs-service -- serve \
+#     cargo run --features service-cluster,wasm --bin pcs-service -- serve \
 #       --config examples/configs/cluster.toml
 #   Terminal 2:
 #     PCS_NODE_ID=2 PCS_DATA_DIR=/tmp/pcs-node-2 \
-#     cargo run --features service --bin pcs-service -- serve \
+#     cargo run --features service-cluster,wasm --bin pcs-service -- serve \
 #       --config examples/configs/cluster.toml
 #   Terminal 3:
 #     PCS_NODE_ID=3 PCS_DATA_DIR=/tmp/pcs-node-3 \
-#     cargo run --features service --bin pcs-service -- serve \
+#     cargo run --features service-cluster,wasm --bin pcs-service -- serve \
 #       --config examples/configs/cluster.toml
 #
 # NOTE: In cluster mode, [[sources]] must NOT be declared. The cluster runner

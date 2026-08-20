@@ -2,10 +2,21 @@
 
 This directory contains runnable TOML configurations for `pcs-service`.
 
+## Required features
+
+Every config in this directory declares a `[pipeline.wasm]` table, and that key
+only exists when the `wasm` feature is on. `service` does **not** imply it, so
+`--features service` alone rejects these files with
+`unknown field 'wasm', there are no fields`. Build with:
+
+| Config | Features |
+|--------|----------|
+| `standalone.toml`, `standalone_wasm.toml`, `extension_example.toml` | `service,wasm` |
+| `cluster.toml` | `service-cluster,wasm` |
+
 ## Built-in factories
 
-The stock `pcs-service` binary (built with `--features service`) ships with the
-following factory types.
+The stock `pcs-service` binary ships with the following factory types.
 
 ### Sources (require `--features io`, included by `service`)
 
@@ -81,14 +92,14 @@ rather than a silently-dropped section.
 
 ```bash
 # Build the service binary (once).
-cargo build --features service --bin pcs-service
+cargo build --features service,wasm --bin pcs-service
 
 # Validate the config (no side-effects; exits 0 on success).
-cargo run --features service --bin pcs-service -- validate \
+cargo run --features service,wasm --bin pcs-service -- validate \
   --config examples/configs/standalone.toml --strict
 
 # Run the pipeline (reads fixtures/orders.csv, writes /tmp/pcs-standalone-orders-out.csv).
-cargo run --features service --bin pcs-service -- serve \
+cargo run --features service,wasm --bin pcs-service -- serve \
   --config examples/configs/standalone.toml
 ```
 
@@ -119,7 +130,7 @@ Cluster mode requires `--features service-cluster`. Validating with the base
 
 ```bash
 PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-cargo run --features service-cluster --bin pcs-service -- validate \
+cargo run --features service-cluster,wasm --bin pcs-service -- validate \
   --config examples/configs/cluster.toml --strict
 ```
 
@@ -171,11 +182,11 @@ would register in a real order-processing service. Validate it to see the
 unknown-factory warning behavior:
 
 ```bash
-cargo run --features service --bin pcs-service -- validate \
+cargo run --features service,wasm --bin pcs-service -- validate \
   --config examples/configs/extension_example.toml
 # exits 0, warns about unknown types (KafkaSource, PostgresSink, etc.)
 
-cargo run --features service --bin pcs-service -- validate \
+cargo run --features service,wasm --bin pcs-service -- validate \
   --config examples/configs/extension_example.toml --strict
 # exits 1 — unknown types are errors in --strict mode
 ```

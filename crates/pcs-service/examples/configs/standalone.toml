@@ -2,10 +2,10 @@
 # Single-node operation: no Raft consensus required.
 #
 # HOW TO RUN:
-#   cargo build --features service --bin pcs-service
-#   cargo run --features service --bin pcs-service -- validate \
+#   cargo build --features service,wasm --bin pcs-service
+#   cargo run --features service,wasm --bin pcs-service -- validate \
 #     --config examples/configs/standalone.toml
-#   cargo run --features service --bin pcs-service -- serve \
+#   cargo run --features service,wasm --bin pcs-service -- serve \
 #     --config examples/configs/standalone.toml
 #
 # The pipeline reads from examples/configs/fixtures/orders.csv (CSV source),

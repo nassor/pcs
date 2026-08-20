@@ -1,0 +1,399 @@
+{% extends "base.html" %}
+
+{% block title %}Build your first pipeline — PCS{% endblock %}
+{% block description %}Run a PCS pipeline in five minutes, then ship it as a WebAssembly component to pcs-service.{% endblock %}
+{% block og_title %}Build your first pipeline — PCS{% endblock %}
+{% block og_description %}Run a PCS pipeline in five minutes, then ship it as a WebAssembly component to pcs-service.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Start</div>
+<h1>Build your first pipeline</h1>
+
+<p class="page-lede">
+    Two paths lead through PCS. Start with the one that runs in a single command,
+    then graduate to the one you would actually deploy.
+</p>
+
+<dl class="page-facts">
+    <dt>Time</dt>
+    <dd><strong>5 minutes</strong> for path A, about 15 for path B</dd>
+    <dt>You need</dt>
+    <dd>Rust <strong>1.95</strong> or newer, and a clone of the repository</dd>
+    <dt>Not needed</dt>
+    <dd>No database, no broker, no cluster &mdash; both paths run on your laptop</dd>
+</dl>
+
+<div class="note">
+    <span class="note-label">Before you start</span>
+    <p>
+        PCS crates are <b>not published to crates.io</b>. Every command below assumes
+        you have cloned the repository and are running from its root.
+    </p>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>clone and verify</em></div>
+    <pre><code class="language-bash">git clone https://github.com/nassor/pcs
+cd pcs
+cargo build</code></pre>
+</div>
+
+<h2 id="two-paths">Which path do you want?</h2>
+
+<p>
+    A PCS pipeline is a set of <b>systems</b> operating on <b>columns</b>. How that
+    pipeline reaches production is what the two paths differ on.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 4 656 236" role="img" aria-labelledby="paths-title paths-desc">
+        <title id="paths-title">The two ways to run a PCS pipeline</title>
+        <desc id="paths-desc">
+            Path A links your Rust pipeline directly into your own binary. Path B compiles
+            the same pipeline to a WebAssembly component, which the pcs-service host loads
+            at runtime.
+        </desc>
+
+        <!-- shared source -->
+        <g class="anim anim-1">
+            <rect class="blk blk-data" x="8" y="96" width="150" height="58" rx="8"/>
+            <rect class="hd hd-data" x="8" y="96" width="150" height="20" rx="8"/>
+            <rect class="hd hd-data" x="8" y="108" width="150" height="8"/>
+            <text class="t-lbl" x="20" y="111">your Rust pipeline</text>
+            <text class="t-sm" x="20" y="132">impl System</text>
+            <text class="t-sm" x="20" y="146">impl Component</text>
+        </g>
+
+        <!-- split -->
+        <g class="anim anim-2">
+            <path class="arw arw-data" d="M158 112 H200 V56 H236" marker-end="url(#gs-a)"/>
+            <path class="arw arw-bnd" d="M158 138 H200 V194 H236" marker-end="url(#gs-b)"/>
+        </g>
+
+        <!-- Path A -->
+        <g class="anim anim-2">
+            <text class="t-sm t-data" x="200" y="42">PATH A</text>
+            <rect class="blk blk-data" x="242" y="34" width="164" height="44" rx="8"/>
+            <text class="t-lbl" x="256" y="54">your binary</text>
+            <text class="t-sm" x="256" y="68">cargo run</text>
+
+            <path class="arw arw-data" d="M406 56 H452" marker-end="url(#gs-a)"/>
+            <rect class="blk" x="458" y="34" width="182" height="44" rx="8"/>
+            <text class="t-lbl" x="472" y="54">rows out</text>
+            <text class="t-sm" x="472" y="68">stdout, Parquet, CSV</text>
+        </g>
+
+        <!-- Path B -->
+        <g class="anim anim-3">
+            <text class="t-sm t-bnd" x="200" y="180">PATH B</text>
+            <rect class="blk blk-bnd" x="242" y="172" width="164" height="44" rx="8"/>
+            <text class="t-lbl" x="256" y="192">pipeline.wasm</text>
+            <text class="t-sm" x="256" y="206">cargo component build</text>
+
+            <path class="arw arw-bnd" d="M406 194 H452" marker-end="url(#gs-b)"/>
+            <rect class="blk blk-ctl" x="458" y="160" width="182" height="68" rx="8"/>
+            <rect class="hd hd-ctl" x="458" y="160" width="182" height="20" rx="8"/>
+            <rect class="hd hd-ctl" x="458" y="172" width="182" height="8"/>
+            <text class="t-lbl" x="472" y="175">pcs-service</text>
+            <text class="t-sm" x="472" y="196">loads + validates</text>
+            <text class="t-sm" x="472" y="210">drives sources and sinks</text>
+        </g>
+
+        <!-- annotation -->
+        <g class="anim anim-4">
+            <path class="seam" d="M432 26 V232"/>
+            <text class="t-sm t-bnd t-mid" x="432" y="18">deploy boundary</text>
+        </g>
+
+        <defs>
+            <marker id="gs-a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--data)"/>
+            </marker>
+            <marker id="gs-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--boundary)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-data"><i></i> data plane</span>
+        <span class="k-control"><i></i> control plane</span>
+        <span class="k-boundary"><i></i> WebAssembly boundary</span>
+    </div>
+    <figcaption class="dgm-cap">
+        Both paths run the <b>same pipeline code</b>. Path A links it into a binary you
+        write. Path B compiles it to a component that <code>pcs-service</code> loads at
+        runtime, so shipping a new pipeline never means rebuilding the host.
+    </figcaption>
+</div>
+
+<h2 id="path-a">Path A — run a pipeline now</h2>
+
+<p>
+    The repository ships runnable examples. This one loads nine transactions,
+    validates them, converts currencies, and prints a report.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>path A</em></div>
+    <pre><code class="language-bash">cargo run -p pcs-service --example scheduler_etl</code></pre>
+</div>
+
+<p>You should see:</p>
+
+<div class="code">
+    <div class="code-cap"><span>output</span></div>
+    <pre><code class="language-text">Starting ETL pipeline...
+[ingest]    loaded 9 transactions
+[validate]  7 valid, 2 rejected
+[enrich]    converted 9 rows to USD
+...
+║  Total rows:      9                                  ║
+║  Valid:           7                                  ║</code></pre>
+</div>
+
+<p>Three more examples, in increasing order of interest:</p>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>more examples</em></div>
+    <pre><code class="language-bash"># two systems sharing one parallel stage
+cargo run -p pcs-service --example scheduler_etl_parallel
+
+# Parquet in, Parquet out
+cargo run -p pcs-service --example scheduler_parquet_etl --features io
+
+# partition claiming and checkpointing across a shared store
+cargo run -p pcs-service --example distributed_scheduler --features distributed</code></pre>
+</div>
+
+<h2 id="anatomy">What that example is made of</h2>
+
+<p>
+    Three pieces, and you have met all of them once you can read this much. Each
+    links to its own page when you want the detail.
+</p>
+
+<ol class="steps">
+    <li>
+        <h3>A <code>Component</code> is one Arrow column block</h3>
+        <p>
+            A plain Rust struct plus the Arrow schema for its fields. PCS stores one
+            <code>RecordBatch</code> per component, so a field is a column, not a
+            per-row lookup.
+        </p>
+        <div class="code">
+            <div class="code-cap"><span>Rust</span><em>the data</em></div>
+            <pre><code class="language-rust">#[derive(Serialize, Deserialize, Clone)]
+struct Transaction {
+    id: u64,
+    amount: f64,
+    currency: String,
+    valid: bool,
+    usd_amount: f64,
+}
+
+impl Component for Transaction {
+    fn name() -> &amp;'static str { "Transaction" }
+
+    fn schema() -&gt; Arc&lt;Schema&gt; {
+        Arc::new(Schema::new(vec![
+            Field::new("id",         DataType::UInt64,  false),
+            Field::new("amount",     DataType::Float64, false),
+            Field::new("currency",   DataType::Utf8,    false),
+            Field::new("valid",      DataType::Boolean, false),
+            Field::new("usd_amount", DataType::Float64, false),
+        ]))
+    }
+}</code></pre>
+        </div>
+        <p><a href="{{ get_url(path='@/dataset.md') }}">Dataset &amp; Components &rarr;</a></p>
+    </li>
+
+    <li>
+        <h3>A <code>System</code> declares the fields it touches</h3>
+        <p>
+            <code>meta()</code> is the important half. Naming your reads and writes is
+            what lets PCS work out the execution order for you &mdash; you never write
+            a stage list by hand.
+        </p>
+        <div class="code">
+            <div class="code-cap"><span>Rust</span><em>the transform</em></div>
+            <pre><code class="language-rust">struct ValidateSystem;
+
+#[async_trait]
+impl System for ValidateSystem {
+    fn meta(&amp;self) -&gt; SystemMeta {
+        SystemMeta::new("validate")
+            .read("Transaction", "amount")
+            .write("Transaction", "valid")
+    }
+
+    async fn run(&amp;self, data: &amp;mut Dataset) -&gt; PcsResult&lt;()&gt; {
+        let view = data.view::&lt;Transaction&gt;()?;
+        let amount = view.f64("amount")?;
+        let valid: Vec&lt;bool&gt; = (0..view.len())
+            .map(|i| amount.value(i) &gt; 0.0)
+            .collect();
+        data.replace_batch::&lt;Transaction&gt;(/* batch with new `valid` column */)
+    }
+}</code></pre>
+        </div>
+        <p><a href="{{ get_url(path='@/systems.md') }}">Systems &rarr;</a></p>
+    </li>
+
+    <li>
+        <h3>A <code>Pipeline</code> works out the order and runs it</h3>
+        <p>
+            Register the component, add the systems, run. PCS reads every
+            <code>SystemMeta</code>, finds which systems conflict on a field, and groups
+            the rest into parallel stages.
+        </p>
+        <div class="code">
+            <div class="code-cap"><span>Rust</span><em>the run</em></div>
+            <pre><code class="language-rust">#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    let mut pipeline = Pipeline::builder("etl")
+        .with::&lt;Transaction&gt;()
+        .with_system(ValidateSystem)
+        .with_system(EnrichSystem)
+        .build();
+
+    pipeline.append::&lt;Transaction&gt;(&amp;seed())?;
+    pipeline.run().await?;
+
+    println!("{} rows", pipeline.data().rows());
+    Ok(())
+}</code></pre>
+        </div>
+        <p><a href="{{ get_url(path='@/pipeline.md') }}">Pipeline &rarr;</a></p>
+    </li>
+</ol>
+
+<h2 id="path-b">Path B — ship it as a component</h2>
+
+<p>
+    Path A puts your pipeline inside a binary you build. Path B puts it inside a
+    <code>.wasm</code> file that <code>pcs-service</code> loads at startup, so the host
+    and the pipeline ship on separate schedules.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>one-time setup</em></div>
+    <pre><code class="language-bash">rustup target add wasm32-wasip2
+cargo install cargo-component --locked --version 0.21.1
+cargo install wasm-tools --locked --version 1.246.2</code></pre>
+</div>
+
+<p>The repository ships a worked example. Build it:</p>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>path B</em></div>
+    <pre><code class="language-bash">cargo component build --release \
+  -p order-processing-wasm \
+  --target wasm32-wasip2
+
+wasm-tools component wit \
+  target/wasm32-wasip1/release/order_processing_wasm.wasm</code></pre>
+</div>
+
+<div class="note">
+    <span class="note-label">Expected</span>
+    <p>
+        A <code>--target wasm32-wasip2</code> build lands under
+        <code>target/wasm32-wasip1/</code>. <code>cargo-component</code> compiles the core
+        module for wasip1 and then adapts it into a WASI 0.2 component, keeping the
+        pre-adapter directory name.
+    </p>
+</div>
+
+<p>
+    The <code>wit</code> command prints the contract the host and guest agree on. Your
+    component exports exactly two functions:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>WIT</span><em>pcs:pipeline@0.2.0</em></div>
+    <pre><code class="language-text">describe:   func() -&gt; pipeline-descriptor
+run-batch:  func(input: ipc-bytes, prior: option&lt;checkpoint&gt;)
+              -&gt; result&lt;run-result, run-error&gt;</code></pre>
+</div>
+
+<p>
+    Turning a pipeline into a component is one line at the bottom of your crate.
+    The macro writes both exports for you:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>src/lib.rs</em></div>
+    <pre><code class="language-rust">use pcs_guest::prelude::*;
+
+fn build() -&gt; Pipeline { /* same builder as path A */ }
+
+pcs_guest::export_pipeline!(build);</code></pre>
+</div>
+
+<p>
+    Then point a config file at the <code>.wasm</code> and start the service:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>service.toml</em></div>
+    <pre><code class="language-toml">mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/var/lib/pcs/node-1"
+
+[run_mode]
+kind = "one_shot"
+
+[pipeline.wasm]
+module = "./target/wasm32-wasip1/release/order_processing_wasm.wasm"
+
+# Values your pipeline reads with pcs_config_get / pcs_config_parse.
+[pipeline.wasm.config]
+fx_eur = "1.08"</code></pre>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>terminal</span><em>run the service</em></div>
+    <pre><code class="language-bash">cargo run -p pcs-service --features service,wasm --bin pcs-service -- \
+  validate --config service.toml
+
+cargo run -p pcs-service --features service,wasm --bin pcs-service -- \
+  serve --config service.toml</code></pre>
+</div>
+
+<p>
+    <code>validate</code> parses the config, compiles the component, checks the WIT
+    world, and confirms every source and sink names a component your pipeline
+    actually declares &mdash; before any data moves.
+</p>
+
+<h2 id="next">Where to go next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/dataset.md') }}" class="next-card">
+        <span class="next-card-label">Concept 01</span>
+        <h3>Dataset &amp; Components</h3>
+        <p>How columns are stored, appended, soft-deleted, and serialized. Start here if the <code>Component</code> trait above raised questions.</p>
+    </a>
+    <a href="{{ get_url(path='@/pipeline.md') }}" class="next-card">
+        <span class="next-card-label">Concept 03</span>
+        <h3>Pipeline</h3>
+        <p>How field declarations become a stage plan, and what happens when two systems collide on the same column.</p>
+    </a>
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <span class="next-card-label">Deploy</span>
+        <h3>Service</h3>
+        <p>The full TOML schema, the validation gates, and the HTTP control plane.</p>
+    </a>
+    <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
+        <span class="next-card-label">Operate</span>
+        <h3>Operating pcs-service</h3>
+        <p>Deploying, tuning, and recovering a running service &mdash; standalone or clustered.</p>
+    </a>
+</div>
+
+{% endblock %}

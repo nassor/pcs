@@ -1,5 +1,5 @@
 +++
 title = "Scheduler"
-description = "PCS's Scheduler orchestrates multiple independent Pipelines from one process — sequentially or concurrently, with optional dependency edges and backpressure."
+description = "PCS's Scheduler drives several independent Pipelines from one process, in dependency order, with optional priority, data-dependency skips, and backpressure."
 template = "scheduler.html"
 +++

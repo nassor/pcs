@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
+use crate::dataset::Dataset;
 use crate::error::PcsError;
-use crate::pipeline::Dataset;
 
 use super::System;
 use super::meta::SystemMeta;
@@ -84,7 +84,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     use crate::component::Component;
     #[cfg(feature = "runtime")]
-    use crate::pipeline::Dataset;
+    use crate::dataset::Dataset;
     use crate::retry::SystemConfig;
     #[cfg(feature = "runtime")]
     use arrow_schema::{DataType, Field, Schema};

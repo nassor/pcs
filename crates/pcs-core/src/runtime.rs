@@ -5,8 +5,8 @@
 //! [`Pipeline`]. Two impls exist:
 //!
 //! - [`Pipeline`] (in this crate) — native path. Wraps [`Pipeline::run_on`].
-//!   Used by integration tests, benches, and the current TOML `pipeline.systems`
-//!   config path.
+//!   Used by integration tests, benches, and any binary that hands its own
+//!   pipeline to `ServiceBuilder::with_runtime`.
 //! - `WasmPipelineRuntime` (in `pcs-service`) — serializes the dataset to
 //!   Arrow IPC, calls a guest WASM component's `run-batch` export via wasmtime,
 //!   and reads the IPC result back into the dataset.
@@ -41,6 +41,27 @@ pub trait PipelineRuntime: Send {
     /// standalone runner). Sources and sinks, if any, are **not** drained
     /// here — the host layer handles IO before and after this call.
     async fn run_on(&self, data: &mut Dataset) -> PcsResult<()>;
+
+    /// Execute against `data`, carrying opaque runtime-internal state.
+    ///
+    /// `prior` is the blob this runtime returned from the previous call for the
+    /// same logical partition, or `None` on first run. The returned blob, if
+    /// any, is persisted verbatim by the host and handed back as the next
+    /// `prior`. Hosts must treat it as opaque — only the runtime knows the
+    /// layout.
+    ///
+    /// The default implementation ignores `prior`, delegates to
+    /// [`run_on`](Self::run_on), and returns `Ok(None)` — correct for any
+    /// runtime whose state lives entirely in the `Dataset`.
+    async fn run_on_with_state(
+        &self,
+        data: &mut Dataset,
+        prior: Option<&[u8]>,
+    ) -> PcsResult<Option<Vec<u8>>> {
+        let _ = prior;
+        self.run_on(data).await?;
+        Ok(None)
+    }
 
     /// Component names this runtime expects to find in the dataset.
     ///

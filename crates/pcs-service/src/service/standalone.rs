@@ -31,10 +31,10 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::dataset::Dataset;
 use crate::error::PcsError;
 use crate::io::sink::drain_dataset;
 use crate::io::source::drain_into_dataset;
-use crate::pipeline::Dataset;
 
 use super::builder::{BuiltService, BuiltSink};
 use super::config::{RunMode, ServiceConfig, ServiceMode};
@@ -385,12 +385,13 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    use crate::dataset::Dataset;
     use crate::error::PcsError;
     use crate::io::channel_sink::ChannelSink;
     use crate::io::channel_source::ChannelSource;
     use crate::io::sink::Sink;
     use crate::io::source::Source;
-    use crate::pipeline::{Dataset, Pipeline};
+    use crate::pipeline::Pipeline;
     use crate::service::builder::{BuiltService, BuiltSink, BuiltSource};
     use crate::service::config::{
         HttpConfig, NodeConfig, ObservabilityConfig, PipelineSpec, RunMode, ServiceConfig,
@@ -568,8 +569,6 @@ mod tests {
                 config: StandaloneConfig { run_mode },
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -1031,8 +1030,6 @@ mod tests {
                 },
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },

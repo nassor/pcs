@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
-use pcs_core::pipeline::Dataset;
+use pcs_core::dataset::Dataset;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

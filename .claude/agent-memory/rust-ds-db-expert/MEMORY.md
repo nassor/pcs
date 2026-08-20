@@ -1,4 +1,3 @@
-- [ECS Architecture](project_ecs_architecture.md) — World/System/Pipeline constraints relevant to distributed design on ecs-rewrite branch
 - [RedbSharedStore Design](project_redb_raft_design.md) — Embedded redb + Raft consensus architecture for self-contained distributed deployment
 - [openraft Migration](project_openraft_migration.md) — Switched from tikv/raft to openraft 0.10.0-alpha.17, key API differences
 - [Consensus Determinism Invariants](project_consensus_determinism_invariants.md) — apply() must not read SystemTime, halt on decode failure, Completed≠Pending, retry on transient overlap

@@ -17,13 +17,11 @@
 //! kind = "interval"
 //! interval_ms = 5000
 //!
-//! [[pipeline.systems]]
-//! name = "validate"
-//! type = "ValidateOrder"
+//! [pipeline.wasm]
+//! module = "pipelines/transform.wasm"
 //!
-//! [[pipeline.systems]]
-//! name = "enrich"
-//! type = "EnrichOrder"
+//! [pipeline.wasm.config]
+//! batch_size = "1000"
 //! ```
 //!
 //! ## Example (cluster)
@@ -44,9 +42,8 @@
 //! id = 2
 //! addr = "10.0.0.2:9000"
 //!
-//! [[pipeline.systems]]
-//! name = "process"
-//! type = "ProcessBatch"
+//! [pipeline.wasm]
+//! module = "pipelines/transform.wasm"
 //! ```
 //!
 //! ## Env var substitution
@@ -233,37 +230,6 @@ pub enum ServiceMode {
     },
 }
 
-// ── SystemInstance / ComponentInstance ────────────────────────────────────────
-
-/// A named system instance to be constructed via the factory registry (S4).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SystemInstance {
-    /// Unique name for this instance within the pipeline.
-    pub name: String,
-    /// Factory lookup key, e.g. `"ValidateOrder"`.
-    #[serde(rename = "type")]
-    pub type_name: String,
-    /// Opaque per-system configuration passed to the factory.
-    #[serde(default = "default_table")]
-    pub config: toml::Value,
-}
-
-/// A named component instance to be constructed via the factory registry (S4).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ComponentInstance {
-    /// Unique name for this instance.
-    pub name: String,
-    /// Factory lookup key.
-    #[serde(rename = "type")]
-    pub type_name: String,
-    /// Schema version for this component. Defaults to 1 when absent.
-    #[serde(default)]
-    pub version: Option<u32>,
-    /// Opaque per-component configuration passed to the factory.
-    #[serde(default = "default_table")]
-    pub config: toml::Value,
-}
-
 // ── WasmSpec / PipelineSpec ───────────────────────────────────────────────────
 
 /// WASM guest pipeline specification (requires the `wasm` feature at runtime).
@@ -272,12 +238,15 @@ pub struct ComponentInstance {
 /// [pipeline.wasm]
 /// module = "pipelines/transform.wasm"
 /// sha3_256 = "abc123..."
-/// watch = false
 ///
 /// [pipeline.wasm.config]
 /// batch_size = "1000"
 /// ```
+///
+/// Unknown keys are rejected: a key the service cannot honour is a
+/// configuration error, not something to ignore silently.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WasmSpec {
     /// Path to the `.wasm` component file (relative or absolute).
     pub module: String,
@@ -286,35 +255,27 @@ pub struct WasmSpec {
     /// an optional `sha3-256:` prefix.
     #[serde(default)]
     pub sha3_256: Option<String>,
-    /// Re-load the module on disk change (hot-reload). Defaults to `false`.
-    #[serde(default)]
-    pub watch: bool,
-    /// Opaque key-value config passed to the guest's `init` function.
+    /// Opaque key-value config the guest reads through the
+    /// `pcs:pipeline/host-io` `get-config` import.
     #[serde(default)]
     pub config: HashMap<String, String>,
 }
 
-/// Top-level workload spec — describes the systems the `Scheduler` runs and
-/// the components the `Pipeline` holds.
+/// Top-level workload spec — describes where the pipeline comes from.
 ///
-/// Exactly one of `systems` or `wasm` must be non-empty/present.
+/// Either `wasm` names a guest module, or the embedding binary supplies a
+/// runtime through [`ServiceBuilder::with_runtime`](crate::service::builder::ServiceBuilder::with_runtime).
+/// There is no TOML path for declaring native systems: nothing can construct a
+/// `System` from a type name (see [`registry`](crate::service::registry)), so a
+/// key that looked like it could is rejected rather than dropped.
 ///
 /// Note: `PipelineSpec` and the TOML `[pipeline]` table refer to the abstract
-/// workload definition (systems + components), not the `Pipeline` Rust type
-/// (the columnar data container).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// workload definition, not the `Pipeline` Rust type (the columnar data
+/// container).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineSpec {
-    /// Systems in registration order. DAG scheduling applies.
-    /// Mutually exclusive with `wasm`. Must be non-empty when `wasm` is absent.
-    #[serde(default)]
-    pub systems: Vec<SystemInstance>,
-    /// Components to register before the first pipeline run.
-    /// For WASM pipelines the component list is derived from the guest's
-    /// `describe()` response and this field is ignored.
-    #[serde(default)]
-    pub components: Vec<ComponentInstance>,
-    /// WASM guest module to run instead of native systems.
-    /// Mutually exclusive with `systems`.
+    /// WASM guest module to run.
     #[cfg(feature = "wasm")]
     #[serde(default)]
     pub wasm: Option<WasmSpec>,
@@ -330,7 +291,8 @@ pub struct SourceSpec {
     /// Factory lookup key.
     #[serde(rename = "type")]
     pub type_name: String,
-    /// Name of the `ComponentInstance` this source writes into.
+    /// Name of the component this source writes into. Checked against the
+    /// runtime's `declared_components()` at load time.
     pub target_component: String,
     /// Opaque per-source configuration.
     #[serde(default = "default_table")]
@@ -345,7 +307,8 @@ pub struct SinkSpec {
     /// Factory lookup key.
     #[serde(rename = "type")]
     pub type_name: String,
-    /// Name of the `ComponentInstance` this sink reads from.
+    /// Name of the component this sink reads from. Checked against the
+    /// runtime's `declared_components()` at load time.
     pub source_component: String,
     /// Opaque per-sink configuration.
     #[serde(default = "default_table")]
@@ -435,7 +398,9 @@ pub struct ServiceConfig {
     /// Runtime mode (standalone or cluster), flattened into the document.
     #[serde(flatten)]
     pub mode: ServiceMode,
-    /// Pipeline systems and components to instantiate.
+    /// Where the pipeline comes from. Omit the `[pipeline]` table entirely when
+    /// the embedding binary supplies a runtime programmatically.
+    #[serde(default)]
     pub pipeline: PipelineSpec,
     /// Data sources feeding the pipeline.
     #[serde(default)]
@@ -539,68 +504,13 @@ impl ServiceConfig {
             }
         }
 
-        // 3. Wasm / native mutual exclusivity.
-        #[cfg(feature = "wasm")]
-        let is_wasm = self.pipeline.wasm.is_some();
-        #[cfg(not(feature = "wasm"))]
-        let is_wasm = false;
+        // 3. Source / sink component references and the presence of a pipeline
+        //    are validated at load time, not here: the component list comes
+        //    from the runtime's `declared_components()` (see
+        //    `service::validation::validate_io_coverage`), and the runtime may
+        //    be supplied programmatically rather than by this config.
 
-        if is_wasm && !self.pipeline.systems.is_empty() {
-            return Err(PcsError::configuration(
-                "pipeline.wasm and pipeline.systems are mutually exclusive — \
-                 remove one or the other",
-            ));
-        }
-        if !is_wasm && self.pipeline.systems.is_empty() {
-            return Err(PcsError::configuration(
-                "pipeline must have at least one system when pipeline.wasm is absent",
-            ));
-        }
-
-        // 4. Pipeline system names must be unique (native path only).
-        if !is_wasm {
-            let mut seen_sys: HashSet<&str> = HashSet::new();
-            for sys in &self.pipeline.systems {
-                if !seen_sys.insert(sys.name.as_str()) {
-                    return Err(PcsError::configuration(format!(
-                        "pipeline has duplicate system name: {}",
-                        sys.name
-                    )));
-                }
-            }
-
-            // Build component name set for cross-reference checks.
-            // Skip for wasm: the guest's describe() provides the component list
-            // at load time, not at config-parse time.
-            let component_names: HashSet<&str> = self
-                .pipeline
-                .components
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect();
-
-            // 5. Every SourceSpec.target_component must reference a known component.
-            for src in &self.sources {
-                if !component_names.contains(src.target_component.as_str()) {
-                    return Err(PcsError::configuration(format!(
-                        "source '{}' references unknown component '{}'",
-                        src.name, src.target_component
-                    )));
-                }
-            }
-
-            // 6. Every SinkSpec.source_component must reference a known component.
-            for sink in &self.sinks {
-                if !component_names.contains(sink.source_component.as_str()) {
-                    return Err(PcsError::configuration(format!(
-                        "sink '{}' references unknown component '{}'",
-                        sink.name, sink.source_component
-                    )));
-                }
-            }
-        }
-
-        // 7. HTTP bind address must parse as a SocketAddr (unless disabled).
+        // 4. HTTP bind address must parse as a SocketAddr (unless disabled).
         if !self.http.disabled {
             SocketAddr::from_str(&self.http.bind).map_err(|e| {
                 PcsError::configuration(format!(
@@ -692,9 +602,6 @@ mode = "standalone"
 id = 1
 data_dir = "/tmp/pcs-test"
 
-[[pipeline.systems]]
-name = "process"
-type = "ProcessBatch"
 "#
     }
 
@@ -715,9 +622,6 @@ addr = "127.0.0.1:9000"
 id = 2
 addr = "127.0.0.2:9000"
 
-[[pipeline.systems]]
-name = "process"
-type = "ProcessBatch"
 "#
     }
 
@@ -733,21 +637,7 @@ type = "ProcessBatch"
                     run_mode: RunMode::Interval { interval_ms: 5_000 },
                 },
             },
-            pipeline: PipelineSpec {
-                systems: vec![SystemInstance {
-                    name: "validate".to_string(),
-                    type_name: "ValidateOrder".to_string(),
-                    config: default_table(),
-                }],
-                components: vec![ComponentInstance {
-                    name: "orders".to_string(),
-                    type_name: "OrderComponent".to_string(),
-                    version: None,
-                    config: default_table(),
-                }],
-                #[cfg(feature = "wasm")]
-                wasm: None,
-            },
+            pipeline: PipelineSpec::default(),
             sources: vec![SourceSpec {
                 name: "kafka_in".to_string(),
                 type_name: "KafkaSource".to_string(),
@@ -793,13 +683,7 @@ data_dir = "/tmp/pcs"
 kind = "interval"
 interval_ms = 5000
 
-[[pipeline.systems]]
-name = "validate"
-type = "ValidateOrder"
 
-[[pipeline.components]]
-name = "orders"
-type = "OrderComponent"
 
 [[sources]]
 name = "kafka_in"
@@ -825,8 +709,11 @@ log_level = "debug"
         assert_eq!(restored.node.id, original.node.id);
         assert_eq!(restored.node.name, original.node.name);
         assert_eq!(restored.node.data_dir, original.node.data_dir);
-        assert_eq!(restored.pipeline.systems.len(), 1);
-        assert_eq!(restored.pipeline.systems[0].name, "validate");
+        #[cfg(feature = "wasm")]
+        assert!(
+            restored.pipeline.wasm.is_none(),
+            "no [pipeline] table means no wasm module"
+        );
         assert_eq!(restored.sources.len(), 1);
         assert_eq!(restored.sources[0].target_component, "orders");
         assert_eq!(restored.sinks.len(), 1);
@@ -863,7 +750,6 @@ log_level = "debug"
         assert!(!cfg.http.disabled);
         assert_eq!(cfg.observability.log_level, "info");
         assert_eq!(cfg.observability.log_format, LogFormat::Pretty);
-        assert_eq!(cfg.pipeline.systems[0].name, "process");
     }
 
     // ── Test 3: Minimal cluster config parses ─────────────────────────────────
@@ -898,9 +784,6 @@ mode = "standalone"
 [node]
 data_dir = "/tmp/pcs"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 "#;
         let result: Result<ServiceConfig, _> = toml::from_str(raw);
         assert!(result.is_err(), "expected parse error for missing node.id");
@@ -922,9 +805,6 @@ mode = "turbo_mode"
 id = 1
 data_dir = "/tmp/pcs"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 "#;
         let result: Result<ServiceConfig, _> = toml::from_str(raw);
         assert!(result.is_err(), "expected parse error for unknown mode");
@@ -949,9 +829,6 @@ addr = "127.0.0.1:9000"
 id = 2
 addr = "127.0.0.2:9000"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 "#;
         let cfg: ServiceConfig = toml::from_str(raw).expect("parse should succeed");
         let err = cfg.validate().unwrap_err();
@@ -978,9 +855,6 @@ data_dir = "/tmp/pcs"
 id = 1
 addr = "127.0.0.1:9000"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 "#;
         let cfg: ServiceConfig = toml::from_str(raw).expect("parse should succeed");
         let err = cfg.validate().unwrap_err();
@@ -990,10 +864,13 @@ type = "Proc"
         );
     }
 
-    // ── Test 8: Source references unknown component rejected ──────────────────
+    // ── Test 8: Unknown source components are a load-time concern now ─────────
 
+    /// Config parsing no longer knows the component list; the runtime supplies
+    /// it via `declared_components()` and
+    /// `service::validation::validate_io_coverage` does the cross-check.
     #[test]
-    fn test_source_unknown_component_rejected() {
+    fn test_source_component_reference_is_not_checked_at_parse_time() {
         let raw = r#"
 mode = "standalone"
 
@@ -1001,21 +878,14 @@ mode = "standalone"
 id = 1
 data_dir = "/tmp/pcs"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
-
 [[sources]]
 name = "my_source"
 type = "KafkaSource"
 target_component = "nonexistent_component"
 "#;
         let cfg: ServiceConfig = toml::from_str(raw).expect("parse should succeed");
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("nonexistent_component"),
-            "error should name the unknown component: {err}"
-        );
+        cfg.validate()
+            .expect("component references are resolved against the runtime, not the config");
     }
 
     // ── Test 9: Env var substitution — ${HOME} replaced ───────────────────────
@@ -1064,33 +934,6 @@ target_component = "nonexistent_component"
         assert!(matches!(cfg.mode, ServiceMode::Standalone { .. }));
     }
 
-    // ── Extra: duplicate system names rejected ────────────────────────────────
-
-    #[test]
-    fn test_duplicate_system_names_rejected() {
-        let raw = r#"
-mode = "standalone"
-
-[node]
-id = 1
-data_dir = "/tmp/pcs"
-
-[[pipeline.systems]]
-name = "dup"
-type = "Foo"
-
-[[pipeline.systems]]
-name = "dup"
-type = "Bar"
-"#;
-        let cfg: ServiceConfig = toml::from_str(raw).expect("parse");
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("dup"),
-            "error should name the duplicate: {err}"
-        );
-    }
-
     // ── Extra: RunMode interval round-trips ───────────────────────────────────
 
     #[test]
@@ -1114,9 +957,6 @@ mode = "standalone"
 id = 1
 data_dir = "/tmp/pcs"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 
 [http]
 bind = "not-a-socket-addr"
@@ -1159,13 +999,7 @@ addr = "127.0.0.1:9000"
 id = 2
 addr = "127.0.0.2:9000"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 
-[[pipeline.components]]
-name = "orders"
-type = "OrderComp"
 
 [[sources]]
 name = "kafka_in"
@@ -1189,10 +1023,10 @@ target_component = "orders"
         );
     }
 
-    // ── Empty systems + no wasm rejected ─────────────────────────────────────
+    // ── Keys the service cannot honour are rejected, not dropped ─────────────
 
     #[test]
-    fn test_empty_systems_without_wasm_rejected() {
+    fn test_pipeline_systems_key_is_rejected() {
         let raw = r#"
 mode = "standalone"
 
@@ -1200,56 +1034,71 @@ mode = "standalone"
 id = 1
 data_dir = "/tmp/pcs"
 
-[pipeline]
-systems = []
+[[pipeline.systems]]
+name = "proc"
+type = "Proc"
 "#;
-        let cfg: ServiceConfig = toml::from_str(raw).expect("parse");
-        let err = cfg.validate().unwrap_err();
+        let err = toml::from_str::<ServiceConfig>(raw)
+            .expect_err("pipeline.systems must be rejected, not silently dropped");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("at least one system"),
-            "error should mention systems requirement: {err}"
+            msg.contains("systems"),
+            "error should name the offending key: {msg}"
         );
     }
 
-    // ── Wasm + systems mutual exclusivity ────────────────────────────────────
+    #[test]
+    fn test_pipeline_components_key_is_rejected() {
+        let raw = r#"
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/tmp/pcs"
+
+[[pipeline.components]]
+name = "orders"
+type = "GenericComponent"
+"#;
+        let err = toml::from_str::<ServiceConfig>(raw)
+            .expect_err("pipeline.components must be rejected, not silently dropped");
+        assert!(err.to_string().contains("components"), "{err}");
+    }
 
     #[cfg(feature = "wasm")]
     #[test]
-    fn test_wasm_and_systems_mutually_exclusive() {
-        use std::collections::HashMap;
-        let cfg = ServiceConfig {
-            node: NodeConfig {
-                id: 1,
-                name: None,
-                data_dir: PathBuf::from("/tmp/pcs"),
-            },
-            mode: ServiceMode::Standalone {
-                config: StandaloneConfig::default(),
-            },
-            pipeline: PipelineSpec {
-                systems: vec![SystemInstance {
-                    name: "proc".to_string(),
-                    type_name: "Proc".to_string(),
-                    config: default_table(),
-                }],
-                components: vec![],
-                wasm: Some(WasmSpec {
-                    module: "pipeline.wasm".to_string(),
-                    sha3_256: None,
-                    watch: false,
-                    config: HashMap::new(),
-                }),
-            },
-            sources: vec![],
-            sinks: vec![],
-            http: HttpConfig::default(),
-            observability: ObservabilityConfig::default(),
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "error should mention mutual exclusivity: {err}"
-        );
+    fn test_wasm_watch_key_is_rejected() {
+        let raw = r#"
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/tmp/pcs"
+
+[pipeline.wasm]
+module = "pipeline.wasm"
+watch = true
+"#;
+        let err = toml::from_str::<ServiceConfig>(raw)
+            .expect_err("watch was never implemented; it must not parse");
+        assert!(err.to_string().contains("watch"), "{err}");
+    }
+
+    /// A config with no `[pipeline]` table at all is valid: the embedding
+    /// binary supplies the runtime through `ServiceBuilder::with_runtime`.
+    /// `ServiceBuilder::build` is what rejects "no runtime at all".
+    #[test]
+    fn test_missing_pipeline_table_validates() {
+        let raw = r#"
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/tmp/pcs"
+"#;
+        let cfg: ServiceConfig = toml::from_str(raw).expect("parse");
+        cfg.validate()
+            .expect("a programmatically-supplied runtime needs no [pipeline] table");
     }
 
     #[cfg(feature = "wasm")]
@@ -1266,12 +1115,9 @@ systems = []
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 wasm: Some(WasmSpec {
                     module: "pipeline.wasm".to_string(),
                     sha3_256: None,
-                    watch: false,
                     config: HashMap::new(),
                 }),
             },
@@ -1293,13 +1139,7 @@ mode = "standalone"
 id = 1
 data_dir = "/tmp/pcs"
 
-[[pipeline.systems]]
-name = "proc"
-type = "Proc"
 
-[[pipeline.components]]
-name = "orders"
-type = "OrderComp"
 
 [[sources]]
 name = "kafka_in"

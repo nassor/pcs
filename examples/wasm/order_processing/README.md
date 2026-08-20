@@ -43,9 +43,11 @@ native example's `Report` resource — the WASM port prints summary lines via
 `println!` (routed to the host's tracing layer through `wasi:cli/stdout`)
 instead of writing a host-side resource.
 
-A future iteration can read FX rates from the `init(config)` JSON blob via
-`pcs_guest::config_get_typed("fx_rates")` once that helper graduates from
-its current stub.
+FX rates come from the host's `[pipeline.wasm.config]` table. `build()` reads
+the `fx_eur` / `fx_gbp` / `fx_jpy` / `fx_cad` keys via `pcs_config_parse::<f64>`
+— the accessor `export_pipeline!` emits into this crate, backed by the
+`pcs:pipeline/host-io` `get-config` import — and falls back to
+`FxRates::DEFAULT` per missing key.
 
 ## Build
 
@@ -63,9 +65,10 @@ This produces:
 target/wasm32-wasip1/release/order_processing_wasm.wasm
 ```
 
-(cargo-component renames the target subdirectory to `wasm32-wasip1` in its
-final component-wrap step. This is expected and matches the smoketest
-output path.)
+(A `--target wasm32-wasip2` build lands under `wasm32-wasip1` because
+cargo-component 0.21.1 compiles the core module for wasip1 and adapts it into a
+wasip2 component, keeping the pre-adapter directory name. This is expected and
+matches the smoketest output path.)
 
 Validate the component:
 
@@ -74,7 +77,7 @@ wasm-tools validate --features component-model \
   target/wasm32-wasip1/release/order_processing_wasm.wasm
 ```
 
-Inspect the exported world to confirm `pcs:pipeline/pipeline@0.1.0` is
+Inspect the exported world to confirm `pcs:pipeline/pipeline@0.2.0` is
 exported:
 
 ```bash
@@ -84,17 +87,12 @@ wasm-tools component wit \
 
 ## Run via `pcs-service`
 
-The host loader (`pipeline.wasm` TOML +
-PipelineRuntimeLoader`) is in flight at the time this example was
-written. Once it lands, the example can be run end-to-end via:
-
 ```bash
-pcs-service serve --config examples/configs/standalone_wasm.toml
+pcs-service serve --config crates/pcs-service/examples/configs/standalone_wasm.toml
 ```
 
-A reference TOML configuration will live at
-`crates/pcs-service/examples/configs/standalone_wasm.toml` (added alongside
-the loader). The expected shape:
+A reference configuration lives at
+`crates/pcs-service/examples/configs/standalone_wasm.toml`. The shape:
 
 ```toml
 mode = "standalone"
@@ -107,28 +105,28 @@ data_dir = "/var/lib/pcs"
 kind = "interval"
 interval_ms = 5000
 
-[[pipelines]]
-name = "order_processing"
-
-[pipelines.wasm]
+[pipeline.wasm]
 module = "./target/wasm32-wasip1/release/order_processing_wasm.wasm"
-config = {}
 
-[[pipelines.sources]]
+[pipeline.wasm.config]
+fx_eur = "1.08"
+fx_gbp = "1.27"
+
+[[sources]]
 name = "txns_in"
-type = "Parquet"
+type = "ParquetSource"
 target_component = "Transaction"
 
-[pipelines.sources.config]
+[sources.config]
 path = "/data/transactions/"
 
-[[pipelines.sinks]]
+[[sinks]]
 name = "enriched_out"
-type = "JsonLines"
+type = "JsonSink"
 source_component = "Transaction"
 
-[pipelines.sinks.config]
-          path: /data/enriched/
+[sinks.config]
+path = "/data/enriched/out.jsonl"
 ```
 
 ## Source layout

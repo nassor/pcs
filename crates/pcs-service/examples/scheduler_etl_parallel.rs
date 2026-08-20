@@ -31,7 +31,8 @@ use async_trait::async_trait;
 
 use pcs_service::PcsError;
 use pcs_service::component::Component;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::dataset::Dataset;
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{FieldRef, ParallelSystem, System, SystemMeta, WriteSet, system_fn};
 use serde::{Deserialize, Serialize};
 

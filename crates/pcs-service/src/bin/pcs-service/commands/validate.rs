@@ -3,7 +3,8 @@
 //! Runs three validation gates:
 //!
 //! **Gate 1 — structural**: Parses the TOML and verifies every field is valid.
-//! Any TOML typo or missing required field fails here.
+//! Any TOML typo, missing required field, or key the service cannot honour
+//! (`pipeline.systems`, `pipeline.wasm.watch`, …) fails here.
 //!
 //! **Gate 2 — world match**: Attempts to build the service using the built-in
 //! factory registry, which compiles any WASM module and verifies the WIT world
@@ -13,12 +14,18 @@
 //! source `target_component` and sink `source_component` declared in the config
 //! refers to a component actually handled by the runtime.
 //!
+//! The schema-fingerprint gate
+//! ([`validate_schema_fingerprint`](pcs_service::service::validation::validate_schema_fingerprint))
+//! is **not** run here: it compares the pipeline against the persisted state in
+//! `node.data_dir`, which only exists once the cluster runner has opened it.
+//! `pcs-service serve` applies it at cluster startup.
+//!
 //! ## Unknown type handling
 //!
-//! User-defined factory types (systems, sources, sinks, components) are not in
-//! the built-in registry.  Unknown types are reported as **warnings** by default
-//! so that configs referencing user types still pass `validate` without a full
-//! custom binary.  Use `--strict` to promote unknown types to errors.
+//! User-defined factory types (sources, sinks) are not in the built-in
+//! registry.  Unknown types are reported as **warnings** by default so that
+//! configs referencing user types still pass `validate` without a full custom
+//! binary.  Use `--strict` to promote unknown types to errors.
 //!
 //! ## Exit codes
 //!
@@ -59,7 +66,9 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
     #[cfg(not(feature = "wasm"))]
     let has_wasm = false;
     let builder = if !has_wasm {
-        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new("pcs-service")))
+        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new(
+            "pcs-service",
+        )))
     } else {
         builder
     };
@@ -102,7 +111,14 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
             ServiceMode::Cluster { .. } => "cluster",
         }
     );
-    println!("  systems:  {}", config.pipeline.systems.len());
+    #[cfg(feature = "wasm")]
+    println!(
+        "  pipeline: {}",
+        match &config.pipeline.wasm {
+            Some(spec) => spec.module.as_str(),
+            None => "(runtime supplied programmatically)",
+        }
+    );
     println!("  sources:  {}", config.sources.len());
     println!("  sinks:    {}", config.sinks.len());
     println!("  http.bind: {}", config.http.bind);
@@ -138,11 +154,9 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
 /// (as opposed to a factory build failure or schema error).
 fn is_unknown_factory_error(e: &PcsError) -> bool {
     // ServiceBuilder::build formats missing-factory errors as:
-    //   "no system/component/source/sink factory registered for type '...'"
+    //   "no source/sink factory registered for type '...'"
     e.category() == "configuration"
-        && (e.message().contains("no system factory registered")
-            || e.message().contains("no component factory registered")
-            || e.message().contains("no source factory registered")
+        && (e.message().contains("no source factory registered")
             || e.message().contains("no sink factory registered"))
 }
 
@@ -150,17 +164,12 @@ fn is_unknown_factory_error(e: &PcsError) -> bool {
 mod tests {
     use super::*;
     use pcs_service::service::config::{
-        ComponentInstance, HttpConfig, NodeConfig, ObservabilityConfig, PipelineSpec,
-        ServiceConfig, ServiceMode, SinkSpec, SourceSpec, StandaloneConfig, SystemInstance,
+        HttpConfig, NodeConfig, ObservabilityConfig, PipelineSpec, ServiceConfig, ServiceMode,
+        SinkSpec, SourceSpec, StandaloneConfig,
     };
     use std::path::PathBuf;
 
-    fn make_config(
-        systems: Vec<SystemInstance>,
-        components: Vec<ComponentInstance>,
-        sources: Vec<SourceSpec>,
-        sinks: Vec<SinkSpec>,
-    ) -> ServiceConfig {
+    fn make_config(sources: Vec<SourceSpec>, sinks: Vec<SinkSpec>) -> ServiceConfig {
         ServiceConfig {
             node: NodeConfig {
                 id: 1,
@@ -170,12 +179,7 @@ mod tests {
             mode: ServiceMode::Standalone {
                 config: StandaloneConfig::default(),
             },
-            pipeline: PipelineSpec {
-                systems,
-                components,
-                #[cfg(feature = "wasm")]
-                wasm: None,
-            },
+            pipeline: PipelineSpec::default(),
             sources,
             sinks,
             http: HttpConfig::default(),
@@ -187,10 +191,11 @@ mod tests {
 
     #[test]
     fn test_builtin_only_config_validates_cleanly() {
-        // An empty config (no systems, no sources) should always pass.
-        let config = make_config(vec![], vec![], vec![], vec![]);
+        // An empty config (no sources, no sinks) should always pass.
+        let config = make_config(vec![], vec![]);
         let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
+        let builder =
+            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let result = builder.build(&config);
         assert!(
             result.is_ok(),
@@ -204,8 +209,6 @@ mod tests {
     fn test_unknown_sink_type_is_unknown_factory_error() {
         let config = make_config(
             vec![],
-            vec![],
-            vec![],
             vec![SinkSpec {
                 name: "sink1".to_string(),
                 type_name: "PostgresSink".to_string(), // not built-in
@@ -214,7 +217,8 @@ mod tests {
             }],
         );
         let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
+        let builder =
+            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let err = builder.build(&config).unwrap_err();
         assert_eq!(err.category(), "configuration");
         assert!(
@@ -228,21 +232,6 @@ mod tests {
     #[test]
     fn test_unknown_source_type_is_unknown_factory_error() {
         let config = make_config(
-            vec![],
-            vec![ComponentInstance {
-                name: "orders".to_string(),
-                type_name: "GenericComponent".to_string(),
-                version: None,
-                config: toml::from_str(
-                    r#"
-[[fields]]
-name = "id"
-type = "Int64"
-nullable = false
-"#,
-                )
-                .unwrap(),
-            }],
             vec![SourceSpec {
                 name: "src1".to_string(),
                 type_name: "KafkaSource".to_string(), // not built-in
@@ -252,7 +241,8 @@ nullable = false
             vec![],
         );
         let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
+        let builder =
+            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let err = builder.build(&config).unwrap_err();
         assert!(
             is_unknown_factory_error(&err),

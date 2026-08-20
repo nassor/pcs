@@ -2,7 +2,7 @@
 
 This crate targets the WebAssembly Component Model. Host and guest share an
 exact-pinned Arrow IPC crate, and the tooling versions below are what the
-team has validated against the `pcs:pipeline@0.1.0` WIT package.
+team has validated against the `pcs:pipeline@0.2.0` WIT package.
 
 ## Required tools
 
@@ -32,6 +32,19 @@ wasm-tools component wit crates/pcs-guest/wit/pipeline.wit > /dev/null
 
 Exit code 0 = parse succeeded. Non-zero = structural WIT error; diff against
 the committed `pipeline.wit` before investigating further.
+
+The `wasm_guest` CI job runs the same check against the built component:
+
+```
+wasm-tools validate --features component-model target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+wasm-tools component wit target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+```
+
+The second command must show world `pcs:pipeline@0.2.0` exporting exactly
+`describe` and `run-batch`. The `wasm32-wasip1` path is expected for a
+`--target wasm32-wasip2` build: `cargo-component` 0.21.1 compiles the core
+module for wasip1 and adapts it into a component, keeping the pre-adapter
+directory name.
 
 ## Upgrade policy
 

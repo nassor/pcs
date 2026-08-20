@@ -28,8 +28,6 @@ impl OwnedFieldAccess {
 
 #[derive(Debug, Clone)]
 pub(super) struct ExpandedMeta {
-    #[allow(dead_code)]
-    pub(super) name: &'static str,
     pub(super) reads: Vec<OwnedFieldAccess>,
     pub(super) writes: Vec<OwnedFieldAccess>,
     pub(super) reads_resources: Vec<std::any::TypeId>,
@@ -89,7 +87,6 @@ impl ExpandedMeta {
         }
 
         Ok(Self {
-            name: meta.name,
             reads,
             writes,
             reads_resources: meta.reads_resources.clone(),
@@ -350,7 +347,7 @@ mod tests {
     use crate::pipeline::Pipeline;
     use crate::system::{System, SystemMeta, system_fn};
 
-    use super::super::Dataset;
+    use crate::dataset::Dataset;
 
     #[derive(Serialize, Deserialize)]
     struct DagOrder {

@@ -20,12 +20,13 @@ pub(crate) mod raft_impl {
     use openraft::Config as RaftConfig;
     use openraft::Raft;
     use openraft::error::InitializeError;
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
     use tokio::sync::{mpsc, oneshot};
 
     use crate::PcsError;
     use crate::PcsResult;
     use crate::distributed::consensus::storage::raft_impl::{
-        ArrowRedbLogStore, ArrowRedbStateMachine,
+        ArrowRedbLogStore, ArrowRedbStateMachine, validate_store_consistency,
     };
     use crate::distributed::consensus::transport::TcpNetworkFactory;
     use crate::distributed::consensus::types::{
@@ -80,9 +81,6 @@ pub(crate) mod raft_impl {
         /// Used by `RedbSharedStore::multi_node` to open read-only queries
         /// against the same file that the state machine writes to.
         app_db: Arc<std::sync::Mutex<redb::Database>>,
-        /// Peer addresses as `"host:port"` strings for leader forwarding.
-        #[allow(dead_code)]
-        peers: HashMap<u64, String>,
     }
 
     impl ArrowRaftDriverHandle {
@@ -183,13 +181,29 @@ pub(crate) mod raft_impl {
                 .map_err(|e| PcsError::configuration(format!("openraft config: {e}")))?,
             );
 
-            let log_store = ArrowRedbLogStore::open(&log_db_path)?;
+            let mut log_store = ArrowRedbLogStore::open(&log_db_path)?;
             let app_db = Arc::new(std::sync::Mutex::new(
                 redb::Database::create(&app_db_path)
                     .map_err(|e| PcsError::store(format!("open app_db: {e}")))?,
             ));
-            let state_machine = ArrowRedbStateMachine::open(app_db.clone())
+            let mut state_machine = ArrowRedbStateMachine::open(app_db.clone())
                 .map_err(|e| PcsError::store(format!("open state machine: {e}")))?;
+
+            // Both halves of the node directory are open; refuse to start if the
+            // state machine is behind what the log store already purged. Without
+            // this a node restored from mismatched backups would silently
+            // diverge instead of failing loudly.
+            {
+                let log_state = log_store
+                    .get_log_state()
+                    .await
+                    .map_err(|e| PcsError::store(format!("read log state: {e}")))?;
+                let (last_applied, _membership) = state_machine
+                    .applied_state()
+                    .await
+                    .map_err(|e| PcsError::store(format!("read applied state: {e}")))?;
+                validate_store_consistency(log_state.last_purged_log_id, last_applied)?;
+            }
 
             let peers_basic: HashMap<u64, BasicNode> = config
                 .peers
@@ -229,7 +243,7 @@ pub(crate) mod raft_impl {
                 }
             }
 
-            // Extract peers after all config.peers borrows are done.
+            // `run_loop` takes ownership for leader forwarding.
             let peers = config.peers;
 
             let (proposal_tx, proposal_rx) = mpsc::channel::<(
@@ -243,7 +257,6 @@ pub(crate) mod raft_impl {
                 shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
                 raft: raft.clone(),
                 app_db,
-                peers: peers.clone(),
             };
 
             let raft_clone = raft.clone();
@@ -359,6 +372,48 @@ pub(crate) mod raft_impl {
                 .await
                 .expect("driver should stop within 3s");
             assert!(result.is_ok());
+        }
+
+        /// A log store that has purged past an empty state machine is the exact
+        /// mismatched-backup shape `validate_store_consistency` describes.
+        /// `start` must refuse rather than come up and diverge.
+        #[tokio::test]
+        async fn test_start_refuses_inconsistent_node_directory() {
+            use openraft::vote::RaftLeaderId;
+
+            let dir = TempDir::new().unwrap();
+            let log_path = dir.path().join("arrow_log.redb");
+            let app_path = dir.path().join("arrow_app.redb");
+
+            // Purge the log up to index 10 while leaving the state machine file
+            // untouched, so `last_applied` stays `None`.
+            {
+                let mut log_store = ArrowRedbLogStore::open(&log_path).unwrap();
+                let purged = openraft::LogId::new(
+                    openraft::impls::leader_id_adv::LeaderId::new(1u64, 1u64),
+                    10,
+                );
+                log_store.purge(purged).await.unwrap();
+            }
+
+            let config = ArrowRaftDriverConfig {
+                node_id: 1,
+                listen_addr: free_addr(),
+                peers: HashMap::new(),
+                heartbeat_interval_ms: 30,
+                election_timeout_min_ms: 100,
+                election_timeout_max_ms: 200,
+            };
+
+            let err = ArrowRaftDriver::start(config, &log_path, &app_path)
+                .await
+                .err()
+                .expect("start must refuse an inconsistent node directory");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("store consistency violation"),
+                "error must name the consistency check; got: {msg}"
+            );
         }
     }
 }

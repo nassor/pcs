@@ -228,7 +228,7 @@ Assert on the observable outcome, not the trap type. Template off `test_checkpoi
 **Validation checklist before merging (task #12 completion):**
 - [ ] `wasm-tools component wit crates/pcs-guest/wit/` parses cleanly.
 - [ ] `wasm-tools validate --features component-model` on a trivial guest built against this world passes.
-- [ ] bindgen-generated host types compile against `wasmtime::component` 43.0.1.
+- [ ] bindgen-generated host types compile against `wasmtime::component` 47.0.3.
 - [ ] Round-trip: a minimal guest echoes input IPC back unchanged → host reads equivalent RecordBatch.
 
 **Open questions to surface to team-lead before finalizing:**

@@ -81,9 +81,9 @@ pub struct DroppedLate;
 ///
 /// Produced by [`WindowedSystem`](super::system::WindowedSystem) and inserted
 /// into the dataset as a resource via
-/// [`Dataset::insert_resource`](crate::pipeline::Dataset::insert_resource).
+/// [`Dataset::insert_resource`](crate::dataset::Dataset::insert_resource).
 /// Downstream systems retrieve it with
-/// [`Dataset::get_resource::<WindowResults>()`](crate::pipeline::Dataset::get_resource)
+/// [`Dataset::get_resource::<WindowResults>()`](crate::dataset::Dataset::get_resource)
 /// and consume or forward the batches.
 ///
 /// Each time the windowed system runs it replaces the previous `WindowResults`

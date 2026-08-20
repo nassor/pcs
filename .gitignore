@@ -2,7 +2,9 @@
 /tmp
 /docs/public
 **/.DS_Store
-prototypes/
+
+# Machine state, not source
+.claude/scheduled_tasks.lock
 
 # Avoid IDE files
 .idea/

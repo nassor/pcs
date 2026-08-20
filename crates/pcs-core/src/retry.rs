@@ -1,7 +1,8 @@
 //! # Retry — Retry Strategies and Execution
 //!
-//! This module provides retry strategies and the `run_with_retries` function used by the
-//! task and node execution layers.
+//! This module provides the retry strategies and the two retry drivers
+//! (`run_with_retries`, `run_with_retries_blocking`) that
+//! `Pipeline`'s stage executor uses for every system it runs.
 //!
 //! ## Retry Modes
 //!
@@ -27,9 +28,6 @@
 use crate::error::PcsError;
 use rand::RngExt;
 use std::time::Duration;
-
-#[cfg(feature = "tracing")]
-use tracing::{debug, error, info, info_span, instrument, warn};
 
 /// Retry modes for task execution
 ///
@@ -228,10 +226,60 @@ impl SystemConfig {
     }
 }
 
-/// Execute a fallible async function with retry logic driven by [`SystemConfig`]
+/// Attempt bookkeeping shared by [`run_with_retries`] and
+/// [`run_with_retries_blocking`].
 ///
-/// Runs `run_fn` up to `config.retry_mode.max_attempts()` times. Returns the first `Ok` result,
-/// or [`PcsError::RetryExhausted`] once all attempts are consumed.
+/// The two drivers differ only in how they wait, so everything else — the
+/// attempt counter, the exhaustion check, the
+/// [`PcsError::RetryExhausted`](crate::PcsError::RetryExhausted) construction,
+/// and the delay lookup — lives here exactly once.
+struct Attempts<'a> {
+    config: &'a SystemConfig,
+    max_attempts: usize,
+    attempt: usize,
+}
+
+impl<'a> Attempts<'a> {
+    fn new(config: &'a SystemConfig) -> Self {
+        Self {
+            config,
+            max_attempts: config.retry_mode.max_attempts(),
+            attempt: 0,
+        }
+    }
+
+    /// Number of retries consumed so far (`0` = the first attempt succeeded).
+    fn retries(&self) -> u32 {
+        self.attempt as u32
+    }
+
+    /// Fold a failed attempt.
+    ///
+    /// `Ok(Some(delay))` — wait that long, then retry.
+    /// `Ok(None)` — retry immediately (the mode declares no delay).
+    /// `Err(_)` — attempts exhausted; `e` is wrapped in `RetryExhausted`.
+    fn failed(&mut self, e: PcsError) -> Result<Option<Duration>, PcsError> {
+        self.attempt += 1;
+        if self.attempt >= self.max_attempts {
+            return Err(PcsError::retry_exhausted(e, self.attempt));
+        }
+        Ok(self.config.retry_mode.delay_for_attempt(self.attempt - 1))
+    }
+}
+
+/// Execute a fallible async operation with retry logic driven by [`SystemConfig`].
+///
+/// Runs `run_fn` up to `config.retry_mode.max_attempts()` times, returning
+/// `(value, retries)` on the first success — `retries` is `0` when the first
+/// attempt succeeded — or [`PcsError::RetryExhausted`](crate::PcsError::RetryExhausted)
+/// once all attempts are consumed.
+///
+/// Waits with `tokio::time::sleep` under the `runtime` feature. Guest builds
+/// have no async timer, so delays are skipped and retries are immediate.
+/// Use [`run_with_retries_blocking`] from a blocking thread.
+///
+/// This is the hot path for every system in a pipeline stage, so it emits no
+/// tracing of its own; callers that want per-attempt visibility log around it.
 ///
 /// # Example
 ///
@@ -242,79 +290,51 @@ impl SystemConfig {
 /// # #[tokio::main]
 /// # async fn main() {
 /// let config = SystemConfig::minimal();
-/// let result = run_with_retries(&config, || async {
-///     Ok::<&str, PcsError>("done")
-/// }).await;
-/// assert_eq!(result.unwrap(), "done");
+/// let (value, retries) =
+///     run_with_retries(&config, async || Ok::<&str, PcsError>("done"))
+///         .await
+///         .unwrap();
+/// assert_eq!(value, "done");
+/// assert_eq!(retries, 0);
 /// # }
 /// ```
-#[cfg_attr(feature = "tracing", instrument(
-    skip(config, run_fn),
-    fields(max_attempts = config.retry_mode.max_attempts())
-))]
-pub async fn run_with_retries<TState, F, Fut>(
+pub async fn run_with_retries<T>(
     config: &SystemConfig,
-    run_fn: F,
-) -> Result<TState, PcsError>
-where
-    TState: Send + Sync,
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<TState, PcsError>>,
-{
-    let max_attempts = config.retry_mode.max_attempts();
-    let mut attempt = 0;
-
-    #[cfg(feature = "tracing")]
-    info!(max_attempts, "Starting task execution with retry logic");
-
+    mut run_fn: impl AsyncFnMut() -> Result<T, PcsError>,
+) -> Result<(T, u32), PcsError> {
+    let mut attempts = Attempts::new(config);
     loop {
-        #[cfg(feature = "tracing")]
-        let attempt_span = info_span!("task_attempt", attempt = attempt + 1, max_attempts);
-
-        #[cfg(feature = "tracing")]
-        let _span_guard = attempt_span.enter();
-
-        #[cfg(feature = "tracing")]
-        debug!(attempt = attempt + 1, "Executing task attempt");
-
         match run_fn().await {
-            Ok(result) => {
-                #[cfg(feature = "tracing")]
-                info!(attempt = attempt + 1, "Task execution successful");
-                return Ok(result);
-            }
+            Ok(value) => return Ok((value, attempts.retries())),
             Err(e) => {
-                attempt += 1;
-
-                #[cfg(feature = "tracing")]
-                if attempt >= max_attempts {
-                    error!(
-                        error = %e,
-                        final_attempt = attempt,
-                        max_attempts,
-                        "Task execution failed after all retry attempts"
-                    );
-                } else {
-                    warn!(
-                        error = %e,
-                        attempt,
-                        max_attempts,
-                        "Task execution failed, will retry"
-                    );
-                }
-
-                if attempt >= max_attempts {
-                    return Err(PcsError::retry_exhausted(e, attempt));
-                }
-
-                if let Some(delay) = config.retry_mode.delay_for_attempt(attempt - 1) {
-                    #[cfg(feature = "tracing")]
-                    debug!(delay_ms = delay.as_millis(), "Waiting before retry");
-
+                if let Some(delay) = attempts.failed(e)? {
                     #[cfg(feature = "runtime")]
                     tokio::time::sleep(delay).await;
+                    // Guest builds have no timer; retry immediately.
                     #[cfg(not(feature = "runtime"))]
                     let _ = delay;
+                }
+            }
+        }
+    }
+}
+
+/// [`run_with_retries`] for a synchronous operation already running on a
+/// blocking thread.
+///
+/// Waits with `std::thread::sleep`, which is correct there and would stall the
+/// async executor anywhere else.
+pub fn run_with_retries_blocking<T>(
+    config: &SystemConfig,
+    mut run_fn: impl FnMut() -> Result<T, PcsError>,
+) -> Result<(T, u32), PcsError> {
+    let mut attempts = Attempts::new(config);
+    loop {
+        match run_fn() {
+            Ok(value) => return Ok((value, attempts.retries())),
+            Err(e) => {
+                if let Some(delay) = attempts.failed(e)? {
+                    std::thread::sleep(delay);
                 }
             }
         }
@@ -439,14 +459,14 @@ mod tests {
         assert_eq!(cfg.retry_mode.max_attempts(), 1);
     }
 
-    // ── run_with_retries tests ───────────────────────────────────────────────
+    // ── retry driver tests ───────────────────────────────────────────────────
 
     #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_run_with_retries_succeeds_on_first_try() {
         let config = SystemConfig::minimal();
-        let result = run_with_retries(&config, || async { Ok::<&str, PcsError>("success") }).await;
-        assert_eq!(result.unwrap(), "success");
+        let result = run_with_retries(&config, async || Ok::<&str, PcsError>("success")).await;
+        assert_eq!(result.unwrap(), ("success", 0));
     }
 
     #[cfg(feature = "runtime")]
@@ -456,20 +476,21 @@ mod tests {
         let config = SystemConfig::new().with_fixed_retry(2, Duration::ZERO);
 
         let cc = Arc::clone(&call_count);
-        let result = run_with_retries(&config, || {
-            let cc = Arc::clone(&cc);
-            async move {
-                let n = cc.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(PcsError::generic("transient"))
-                } else {
-                    Ok("recovered")
-                }
+        let result = run_with_retries(&config, async || {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(PcsError::generic("transient"))
+            } else {
+                Ok("recovered")
             }
         })
         .await;
 
-        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(
+            result.unwrap(),
+            ("recovered", 2),
+            "two retries preceded the success"
+        );
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
 
@@ -478,7 +499,7 @@ mod tests {
     async fn test_run_with_retries_returns_retry_exhausted_after_max_attempts() {
         let config = SystemConfig::new().with_fixed_retry(2, Duration::ZERO);
 
-        let result = run_with_retries(&config, || async {
+        let result = run_with_retries(&config, async || {
             Err::<(), PcsError>(PcsError::generic("always fails"))
         })
         .await;
@@ -497,12 +518,9 @@ mod tests {
         let config = SystemConfig::minimal();
 
         let cc = Arc::clone(&call_count);
-        let result = run_with_retries(&config, || {
-            let cc = Arc::clone(&cc);
-            async move {
-                cc.fetch_add(1, Ordering::SeqCst);
-                Err::<(), PcsError>(PcsError::generic("fail"))
-            }
+        let result = run_with_retries(&config, async || {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Err::<(), PcsError>(PcsError::generic("fail"))
         })
         .await;
 
@@ -519,7 +537,7 @@ mod tests {
         // 2 retries → 3 total attempts
         let config = SystemConfig::new().with_fixed_retry(2, Duration::ZERO);
 
-        let result = run_with_retries(&config, || async {
+        let result = run_with_retries(&config, async || {
             Err::<(), PcsError>(PcsError::system_execution("root cause"))
         })
         .await;
@@ -531,6 +549,37 @@ mod tests {
                     matches!(*source, PcsError::SystemExecution(_)),
                     "source should be SystemExecution, got {source:?}"
                 );
+                assert_eq!(source.message(), "root cause");
+            }
+            other => panic!("expected RetryExhausted, got {other:?}"),
+        }
+    }
+
+    /// The blocking driver must count attempts and construct the exhaustion
+    /// error exactly like the async one — they share `Attempts`.
+    #[test]
+    fn test_run_with_retries_blocking_matches_the_async_driver() {
+        let config = SystemConfig::new().with_fixed_retry(2, Duration::ZERO);
+
+        let mut calls = 0usize;
+        let ok = run_with_retries_blocking(&config, || {
+            calls += 1;
+            if calls < 3 {
+                Err(PcsError::generic("transient"))
+            } else {
+                Ok("recovered")
+            }
+        });
+        assert_eq!(ok.unwrap(), ("recovered", 2));
+        assert_eq!(calls, 3);
+
+        let err = run_with_retries_blocking(&config, || {
+            Err::<(), PcsError>(PcsError::system_execution("root cause"))
+        })
+        .unwrap_err();
+        match err {
+            PcsError::RetryExhausted { source, attempts } => {
+                assert_eq!(attempts, 3);
                 assert_eq!(source.message(), "root cause");
             }
             other => panic!("expected RetryExhausted, got {other:?}"),

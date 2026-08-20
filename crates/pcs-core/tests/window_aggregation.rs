@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use pcs_core::PcsError;
 use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{System, SystemMeta};
 use pcs_core::windows::{
     ReduceAggregate, WindowFunction, WindowResults, WindowSpec, WindowedSystemBuilder,

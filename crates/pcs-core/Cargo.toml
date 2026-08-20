@@ -1,11 +1,11 @@
 [package]
 name = "pcs-core"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 rust-version.workspace = true
-publish = false
+publish.workspace = true
 description = "Core columnar processing types for PCS: Dataset, Pipeline, System, Scheduler."
-license = "AGPL-3.0-only"
+license.workspace = true
 
 [features]
 default = ["runtime"]

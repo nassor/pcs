@@ -41,11 +41,15 @@ use async_trait::async_trait;
 use criterion::{Criterion, criterion_group, criterion_main};
 use pcs_core::PcsError;
 use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{
     ParallelSystem, ResourceUpdate, SliceWriteSet, System, SystemMeta, WriteSet,
 };
 use serde::{Deserialize, Serialize};
+
+mod support;
+use support::tpch::Lineitem;
 
 // ---------------------------------------------------------------------------
 // Date constants (days since 1970-01-01)
@@ -59,44 +63,6 @@ const QUANTITY_LT: f64 = 24.0;
 // ---------------------------------------------------------------------------
 // Narrow lineitem component (12 columns)
 // ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Lineitem {
-    l_orderkey: i64,
-    l_partkey: i64,
-    l_suppkey: i64,
-    l_linenumber: i32,
-    l_quantity: f64,
-    l_extendedprice: f64,
-    l_discount: f64,
-    l_tax: f64,
-    l_returnflag: u8,
-    l_linestatus: u8,
-    l_shipdate: i32,
-    l_commitdate: i32,
-}
-
-impl Component for Lineitem {
-    fn name() -> &'static str {
-        "Lineitem"
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int64, false),
-            Field::new("l_partkey", DataType::Int64, false),
-            Field::new("l_suppkey", DataType::Int64, false),
-            Field::new("l_linenumber", DataType::Int32, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
-            Field::new("l_returnflag", DataType::UInt8, false),
-            Field::new("l_linestatus", DataType::UInt8, false),
-            Field::new("l_shipdate", DataType::Int32, false),
-            Field::new("l_commitdate", DataType::Int32, false),
-        ]))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Wide lineitem schema (30 columns: 12 real + 18 junk)

@@ -92,7 +92,9 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
     #[cfg(not(feature = "wasm"))]
     let has_wasm = false;
     let builder = if !has_wasm {
-        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new("pcs-service")))
+        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new(
+            "pcs-service",
+        )))
     } else {
         builder
     };

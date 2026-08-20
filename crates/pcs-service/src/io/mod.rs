@@ -1,7 +1,7 @@
 //! Ingestion and egress layer for the Arrow pipeline.
 //!
 //! This module provides [`Source`] and [`Sink`] traits for reading data into
-//! and writing data out of a [`Dataset`](crate::pipeline::Dataset), plus implementations for common
+//! and writing data out of a [`Dataset`](crate::dataset::Dataset), plus implementations for common
 //! formats (Parquet, JSON Lines, CSV) and an in-memory channel transport.
 
 // Trait defs and channel impls live in pcs-core; re-export all so that

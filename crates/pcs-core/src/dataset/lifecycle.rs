@@ -83,7 +83,7 @@ impl Dataset {
     ///
     /// ```rust
     /// # {
-    /// use pcs_core::pipeline::Dataset;
+    /// use pcs_core::dataset::Dataset;
     /// use pcs_core::component::Component;
     /// use arrow_schema::{DataType, Field, Schema};
     /// use std::sync::Arc;

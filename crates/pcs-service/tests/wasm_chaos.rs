@@ -1,12 +1,15 @@
 // Integration test — guest trap releases claim (not acks)
 //
 // Uses a `MockTrapRuntime` (a mock `PipelineRuntime`) instead of a real WASM
-// component. A real WASM component cannot maintain per-batch call state across
-// `run-batch` invocations because `WasmPipelineRuntime::make_store_and_instance`
-// creates a **fresh Store per call**, resetting all guest linear memory. The mock
-// exercises the identical `DistributedRunner` release-not-ack code path
-// (runner.rs lines 395-397) because by that point the error is just a `PcsError`
-// — the runner does not distinguish WASM-origin from mock-origin.
+// component: the mock can be told to fail on an exact call index, which a real
+// guest cannot without carrying its own failure counter through
+// `run-batch`'s state blob. It exercises the identical `DistributedRunner`
+// release-not-ack code path, because by that point the error is just a
+// `PcsError` — the runner does not distinguish WASM-origin from mock-origin.
+//
+// The mock keeps `PipelineRuntime`'s default `run_on_with_state`, so these
+// tests also cover the stateless path through the runner: `prior` is ignored
+// and no state blob is persisted.
 //
 // Future improvement: once the claim-level retry cap lands, add an assertion
 // that a permanently-trapping runtime exhausts its cap and the claim is acked

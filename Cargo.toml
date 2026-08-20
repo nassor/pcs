@@ -10,6 +10,9 @@ resolver = "2"
 
 [workspace.package]
 rust-version = "1.95.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
 
 [workspace.dependencies]
 # Arrow core sub-crates — exact pins enforced at workspace level.

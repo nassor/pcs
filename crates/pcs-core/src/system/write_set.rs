@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use arrow_array::ArrayRef;
 
-use crate::pipeline::Dataset;
+use crate::dataset::Dataset;
 
 /// A boxed, type-erased resource mutation produced by a [`ParallelSystem`](super::ParallelSystem).
 ///
@@ -25,7 +25,7 @@ impl ResourceUpdate {
     /// #
     /// # {
     /// use pcs_core::system::ResourceUpdate;
-    /// use pcs_core::pipeline::Dataset;
+    /// use pcs_core::dataset::Dataset;
     ///
     /// struct MyCount(u32);
     ///
@@ -65,7 +65,7 @@ impl std::fmt::Debug for ResourceUpdate {
 /// After all parallel systems in a stage finish, the pipeline merges their
 /// `WriteSet`s (all field keys must be disjoint — enforced by the field-level
 /// DAG) and applies them atomically via
-/// [`Dataset::apply_write_set`](crate::pipeline::Dataset::apply_write_set).
+/// [`Dataset::apply_write_set`](crate::dataset::Dataset::apply_write_set).
 ///
 /// ## Builder API
 ///

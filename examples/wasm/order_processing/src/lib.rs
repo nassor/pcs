@@ -135,6 +135,32 @@ impl FxRates {
         cad: 0.74,
     };
 
+    /// Read the rates from the host's `[pipeline.wasm.config]` table,
+    /// falling back to [`DEFAULT`](Self::DEFAULT) per missing key.
+    ///
+    /// A present-but-unparseable value keeps the default and warns on stderr
+    /// rather than trapping the guest mid-`describe`.
+    #[cfg(target_arch = "wasm32")]
+    fn from_config() -> Self {
+        fn rate(key: &str, default: f64) -> f64 {
+            match crate::pcs_config_parse::<f64>(key) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
+                    eprintln!("[config] {key} is not a valid f64 ({e}); using {default}");
+                    default
+                }
+                None => default,
+            }
+        }
+
+        Self {
+            eur: rate("fx_eur", Self::DEFAULT.eur),
+            gbp: rate("fx_gbp", Self::DEFAULT.gbp),
+            jpy: rate("fx_jpy", Self::DEFAULT.jpy),
+            cad: rate("fx_cad", Self::DEFAULT.cad),
+        }
+    }
+
     fn rate_for(&self, currency: &str) -> f64 {
         match currency {
             "USD" => 1.0,
@@ -354,17 +380,23 @@ fn make_report_system() -> impl System {
 /// `OnceLock<Mutex<Pipeline>>` so it's constructed exactly once per component
 /// instance.
 ///
-/// FxRates are baked into `EnrichSystem` at construction time. A future
-/// version can read them from the `init(config)` JSON blob via
-/// `pcs_guest::config_get_typed("fx_rates")` once that helper graduates from
-/// stub.
+/// FX rates are read from the host's `[pipeline.wasm.config]` table via the
+/// `host-io` `get-config` import (keys `fx_eur`, `fx_gbp`, `fx_jpy`,
+/// `fx_cad`), each falling back to [`FxRates::DEFAULT`] when absent. They stay
+/// a field on `EnrichSystem` rather than a `Dataset` resource because
+/// resources do not round-trip through Arrow IPC.
 pub fn build() -> Pipeline {
+    // `pcs_config_parse` is emitted into this crate by `export_pipeline!` and
+    // only exists on wasm32, where `crate::bindings` exists.
+    #[cfg(target_arch = "wasm32")]
+    let rates = FxRates::from_config();
+    #[cfg(not(target_arch = "wasm32"))]
+    let rates = FxRates::DEFAULT;
+
     Pipeline::builder("order_processing")
         .with::<Transaction>()
         .with_system(ValidateSystem)
-        .with_system(EnrichSystem {
-            rates: FxRates::DEFAULT,
-        })
+        .with_system(EnrichSystem { rates })
         .with_system(make_report_system())
         .build()
 }

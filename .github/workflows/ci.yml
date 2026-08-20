@@ -40,10 +40,12 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-    # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it
-    # needs `examples/wasm/order_processing/src/bindings.rs` on disk even
-    # though the host build never compiles it. cargo-component generates the
-    # file as part of a wasm32-wasip2 build.
+    # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs
+    # `examples/wasm/order_processing/src/bindings.rs` and
+    # `crates/pcs-guest-smoketest/src/bindings.rs` on disk even though the host
+    # build never compiles them. cargo-component generates both files as part of
+    # a wasm32-wasip2 build, and both are gitignored, so they exist only once
+    # the component builds below have run.
     - name: Install wasm32-wasip2 target
       run: rustup target add wasm32-wasip2
 
@@ -55,10 +57,17 @@ jobs:
     - name: Generate WASM bindings
       run: cargo component build -p order-processing-wasm --target wasm32-wasip2
 
+    # `tests/wasm_roundtrip.rs` hard-asserts this artifact exists, so the
+    # component must be built before the test job runs.
+    - name: Build smoketest WASM component
+      run: cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
+
     # Generated bindings ship unformatted; normalize before the workspace-wide
     # fmt check so `--check` only fails on hand-written code.
     - name: Pre-format generated bindings
-      run: rustfmt examples/wasm/order_processing/src/bindings.rs
+      run: |
+        rustfmt examples/wasm/order_processing/src/bindings.rs
+        rustfmt crates/pcs-guest-smoketest/src/bindings.rs
 
     - name: Check formatting
       run: cargo fmt --all -- --check
@@ -76,10 +85,10 @@ jobs:
       run: cargo check --examples
 
     - name: Run tests
-      run: cargo test --lib
+      run: cargo test --workspace --all-features
 
     - name: Run doctests
-      run: cargo test --doc
+      run: cargo test --workspace --all-features --doc
 
   wasm_guest:
     name: WASM Guest (wasm32-wasip2)
@@ -88,7 +97,9 @@ jobs:
     - uses: actions/checkout@v5
 
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
 
     - name: Cache cargo registry
       uses: actions/cache@v5
@@ -102,8 +113,26 @@ jobs:
         path: target
         key: ${{ runner.os }}-wasm-guest-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Install component tooling
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+
     - name: Check pcs-core for wasm32-wasip2
       run: bash scripts/check-wasm-guest.sh
+
+    # The arrow-ipc exact pin is load-bearing across the component boundary;
+    # crates/pcs-guest/PINS.md forbids relaxing it without this gate.
+    - name: Host-guest arrow-ipc round-trip
+      run: bash scripts/ci/guest_ipc_roundtrip.sh
+
+    # cargo-component 0.21.1 emits under wasm32-wasip1 even for a
+    # --target wasm32-wasip2 build; the round-trip script above produced it.
+    - name: Validate smoketest component
+      run: wasm-tools validate --features component-model target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+
+    - name: Print smoketest component world
+      run: wasm-tools component wit target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
 
   security_audit:
     name: Security Audit
@@ -112,7 +141,9 @@ jobs:
     - uses: actions/checkout@v5
     
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
     
     - name: Install cargo-audit
       uses: taiki-e/install-action@cargo-audit

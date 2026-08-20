@@ -10,7 +10,7 @@
 //! `Dataset` registers a schema once and enforces schema consistency at
 //! append time.  You cannot change the physical type of a registered column
 //! in place.  Schema casting is therefore a **pre-ingestion** operation: cast
-//! the batch first, then call [`append_record_batch`](crate::pipeline::Dataset::append_record_batch).
+//! the batch first, then call [`append_record_batch`](crate::dataset::Dataset::append_record_batch).
 //! `CastingSource` wraps this pattern cleanly.
 //!
 //! ## Safe vs unsafe casting

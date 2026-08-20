@@ -17,6 +17,14 @@ use crate::PcsResult;
 /// `stage_idx`, so this value is safe to use directly.
 pub const ACCUMULATOR_STAGE_SENTINEL: u32 = u32::MAX;
 
+/// Sentinel `stage_idx` used to store a runtime's opaque internal-state blob.
+///
+/// Distinct from [`ACCUMULATOR_STAGE_SENTINEL`] (`u32::MAX`) and far above any
+/// real stage index, which number from 0 and stay in the dozens. The payload is
+/// whatever [`PipelineRuntime::run_on_with_state`](pcs_core::runtime::PipelineRuntime::run_on_with_state)
+/// returned — the host never interprets it.
+pub const GUEST_STATE_STAGE_SENTINEL: u32 = u32::MAX - 1;
+
 // ── Checkpoint ───────────────────────────────────────────────────────────
 
 /// A persisted intermediate snapshot of pipeline state for one claim stage.

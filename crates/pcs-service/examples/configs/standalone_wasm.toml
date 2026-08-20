@@ -8,9 +8,8 @@ data_dir = "/var/lib/pcs/node-1"
 kind = "interval"
 interval_ms = 5000
 
-# WASM guest pipeline — mutually exclusive with `pipeline.systems`.
-# The module must be a wasm32-wasip2 component compiled with cargo-component
-# and implementing the `pcs:pipeline/pcs-pipeline` world.
+# WASM guest pipeline. The module must be a wasm32-wasip2 component compiled
+# with cargo-component and implementing the `pcs:pipeline/pcs-pipeline` world.
 [pipeline.wasm]
 # Path to the .wasm component file, relative to the working directory or absolute.
 module = "pipelines/order_processing.wasm"
@@ -18,10 +17,9 @@ module = "pipelines/order_processing.wasm"
 # The service will refuse to start if the digest does not match.
 # An optional "sha3-256:" prefix on the value is accepted.
 # sha3_256 = "abc123..."
-# Re-load the module when the file changes on disk (hot-reload).
-watch = false
 
-# Opaque key/value config forwarded to the guest's `init` call.
+# Opaque key/value config the guest reads through the host-io `get-config`
+# import. Values are strings; the guest parses numerics itself.
 [pipeline.wasm.config]
 batch_size = "500"
 output_format = "arrow-ipc"

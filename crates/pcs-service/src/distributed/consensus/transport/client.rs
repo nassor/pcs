@@ -1,365 +1,52 @@
-//! TCP transport for Arrow-IPC Raft consensus messages.
+//! Outbound half of the transport: per-peer connection pooling, the
+//! circuit breaker, and the openraft client implementations.
 //!
-//! Same length-prefixed framing as the existing transport, but with a typed
-//! envelope to distinguish message kinds on the wire:
-//!
-//! - Control messages (`AppendEntries`, `Vote`) are serialised as `serde_json`.
-//! - Snapshot transfer uses a multi-frame chunked protocol (4 MiB per chunk).
-//!
-//! ```text
-//! ┌────────────────┬──────────────────────────┐
-//! │  length: u32   │  payload: [u8; length]   │
-//! │  (big-endian)  │                          │
-//! └────────────────┴──────────────────────────┘
-//! ```
-//!
-//! Each payload is a `serde_json`-encoded `RpcEnvelope`. The wire format is
-//! **append-only**: existing variant positions must never change so that
-//! rolling upgrades remain compatible.
-//!
-//! ## TCP server
-//!
-//! [`RaftTcpServer`] binds a listen address and dispatches incoming envelopes
-//! to the local [`Raft`](openraft::Raft) node.  Start it once during node
-//! initialisation before any remote peer can contact the node.
-//!
-//! ## Connection pool
-//!
-//! [`TcpNetwork`] maintains a per-peer pool of idle [`TcpStream`]s bounded by
-//! [`POOL_CAPACITY`]. Streams are acquired from the pool (or freshly connected)
-//! and returned on success; dropped on error so a broken stream never re-enters
-//! the pool.
-//!
-//! ## Timeouts
-//!
-//! All read-frame calls on the RPC-response path are wrapped in
-//! [`tokio::time::timeout`] with a deadline of [`RPC_READ_TIMEOUT`].  Connect
-//! attempts are wrapped with [`CONNECT_TIMEOUT`].  Write calls are wrapped with
-//! [`RPC_WRITE_TIMEOUT`].
+//! Owns [`TcpNetwork`] (one handle per remote peer, including the chunked
+//! snapshot sender), the [`TcpNetworkFactory`] openraft plugs into, and
+//! [`forward_proposal`], the follower-to-leader proposal path.
 
 use std::collections::HashMap;
 #[cfg(feature = "distributed-raft")]
 use std::collections::VecDeque;
+#[cfg(feature = "distributed-raft")]
 use std::io;
-// Used inside #[cfg(feature = "distributed-raft")] blocks and tests.
-#[allow(unused_imports)]
-use std::net::SocketAddr;
-#[allow(unused_imports)]
-use std::sync::Arc;
-
 #[cfg(feature = "distributed-raft")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "distributed-raft")]
+use std::sync::{Arc, LazyLock};
+#[cfg(feature = "distributed-raft")]
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "distributed-raft")]
 use tokio::net::TcpStream;
-#[allow(unused_imports)]
+#[cfg(feature = "distributed-raft")]
 use tokio::sync::Mutex;
 
 #[cfg(feature = "distributed-raft")]
 use openraft::{
-    BasicNode, RaftNetworkFactory, RaftNetworkV2, Snapshot,
-    error::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable},
+    BasicNode, RaftNetworkFactory, RaftNetworkV2,
+    error::{NetworkError, RPCError, ReplicationClosed, StreamingError},
     network::{Backoff, RPCOption},
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     },
-    type_config::alias::{SnapshotMetaOf, SnapshotOf, VoteOf},
+    type_config::alias::{SnapshotOf, VoteOf},
 };
-#[cfg(feature = "distributed-raft")]
-use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "distributed-raft")]
 use crate::distributed::consensus::types::{ConsensusCommand, ConsensusResponse, PcsTypeConfig};
 #[cfg(feature = "distributed-raft")]
 use crate::{PcsError, PcsResult};
 
-// ── Constants ──────────────────────────────────────────────────────────────────
-
-/// Hard cap on a single TCP frame.  Snapshot *chunks* are bounded by
-/// [`SNAPSHOT_CHUNK_BYTES`], which is well within this limit.
-#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
-
-/// Maximum snapshot payload per chunk frame.
-///
-/// Chosen to keep each frame well below `MAX_FRAME_BYTES` while limiting the
-/// number of round-trips for typical state-machine snapshots (< 64 MiB).
 #[cfg(feature = "distributed-raft")]
-pub const SNAPSHOT_CHUNK_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-
-/// Per-RPC read-response timeout.  A dead peer that accepted the TCP connect
-/// but never replies will be declared unreachable after this duration.
+use super::wire::{read_frame, write_frame};
 #[cfg(feature = "distributed-raft")]
-pub const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Per-RPC write timeout. A blocked-but-alive peer (TCP send buffer full)
-/// will be declared unreachable after this duration.
-#[cfg(feature = "distributed-raft")]
-pub const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Read-response timeout used exclusively for [`forward_proposal`].
-///
-/// Proposal forwarding waits for the remote leader to run `client_write` —
-/// which can block for the full Raft commit round-trip.  This timeout must
-/// be strictly greater than `CLUSTER_PROPOSE_TIMEOUT` (30 s) so the store
-/// layer's outer timeout fires first if something goes wrong.
-#[cfg(feature = "distributed-raft")]
-const PROPOSAL_FORWARD_READ_TIMEOUT: Duration = Duration::from_secs(35);
-
-/// Timeout for establishing a new TCP connection to a peer.
-#[cfg(feature = "distributed-raft")]
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Maximum number of idle connections kept per peer.
-#[cfg(feature = "distributed-raft")]
-pub const POOL_CAPACITY: usize = 4;
-
-/// Maximum idle time for a pooled connection before it is dropped on next acquire.
-#[cfg(feature = "distributed-raft")]
-const POOL_MAX_IDLE: Duration = Duration::from_secs(10);
-
-/// Maximum number of concurrent accepted connections on the server.
-#[cfg(feature = "distributed-raft")]
-const MAX_ACCEPTED_CONNECTIONS: usize = 1024;
-
-/// Maximum total bytes buffered per in-flight snapshot transfer (256 MiB).
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_MAX_TRANSFER_BYTES: usize = 256 * 1024 * 1024;
-
-/// Maximum number of concurrent in-flight snapshot transfers per connection.
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_MAX_CONCURRENT_TRANSFERS: usize = 4;
-
-/// Idle timeout for a snapshot transfer (no chunk received for this duration).
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Idle-read timeout on the server connection task.
-///
-/// A peer that keeps TCP alive but stops sending is evicted after this window.
-/// Chosen to be well above Raft heartbeat intervals (typically 150–500 ms).
-#[cfg(feature = "distributed-raft")]
-const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Maximum per-chunk byte size enforced on the client before framing.
-///
-/// Matches the server-side cap so oversized chunks are caught client-side with
-/// a clear error rather than being rejected by the server after framing.
-#[cfg(feature = "distributed-raft")]
-const MAX_SNAPSHOT_CHUNK_BYTES: usize = SNAPSHOT_CHUNK_BYTES; // 4 MiB
-
-/// Number of consecutive RPC failures before a per-peer circuit opens.
-#[cfg(feature = "distributed-raft")]
-const CIRCUIT_OPEN_THRESHOLD: u32 = 5;
-
-/// Duration a circuit stays open before allowing a retry attempt.
-#[cfg(feature = "distributed-raft")]
-const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(30);
-
-// ── Transport error classification ────────────────────────────────────────────
-
-/// Fine-grained transport error, mapped to the appropriate openraft error type.
-///
-/// Mapping table:
-///
-/// | `TransportError` variant    | openraft mapping                          | Semantic                            |
-/// |-----------------------------|-------------------------------------------|-------------------------------------|
-/// | `ConnectFailed`             | `RPCError::Unreachable`                   | Peer is down / unreachable          |
-/// | `WriteFailed`               | `RPCError::Network` (transient)           | Lost connection mid-send            |
-/// | `WriteTimeout`              | `RPCError::Network` (transient)           | Peer alive but write buffer full    |
-/// | `ReadTimeout`               | `RPCError::Network` (transient)           | Peer alive but not responding       |
-/// | `FramingError`              | `RPCError::Network` (transient)           | Corrupt/truncated frame             |
-/// | `PeerReset`                 | `RPCError::Network` (transient)           | Peer closed connection cleanly      |
-/// | `EncodeError`               | `RPCError::Unreachable` (fatal-ish)       | Serialization bug — not transient   |
-/// | `Other`                     | `RPCError::Network` (transient)           | Miscellaneous I/O error             |
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug)]
-pub enum TransportError {
-    /// TCP connect failed (peer unreachable or connection refused).
-    ConnectFailed(io::Error),
-    /// Write to stream failed.
-    WriteFailed(io::Error),
-    /// Write timed out — peer send buffer full.
-    WriteTimeout,
-    /// Read timed out — peer did not respond within [`RPC_READ_TIMEOUT`].
-    ReadTimeout,
-    /// Frame protocol error (oversized frame, premature EOF).
-    FramingError(String),
-    /// Peer reset the connection cleanly (EOF on read).
-    PeerReset,
-    /// Serialization error — this is a bug, not a transient network issue.
-    EncodeError(String),
-    /// Other I/O error.
-    Other(io::Error),
-}
-
-#[cfg(feature = "distributed-raft")]
-impl TransportError {
-    /// Map to openraft `RPCError`.  Connect failures and encode errors surface
-    /// as `Unreachable` (causes openraft to back off); everything else is
-    /// `Network` (transient, causes immediate retry).
-    pub fn into_rpc_error(self) -> RPCError<PcsTypeConfig> {
-        match self {
-            TransportError::ConnectFailed(e) => {
-                RPCError::Unreachable(Unreachable::from_string(format!("connect failed: {e}")))
-            }
-            TransportError::EncodeError(msg) => RPCError::Unreachable(Unreachable::from_string(
-                format!("encode error (bug): {msg}"),
-            )),
-            TransportError::ReadTimeout => {
-                RPCError::Network(NetworkError::new(&io::Error::other("RPC read timeout")))
-            }
-            TransportError::WriteTimeout => {
-                RPCError::Network(NetworkError::new(&io::Error::other("RPC write timeout")))
-            }
-            TransportError::WriteFailed(e) => RPCError::Network(NetworkError::new(
-                &io::Error::other(format!("write failed: {e}")),
-            )),
-            TransportError::FramingError(msg) => {
-                RPCError::Network(NetworkError::new(&io::Error::other(msg)))
-            }
-            TransportError::PeerReset => RPCError::Network(NetworkError::new(&io::Error::other(
-                "peer reset connection",
-            ))),
-            TransportError::Other(e) => RPCError::Network(NetworkError::new(&e)),
-        }
-    }
-
-    pub fn into_streaming_error(self) -> StreamingError<PcsTypeConfig> {
-        StreamingError::from(self.into_rpc_error())
-    }
-}
-
-// ── Wire envelope ─────────────────────────────────────────────────────────────
-
-/// Typed envelope for all RPCs sent over the TCP transport.
-///
-/// **Append-only**: do not reorder or remove variants. The `serde_json`
-/// discriminant is the variant name string — adding new variants at the end is
-/// always safe.
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum RpcEnvelope {
-    /// `AppendEntries` RPC.
-    AppendEntries(AppendEntriesRequest<PcsTypeConfig>),
-    /// `Vote` / `RequestVote` RPC.
-    Vote(VoteRequest<PcsTypeConfig>),
-    /// One chunk of a snapshot transfer.
-    SnapshotChunk(SnapshotChunkMsg),
-    /// Signals the last chunk and carries the snapshot metadata.
-    SnapshotFinal(SnapshotFinalMsg),
-    /// A follower forwards a proposal to the leader.
-    ///
-    /// Added at the end to preserve wire-format compatibility with older nodes.
-    ProposalForward { command: ConsensusCommand },
-}
-
-/// A single data chunk within a snapshot transfer.
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SnapshotChunkMsg {
-    /// Unique transfer ID shared across all chunks of one snapshot send.
-    pub transfer_id: u64,
-    /// Byte offset within the full snapshot payload.
-    pub offset: u64,
-    /// Raw bytes of this chunk.
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
-}
-
-/// Final (or only) chunk of a snapshot transfer; includes metadata.
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SnapshotFinalMsg {
-    /// Unique transfer ID shared across all chunks of one snapshot send.
-    pub transfer_id: u64,
-    /// Byte offset of the last chunk's start.
-    pub offset: u64,
-    /// Raw bytes of the last chunk (may be empty).
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
-    /// Leader vote, forwarded to [`Raft::install_full_snapshot`].
-    pub vote: VoteOf<PcsTypeConfig>,
-    /// Snapshot metadata.
-    pub meta: SnapshotMetaOf<PcsTypeConfig>,
-}
-
-/// Response envelope returned from the server for each incoming RPC.
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum RpcResponse {
-    /// Response to an `AppendEntries` RPC.
-    AppendEntries(AppendEntriesResponse<PcsTypeConfig>),
-    /// Response to a `Vote` RPC.
-    Vote(VoteResponse<PcsTypeConfig>),
-    /// Acknowledgement for an intermediate snapshot chunk.
-    SnapshotChunkAck { transfer_id: u64 },
-    /// Final response after the snapshot was installed.
-    SnapshotDone(SnapshotResponse<PcsTypeConfig>),
-    /// Error string returned by the server.
-    Error(String),
-    /// Result of a forwarded proposal. Uses `Option` fields instead of
-    /// `Result` to keep serde_json serialization clean.
-    ///
-    /// Exactly one of `ok` and `err` is `Some`.
-    ProposalResult {
-        ok: Option<ConsensusResponse>,
-        err: Option<String>,
-    },
-}
-
-// ── Frame helpers ─────────────────────────────────────────────────────────────
-
-/// Read one length-prefixed frame from `stream`.
-///
-/// Returns:
-/// - `Ok(Some(bytes))` — a complete frame was received.
-/// - `Ok(None)` — the peer closed the connection cleanly (EOF on length header).
-/// - `Err(e)` — an I/O error occurred:
-///   - `ErrorKind::InvalidData` — frame length exceeds [`MAX_FRAME_BYTES`].
-///   - `ErrorKind::UnexpectedEof` — truncated frame (EOF inside payload).
-///   - Other kinds forwarded from the underlying stream.
-#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
-async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame too large: {len} > {MAX_FRAME_BYTES}"),
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await.map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame payload")
-        } else {
-            e
-        }
-    })?;
-    Ok(Some(payload))
-}
-
-#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
-async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    if data.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame too large: {} > {MAX_FRAME_BYTES}", data.len()),
-        ));
-    }
-    let len = u32::try_from(data.len()).map_err(|_| io::Error::other("frame too large"))?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.flush().await
-}
+use super::{
+    CIRCUIT_OPEN_DURATION, CIRCUIT_OPEN_THRESHOLD, CONNECT_TIMEOUT, MAX_SNAPSHOT_CHUNK_BYTES,
+    POOL_CAPACITY, POOL_MAX_IDLE, PROPOSAL_FORWARD_READ_TIMEOUT, RPC_READ_TIMEOUT,
+    RPC_WRITE_TIMEOUT, RpcEnvelope, RpcResponse, SNAPSHOT_CHUNK_BYTES, SnapshotChunkMsg,
+    SnapshotFinalMsg, TransportError,
+};
 
 // ── Per-peer connection pool ───────────────────────────────────────────────────
 
@@ -440,9 +127,9 @@ impl CircuitState {
 #[cfg(feature = "distributed-raft")]
 struct PeerPool {
     /// Peer address as `"host:port"` — may be a hostname or an IP literal.
-    /// Resolved to [`SocketAddr`] lazily at connection time so that Docker
-    /// service names (e.g. `"node2:9002"`) work without requiring a pre-boot
-    /// DNS lookup.
+    /// Resolved to [`SocketAddr`](std::net::SocketAddr) lazily at connection
+    /// time so that Docker service names (e.g. `"node2:9002"`) work without
+    /// requiring a pre-boot DNS lookup.
     addr: String,
     idle: Mutex<VecDeque<PooledStream>>,
     /// Per-peer circuit breaker — guards `acquire` from hammering a dead peer.
@@ -765,7 +452,7 @@ impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
         &mut self,
         vote: VoteOf<PcsTypeConfig>,
         snapshot: SnapshotOf<PcsTypeConfig>,
-        cancel: impl std::future::Future<Output = ReplicationClosed> + openraft::OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + openraft::OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<PcsTypeConfig>, StreamingError<PcsTypeConfig>> {
         let transfer_id = TRANSFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -795,303 +482,17 @@ impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
     }
 }
 
-// ── TCP Server ─────────────────────────────────────────────────────────────────
-
-/// In-flight snapshot transfer state on the server side.
-#[cfg(feature = "distributed-raft")]
-struct InFlightSnapshot {
-    data: Vec<u8>,
-    last_chunk_at: Instant,
-}
-
-/// TCP server that dispatches incoming Raft RPCs to a local `Raft` node.
-///
-/// Start one instance per node during cluster initialisation. The server binds
-/// `listen_addr` and spawns a Tokio task per accepted connection. The accept
-/// loop stops on [`RaftTcpServer::shutdown`] or when the server handle drops.
-#[cfg(feature = "distributed-raft")]
-pub struct RaftTcpServer {
-    raft: crate::distributed::consensus::driver::raft_impl::ArrowPCSRaft,
-    listen_addr: SocketAddr,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-}
-
-#[cfg(feature = "distributed-raft")]
-impl RaftTcpServer {
-    /// Create a new server bound to `listen_addr` that dispatches RPCs to `raft`.
-    pub fn new(
-        raft: crate::distributed::consensus::driver::raft_impl::ArrowPCSRaft,
-        listen_addr: SocketAddr,
-    ) -> Self {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        Self {
-            raft,
-            listen_addr,
-            shutdown_tx,
-            shutdown_rx,
-        }
-    }
-
-    /// Signal the accept loop to stop.
-    pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
-    }
-
-    /// Spawn the server as a background Tokio task.
-    ///
-    /// The returned `JoinHandle` can be awaited for a clean shutdown signal.
-    pub fn spawn(self) -> tokio::task::JoinHandle<io::Result<()>> {
-        tokio::spawn(async move { self.run().await })
-    }
-
-    async fn run(mut self) -> io::Result<()> {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind(self.listen_addr).await?;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_ACCEPTED_CONNECTIONS));
-
-        #[cfg(feature = "tracing")]
-        tracing::info!(addr = %self.listen_addr, "RaftTcpServer listening");
-
-        loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    let (stream, _peer_addr) = match accept_result {
-                        Ok(pair) => pair,
-                        Err(_e) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(error = %_e, "RaftTcpServer: accept error");
-                            // Sleep briefly to avoid tight-looping on EMFILE.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                    };
-
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(peer = %_peer_addr, "RaftTcpServer: accepted connection");
-
-                    let permit = match semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(peer = %_peer_addr, "RaftTcpServer: connection limit reached, dropping");
-                            drop(stream);
-                            continue;
-                        }
-                    };
-
-                    let raft = self.raft.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        handle_connection(raft, stream).await;
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!(peer = %_peer_addr, "RaftTcpServer: connection closed");
-                    });
-                }
-                _ = self.shutdown_rx.changed() => {
-                    if *self.shutdown_rx.borrow() {
-                        #[cfg(feature = "tracing")]
-                        tracing::info!("RaftTcpServer: shutdown signal received");
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Handle one accepted connection: read RPCs, dispatch, write responses.
-#[cfg(feature = "distributed-raft")]
-async fn handle_connection(
-    raft: crate::distributed::consensus::driver::raft_impl::ArrowPCSRaft,
-    mut stream: TcpStream,
-) {
-    // Per-connection reassembly state for snapshot transfers.
-    let mut snapshot_transfers: HashMap<u64, InFlightSnapshot> = HashMap::new();
-
-    loop {
-        // Close connection if peer stops sending — avoids parking a task
-        // indefinitely on an alive-but-silent TCP link.
-        let raw = match tokio::time::timeout(IDLE_READ_TIMEOUT, read_frame(&mut stream)).await {
-            Ok(Ok(Some(b))) => b,
-            Ok(Ok(None)) => break, // clean EOF
-            Ok(Err(_e)) => {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(error = %_e, "RaftTcpServer: read frame error");
-                break;
-            }
-            Err(_) => {
-                // Idle timeout — no frame received. Close cleanly.
-                #[cfg(feature = "tracing")]
-                tracing::debug!("RaftTcpServer: idle timeout, closing connection");
-                break;
-            }
-        };
-
-        let envelope: RpcEnvelope = match serde_json::from_slice(&raw) {
-            Ok(e) => e,
-            Err(_e) => {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(error = %_e, "RaftTcpServer: envelope decode error");
-                break;
-            }
-        };
-
-        let response = handle_envelope(&raft, envelope, &mut snapshot_transfers).await;
-
-        let resp_bytes = match serde_json::to_vec(&response) {
-            Ok(b) => b,
-            Err(_e) => {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(error = %_e, "RaftTcpServer: response encode error");
-                break;
-            }
-        };
-
-        if write_frame(&mut stream, &resp_bytes).await.is_err() {
-            break;
-        }
-    }
-}
-
-/// Dispatch one decoded envelope to the local Raft node and return a response.
-#[cfg(feature = "distributed-raft")]
-async fn handle_envelope(
-    raft: &crate::distributed::consensus::driver::raft_impl::ArrowPCSRaft,
-    envelope: RpcEnvelope,
-    snapshot_transfers: &mut HashMap<u64, InFlightSnapshot>,
-) -> RpcResponse {
-    use std::io::Cursor;
-
-    match envelope {
-        RpcEnvelope::AppendEntries(req) => match raft.append_entries(req).await {
-            Ok(resp) => RpcResponse::AppendEntries(resp),
-            Err(e) => RpcResponse::Error(e.to_string()),
-        },
-
-        RpcEnvelope::Vote(req) => match raft.vote(req).await {
-            Ok(resp) => RpcResponse::Vote(resp),
-            Err(e) => RpcResponse::Error(e.to_string()),
-        },
-
-        RpcEnvelope::SnapshotChunk(chunk) => {
-            let transfer_id = chunk.transfer_id;
-            // Evict stale transfers only on snapshot traffic — bounds memory
-            // without adding per-RPC overhead on the common append_entries path.
-            snapshot_transfers
-                .retain(|_, v| v.last_chunk_at.elapsed() <= SNAPSHOT_TRANSFER_IDLE_TIMEOUT);
-
-            // Enforce concurrent transfer limit.
-            if !snapshot_transfers.contains_key(&transfer_id)
-                && snapshot_transfers.len() >= SNAPSHOT_MAX_CONCURRENT_TRANSFERS
-            {
-                return RpcResponse::Error(format!(
-                    "too many concurrent snapshot transfers (max {SNAPSHOT_MAX_CONCURRENT_TRANSFERS})"
-                ));
-            }
-
-            let entry = snapshot_transfers
-                .entry(transfer_id)
-                .or_insert_with(|| InFlightSnapshot {
-                    data: Vec::new(),
-                    last_chunk_at: Instant::now(),
-                });
-
-            // Enforce per-transfer size cap.
-            let new_size = entry.data.len() + chunk.data.len();
-            if new_size > SNAPSHOT_MAX_TRANSFER_BYTES {
-                snapshot_transfers.remove(&transfer_id);
-                return RpcResponse::Error(format!(
-                    "snapshot transfer {transfer_id} exceeded size limit ({SNAPSHOT_MAX_TRANSFER_BYTES} bytes)"
-                ));
-            }
-
-            entry.data.extend_from_slice(&chunk.data);
-            entry.last_chunk_at = Instant::now();
-
-            RpcResponse::SnapshotChunkAck { transfer_id }
-        }
-
-        RpcEnvelope::SnapshotFinal(final_msg) => {
-            let transfer_id = final_msg.transfer_id;
-            let mut buf = snapshot_transfers
-                .remove(&transfer_id)
-                .map(|s| s.data)
-                .unwrap_or_default();
-            buf.extend_from_slice(&final_msg.data);
-
-            let snapshot = Snapshot {
-                meta: final_msg.meta,
-                snapshot: Cursor::new(buf),
-            };
-
-            let vote = final_msg.vote;
-            // Spawn the install to keep the connection task responsive.
-            // We still await the handle so we can send the response on the same stream.
-            let raft = raft.clone();
-            let result =
-                tokio::spawn(async move { raft.install_full_snapshot(vote, snapshot).await }).await;
-
-            match result {
-                Ok(Ok(resp)) => RpcResponse::SnapshotDone(resp),
-                Ok(Err(e)) => RpcResponse::Error(e.to_string()),
-                Err(e) => RpcResponse::Error(format!("snapshot install task panicked: {e}")),
-            }
-        }
-
-        RpcEnvelope::ProposalForward { command } => {
-            // The server-side handler calls client_write directly.
-            // It does NOT forward further even if it is also a follower — that
-            // would cause infinite forwarding loops between nodes.
-            //
-            // A 28 s timeout around client_write ensures we always respond
-            // before the caller's PROPOSAL_FORWARD_READ_TIMEOUT (35 s) fires,
-            // so the follower gets a structured error rather than a TCP drop.
-            use openraft::error::{ClientWriteError, RaftError};
-            const SERVER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
-            let write_result =
-                tokio::time::timeout(SERVER_WRITE_TIMEOUT, raft.client_write(command)).await;
-            match write_result {
-                Ok(Ok(resp)) => RpcResponse::ProposalResult {
-                    ok: Some(resp.data),
-                    err: None,
-                },
-                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => {
-                    // This node is not the leader — reject the forward rather
-                    // than propagating it further.
-                    RpcResponse::ProposalResult {
-                        ok: None,
-                        err: Some("not leader".to_string()),
-                    }
-                }
-                Ok(Err(e)) => RpcResponse::ProposalResult {
-                    ok: None,
-                    err: Some(e.to_string()),
-                },
-                Err(_elapsed) => RpcResponse::ProposalResult {
-                    ok: None,
-                    err: Some("server-side client_write timeout".to_string()),
-                },
-            }
-        }
-    }
-}
-
 // ── Proposal forwarding ────────────────────────────────────────────────────────
 
 /// Module-level pool cache for `forward_proposal` so each leader address
 /// reuses pooled connections instead of opening a fresh one per call.
 #[cfg(feature = "distributed-raft")]
-static FORWARD_PROPOSAL_POOLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<PeerPool>>>> =
-    std::sync::OnceLock::new();
+static FORWARD_PROPOSAL_POOLS: LazyLock<Mutex<HashMap<String, Arc<PeerPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "distributed-raft")]
 async fn get_forward_pool(addr: &str) -> Arc<PeerPool> {
-    let pools = FORWARD_PROPOSAL_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = pools.lock().await;
+    let mut guard = FORWARD_PROPOSAL_POOLS.lock().await;
     if let Some(p) = guard.get(addr) {
         return Arc::clone(p);
     }
@@ -1225,47 +626,18 @@ impl RaftNetworkFactory<PcsTypeConfig> for TcpNetworkFactory {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed-raft"))]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
-    fn free_addr() -> SocketAddr {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    }
-
-    fn spawn_echo_server(addr: SocketAddr) {
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    while let Ok(Some(frame)) = read_frame(&mut stream).await {
-                        let _ = write_frame(&mut stream, &frame).await;
-                    }
-                });
-            }
-        });
-    }
-
-    #[test]
-    fn test_serde_command_round_trip_via_json() {
-        use crate::distributed::consensus::types::ConsensusCommand;
-        let cmd = ConsensusCommand::AckClaim {
-            claim_id: uuid::Uuid::new_v4(),
-            instance_id: uuid::Uuid::new_v4(),
-        };
-        let json = serde_json::to_vec(&cmd).unwrap();
-        let decoded: ConsensusCommand = serde_json::from_slice(&json).unwrap();
-        assert!(matches!(decoded, ConsensusCommand::AckClaim { .. }));
-    }
+    use super::super::tests::{free_addr, spawn_echo_server};
 
     // ── Task-#29 tests ────────────────────────────────────────────────────────
 
     /// Verify that connecting to an unreachable peer produces `ConnectFailed`
     /// which maps to `RPCError::Unreachable` (permanent-ish classification).
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_connect_failure_maps_to_unreachable() {
         // Port 1 is never listening.
@@ -1279,7 +651,6 @@ mod tests {
     }
 
     /// Verify that a read timeout maps to `RPCError::Network` (transient).
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_read_timeout_maps_to_network_error() {
         use tokio::net::TcpListener;
@@ -1313,42 +684,7 @@ mod tests {
         );
     }
 
-    /// `PeerReset`, `WriteFailed`, `FramingError`, and `Other` must all map to
-    /// the transient `RPCError::Network` variant.
-    #[cfg(feature = "distributed-raft")]
-    #[tokio::test]
-    async fn test_transient_errors_map_to_network() {
-        let cases: Vec<TransportError> = vec![
-            TransportError::PeerReset,
-            TransportError::WriteFailed(io::Error::other("x")),
-            TransportError::WriteTimeout,
-            TransportError::FramingError("bad frame".to_string()),
-            TransportError::Other(io::Error::other("y")),
-        ];
-        for err in cases {
-            let rpc_err = err.into_rpc_error();
-            assert!(
-                matches!(rpc_err, RPCError::Network(_)),
-                "expected Network for transient error, got: {rpc_err:?}"
-            );
-        }
-    }
-
-    /// `EncodeError` must map to `RPCError::Unreachable` (non-transient —
-    /// serialization failures are bugs, not network hiccups).
-    #[cfg(feature = "distributed-raft")]
-    #[test]
-    fn test_encode_error_maps_to_unreachable() {
-        let err = TransportError::EncodeError("bad type".to_string());
-        let rpc_err = err.into_rpc_error();
-        assert!(
-            matches!(rpc_err, RPCError::Unreachable(_)),
-            "encode error must map to Unreachable, got: {rpc_err:?}"
-        );
-    }
-
     /// Verify the connection pool acquire/release/capacity semantics.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_pool_acquire_release_capacity() {
         let addr = free_addr();
@@ -1384,7 +720,6 @@ mod tests {
     }
 
     /// Stale pooled connections (exceeding POOL_MAX_IDLE) are dropped on acquire.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_pool_stale_connection_dropped() {
         let addr = free_addr();
@@ -1411,146 +746,12 @@ mod tests {
         );
     }
 
-    /// Oversized frame returns InvalidData, not silently truncates.
-    #[tokio::test]
-    async fn test_read_frame_oversized_returns_error() {
-        use tokio::io::AsyncWriteExt;
-        let addr = free_addr();
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            if let Ok((mut stream, _)) = listener.accept().await {
-                // Send a length larger than MAX_FRAME_BYTES.
-                let oversized_len = (MAX_FRAME_BYTES + 1) as u32;
-                let _ = stream.write_all(&oversized_len.to_be_bytes()).await;
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let result = read_frame(&mut stream).await;
-        assert!(
-            matches!(result, Err(ref e) if e.kind() == io::ErrorKind::InvalidData),
-            "oversized frame must return InvalidData, got: {result:?}"
-        );
-    }
-
-    /// Truncated frame payload returns UnexpectedEof.
-    #[tokio::test]
-    async fn test_read_frame_truncated_returns_unexpected_eof() {
-        use tokio::io::AsyncWriteExt;
-        let addr = free_addr();
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            if let Ok((mut stream, _)) = listener.accept().await {
-                // Claim 10 bytes but only send 5.
-                let len: u32 = 10;
-                let _ = stream.write_all(&len.to_be_bytes()).await;
-                let _ = stream.write_all(b"hello").await;
-                // Drop stream — causes EOF mid-payload.
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let result = read_frame(&mut stream).await;
-        assert!(
-            matches!(result, Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
-            "truncated frame must return UnexpectedEof, got: {result:?}"
-        );
-    }
-
-    /// write_frame rejects frames larger than MAX_FRAME_BYTES before writing.
-    #[tokio::test]
-    async fn test_write_frame_oversized_returns_error() {
-        let addr = free_addr();
-        spawn_echo_server(addr);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        // MAX_FRAME_BYTES + 1 bytes.
-        let big = vec![0u8; MAX_FRAME_BYTES + 1];
-        let result = write_frame(&mut stream, &big).await;
-        assert!(
-            matches!(result, Err(ref e) if e.kind() == io::ErrorKind::InvalidData),
-            "oversized write must return InvalidData, got: {result:?}"
-        );
-    }
-
-    /// clean EOF (peer closes without sending anything) returns Ok(None).
-    #[tokio::test]
-    async fn test_read_frame_clean_eof_returns_none() {
-        let addr = free_addr();
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            if let Ok((_stream, _)) = listener.accept().await {
-                // Drop stream immediately — sends clean FIN.
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let result = read_frame(&mut stream).await;
-        assert!(
-            matches!(result, Ok(None)),
-            "clean EOF must return Ok(None), got: {result:?}"
-        );
-    }
-
     /// Snapshot transfer IDs from TRANSFER_ID_COUNTER are unique.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_transfer_id_counter_unique() {
         let id1 = TRANSFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let id2 = TRANSFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id1, id2, "transfer IDs must be unique");
-    }
-
-    /// Snapshot chunk accumulation enforces the concurrent transfer limit.
-    #[cfg(feature = "distributed-raft")]
-    #[tokio::test]
-    async fn test_snapshot_buffer_concurrent_limit() {
-        // Fill up to the limit.
-        let mut transfers: HashMap<u64, InFlightSnapshot> = HashMap::new();
-        for i in 0..SNAPSHOT_MAX_CONCURRENT_TRANSFERS {
-            transfers.insert(
-                i as u64,
-                InFlightSnapshot {
-                    data: Vec::new(),
-                    last_chunk_at: Instant::now(),
-                },
-            );
-        }
-        assert_eq!(transfers.len(), SNAPSHOT_MAX_CONCURRENT_TRANSFERS);
-
-        // A new transfer_id when at limit should be rejected.
-        let new_id = 999u64;
-        let is_new = !transfers.contains_key(&new_id);
-        let at_limit = transfers.len() >= SNAPSHOT_MAX_CONCURRENT_TRANSFERS;
-        assert!(is_new && at_limit, "should detect new transfer at limit");
-    }
-
-    /// Snapshot chunk accumulation enforces the per-transfer size cap.
-    #[cfg(feature = "distributed-raft")]
-    #[tokio::test]
-    async fn test_snapshot_buffer_size_cap() {
-        let mut transfers: HashMap<u64, InFlightSnapshot> = HashMap::new();
-        let transfer_id = 1u64;
-        transfers.insert(
-            transfer_id,
-            InFlightSnapshot {
-                // Pre-fill with data just below the cap.
-                data: vec![0u8; SNAPSHOT_MAX_TRANSFER_BYTES - 1],
-                last_chunk_at: Instant::now(),
-            },
-        );
-
-        let entry = transfers.get(&transfer_id).unwrap();
-        // Adding 2 more bytes would exceed the cap.
-        let new_size = entry.data.len() + 2;
-        assert!(
-            new_size > SNAPSHOT_MAX_TRANSFER_BYTES,
-            "size check should detect overflow"
-        );
     }
 
     // ── Task-#6 test: snapshot chunk reassembly ────────────────────────────────
@@ -1564,7 +765,6 @@ mod tests {
     ///
     /// This validates that the sender correctly slices the body and that the
     /// reassembly logic produces the original bytes.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_snapshot_chunk_reassembly_roundtrip() {
         use std::io::Cursor;
@@ -1623,7 +823,7 @@ mod tests {
 
         // We need a fake Vote and SnapshotMeta for the test.
         // Since they are serde types we construct them manually.
-        use openraft::{SnapshotMeta, StoredMembership, impls::Vote};
+        use openraft::{Snapshot, SnapshotMeta, StoredMembership, impls::Vote};
         let vote = Vote::new(1, 1);
         let meta = SnapshotMeta {
             last_log_id: None,
@@ -1649,7 +849,6 @@ mod tests {
 
     /// Spawn a minimal TCP server that handles `ProposalForward` envelopes and
     /// returns a `ProposalResult { ok: Some(...) }` response.
-    #[cfg(feature = "distributed-raft")]
     fn spawn_fake_leader(addr: SocketAddr, response: ConsensusResponse) {
         tokio::spawn(async move {
             let listener = TcpListener::bind(addr).await.unwrap();
@@ -1674,7 +873,6 @@ mod tests {
     }
 
     /// `forward_proposal` succeeds when the leader returns `ProposalResult { ok }`.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_forward_proposal_success() {
         use uuid::Uuid;
@@ -1696,7 +894,6 @@ mod tests {
 
     /// `forward_proposal` returns an error when the leader returns
     /// `ProposalResult { err }`.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_forward_proposal_leader_error_response() {
         use tokio::net::TcpListener;
@@ -1734,7 +931,6 @@ mod tests {
     }
 
     /// `forward_proposal` returns a connect error when the address is unreachable.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_forward_proposal_connect_failure() {
         use uuid::Uuid;
@@ -1751,49 +947,9 @@ mod tests {
         );
     }
 
-    /// `handle_envelope` with `ProposalForward` returns `ProposalResult` via
-    /// the wire framing end-to-end (serde round-trip check).
-    #[cfg(feature = "distributed-raft")]
-    #[test]
-    fn test_proposal_forward_envelope_serde_round_trip() {
-        use uuid::Uuid;
-
-        let cmd = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
-        };
-        let envelope = RpcEnvelope::ProposalForward {
-            command: cmd.clone(),
-        };
-        let json = serde_json::to_vec(&envelope).unwrap();
-        let decoded: RpcEnvelope = serde_json::from_slice(&json).unwrap();
-        assert!(
-            matches!(decoded, RpcEnvelope::ProposalForward { .. }),
-            "should decode back to ProposalForward"
-        );
-
-        let resp = RpcResponse::ProposalResult {
-            ok: Some(ConsensusResponse::ClaimAcked),
-            err: None,
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: RpcResponse = serde_json::from_slice(&json).unwrap();
-        assert!(
-            matches!(
-                decoded,
-                RpcResponse::ProposalResult {
-                    ok: Some(ConsensusResponse::ClaimAcked),
-                    ..
-                }
-            ),
-            "should decode back to ProposalResult with ok"
-        );
-    }
-
     // ── Circuit breaker state machine tests ───────────────────────────────────
 
     /// Fresh circuit is closed with zero failures.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_circuit_starts_closed() {
         let state = CircuitState::new();
@@ -1801,7 +957,6 @@ mod tests {
     }
 
     /// Circuit opens after CIRCUIT_OPEN_THRESHOLD consecutive failures.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_circuit_opens_after_threshold_failures() {
         let mut state = CircuitState::new();
@@ -1819,7 +974,6 @@ mod tests {
     }
 
     /// A success resets the failure counter so the threshold must be reached again.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_circuit_resets_on_success() {
         let mut state = CircuitState::new();
@@ -1844,7 +998,6 @@ mod tests {
     }
 
     /// Circuit transitions to half-open after CIRCUIT_OPEN_DURATION expires.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_circuit_half_open_after_duration() {
         let mut state = CircuitState::Open {
@@ -1870,7 +1023,6 @@ mod tests {
     }
 
     /// Closed circuit stays closed when failures are below the threshold.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_circuit_stays_closed_below_threshold() {
         let mut state = CircuitState::new();
@@ -1884,7 +1036,6 @@ mod tests {
     }
 
     /// `PeerPool::acquire` returns an error immediately when the circuit is open.
-    #[cfg(feature = "distributed-raft")]
     #[tokio::test]
     async fn test_pool_acquire_blocked_by_open_circuit() {
         let pool = PeerPool::new("127.0.0.1:1"); // unreachable port
@@ -1909,7 +1060,6 @@ mod tests {
     /// This is a logic test — we verify the constant relationship, not the
     /// network path. The actual guard inside `send_snapshot_chunks` compares
     /// `chunk_data.len() > MAX_SNAPSHOT_CHUNK_BYTES`.
-    #[cfg(feature = "distributed-raft")]
     #[test]
     fn test_snapshot_chunk_size_constant_matches_server_cap() {
         assert_eq!(

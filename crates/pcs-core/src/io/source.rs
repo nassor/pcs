@@ -16,8 +16,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 
+use crate::dataset::Dataset;
 use crate::error::PcsError;
-use crate::pipeline::Dataset;
 
 /// Pull-based batch source for Arrow data.
 ///

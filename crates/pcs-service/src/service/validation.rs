@@ -1,10 +1,14 @@
 //! Load-time semantic validation for assembled services.
 //!
-//! Provides [`validate_io_coverage`] which checks that every source
-//! `target_component` and sink `source_component` declared in the TOML config
-//! is covered by the runtime's declared component list.  The check runs after
-//! the runtime is loaded so it catches config↔runtime mismatches before the
-//! first pipeline iteration.
+//! Two checks run after the runtime is loaded, so they catch config↔runtime and
+//! runtime↔persisted-state mismatches before the first pipeline iteration:
+//!
+//! - [`validate_io_coverage`] — every source `target_component` and sink
+//!   `source_component` declared in the TOML config is covered by the runtime's
+//!   declared component list.
+//! - [`validate_schema_fingerprint`] — the runtime's Arrow schema fingerprint
+//!   matches the fingerprint recorded by the node's persisted checkpoints, so a
+//!   redeployed pipeline cannot resume against incompatible state.
 
 use pcs_core::PcsResult;
 use pcs_core::error::PcsError;
@@ -37,8 +41,7 @@ use super::config::ServiceConfig;
 /// let config = ServiceConfig {
 ///     node: NodeConfig { id: 1, name: None, data_dir: PathBuf::from("/tmp") },
 ///     mode: ServiceMode::Standalone { config: StandaloneConfig::default() },
-///     pipeline: PipelineSpec { systems: vec![], components: vec![],
-///         #[cfg(feature = "wasm")] wasm: None },
+///     pipeline: PipelineSpec::default(),
 ///     sources: vec![],
 ///     sinks: vec![],
 ///     http: HttpConfig::default(),
@@ -86,6 +89,33 @@ pub fn validate_io_coverage(declared: &[&str], config: &ServiceConfig) -> PcsRes
     }
 }
 
+/// Verify that the runtime's Arrow schema fingerprint matches the one recorded
+/// by this node's persisted checkpoints.
+///
+/// `runtime` is `runtime.template_dataset().schemas().fingerprint()` — the same
+/// `u32` a WASM guest reports as `pipeline-descriptor.schema-fingerprint` (the
+/// guest formats it as 8-char hex; the value is identical). `persisted` is
+/// [`RedbSharedStore::persisted_schema_id`](crate::distributed::consensus::store::RedbSharedStore::persisted_schema_id),
+/// i.e. `None` on a node with no state yet.
+///
+/// # Errors
+///
+/// Returns [`PcsError::Configuration`] when both are present and differ: the
+/// persisted checkpoints describe a different schema shape than the pipeline
+/// about to resume from them, so resuming would silently mix layouts.
+pub fn validate_schema_fingerprint(runtime: u32, persisted: Option<u32>) -> PcsResult<()> {
+    match persisted {
+        None => Ok(()),
+        Some(stored) if stored == runtime => Ok(()),
+        Some(stored) => Err(PcsError::configuration(format!(
+            "schema fingerprint mismatch: the pipeline declares {runtime:08x} but this \
+             node's persisted checkpoints were written with {stored:08x}. The deployed \
+             pipeline's component schemas changed. Either restore the previous pipeline \
+             or clear node.data_dir before starting with the new schema."
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,8 +136,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -197,5 +225,38 @@ mod tests {
     fn test_no_sources_or_sinks_passes() {
         let config = make_config(vec![], vec![]);
         validate_io_coverage(&["Orders"], &config).unwrap();
+    }
+
+    // ── Schema fingerprint gate ──────────────────────────────────────────────
+
+    #[test]
+    fn test_fingerprint_passes_on_a_fresh_node() {
+        validate_schema_fingerprint(0xdead_beef, None)
+            .expect("a node with no persisted state has nothing to conflict with");
+    }
+
+    #[test]
+    fn test_fingerprint_passes_when_it_matches() {
+        validate_schema_fingerprint(0xdead_beef, Some(0xdead_beef)).expect("same shape resumes");
+    }
+
+    #[test]
+    fn test_fingerprint_mismatch_is_rejected() {
+        let err = validate_schema_fingerprint(0x0000_0001, Some(0x0000_0002))
+            .expect_err("a redeployed pipeline must not resume against foreign state");
+        assert_eq!(err.category(), "configuration");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("00000001"),
+            "must name the pipeline's own: {msg}"
+        );
+        assert!(
+            msg.contains("00000002"),
+            "must name the persisted one: {msg}"
+        );
+        assert!(
+            msg.contains("data_dir"),
+            "must tell the operator what to do: {msg}"
+        );
     }
 }

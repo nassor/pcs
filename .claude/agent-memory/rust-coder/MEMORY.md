@@ -1,6 +1,5 @@
 # rust-coder Agent Memory
 
-- [Canudo ECS Rewrite](project_ecs_rewrite.md) — ECS rewrite completed on ecs-rewrite branch; new module structure and API
 - [Phase 2 ArrowWorld](project_phase2_arrowworld.md) — Arrow-backed world under src/arrow/; design decisions and benchmark results for Phase 3 coders
 - [Phase 3 ArrowSystem+Pipeline](project_phase3_arrow_pipeline.md) — ArrowSystem trait, ArrowPipeline with field-level DAG scheduling; key design decisions recorded
 - [Phase 4 Parallelism](project_phase4_parallelism.md) — ParallelArrowSystem, WriteSet, slice parallelism; critical diagnosis: sqrt workload is DRAM-bound, not compute-bound

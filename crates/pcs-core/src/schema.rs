@@ -1,8 +1,8 @@
 //! [`SchemaRegistry`] — a catalogue of Arrow schemas for registered components.
 //!
-//! The registry is maintained inside [`Dataset`](super::pipeline::Dataset) and
+//! The registry is maintained inside [`Dataset`](super::dataset::Dataset) and
 //! records the canonical [`Schema`] for every component type registered with
-//! [`register_component`](super::pipeline::Dataset::register_component).
+//! [`register_component`](super::dataset::Dataset::register_component).
 //!
 //! You rarely need to interact with the registry directly; the pipeline manages it
 //! on your behalf. It is exposed publicly to support advanced use-cases such as

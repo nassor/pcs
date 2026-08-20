@@ -31,12 +31,13 @@ async fn full_stack_chaos_monkey_60s() {
     use async_trait::async_trait;
     use common::RaftClusterHarness;
     use pcs_service::PcsResult;
+    use pcs_service::dataset::Dataset;
     use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
     use pcs_service::distributed::consensus::store::RedbSharedStore;
     use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
     use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
     use pcs_service::distributed::strategy::CheckpointStrategy;
-    use pcs_service::pipeline::{Dataset, Pipeline};
+    use pcs_service::pipeline::Pipeline;
     use pcs_service::system::{SystemMeta, system_fn};
     use rand::RngExt;
     use tokio_util::sync::CancellationToken;

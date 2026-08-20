@@ -15,8 +15,8 @@ Phase 2 ArrowWorld is implemented and merged on the ecs-rewrite branch under `sr
 - `row_count` and `alive` bitmap track LOGICAL rows, not per-component accumulated appends. The first component appended in a batch cycle extends the bitmap; subsequent components for the same cycle do not (their new batch length == row_count).
 - No per-row `get::<C>(row)` API — intentional to force column-first access patterns.
 - Component names leaked as `&'static str` during `read_ipc` for map-key compatibility. Acceptable for IPC (non-hot path). Phase 3 should plan for interning.
-- `serde_arrow 0.14.0` uses `to_arrow(fields, items: T)` (not `to_record_batch(fields, &T)`) for slice inputs because `[T]` is unsized. Use `serde_arrow::to_arrow` + `RecordBatch::try_new`.
-- Arrow sub-crates pinned at `=58.1.0` exactly. serde_arrow uses `arrow-58` feature flag.
+- `serde_arrow 0.15.0` uses `to_arrow(fields, items: T)` (not `to_record_batch(fields, &T)`) for slice inputs because `[T]` is unsized. Use `serde_arrow::to_arrow` + `RecordBatch::try_new`.
+- Arrow sub-crates pinned at `59.2.0` (`arrow-buffer`/`arrow-arith`/`arrow-ord`/`arrow-ipc`/`parquet` exactly). serde_arrow uses the `arrow-59` feature flag.
 - `register_component` panics if called after rows have been appended. All components must be registered before first `append`.
 
 ## Benchmark results (1M rows, 10 wide-schema f64 columns, target-cpu=native)

@@ -35,7 +35,8 @@ use async_trait::async_trait;
 
 use pcs_service::PcsError;
 use pcs_service::SystemConfig;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::dataset::Dataset;
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{ParallelSystem, System, SystemMeta, WriteSet};
 
 use crate::components::{Invoice, Order};

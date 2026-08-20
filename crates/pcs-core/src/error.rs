@@ -45,98 +45,13 @@
 
 /// Comprehensive error type for PCS workflows
 ///
-/// This enum covers all the different ways things can go wrong in PCS pipelines.
-/// Each variant is designed to give you clear information about what happened
-/// and how to fix it.
+/// Each variant carries enough context to say what happened and what to do
+/// about it; the table in the [module docs](self) maps every variant to its
+/// cause and remedy.
 ///
-/// ## Error Categories
-///
-/// ### SystemExecution
-/// Something went wrong in your system's business logic during execution.
-///
-/// **Common causes:**
-/// - Invalid input data
-/// - External API failures
-/// - Business rule violations
-/// - Resource unavailability
-///
-/// **How to fix:** Check your system's logic and input validation.
-///
-/// ### ComponentNotFound
-/// An entity is missing a required component.
-///
-/// **Common causes:**
-/// - Component was never added to the entity
-/// - Component was removed before it was needed
-/// - Wrong entity ID used
-///
-/// **How to fix:** Ensure the component is added to the entity before the system runs.
-///
-/// ### EntityNotFound
-/// The referenced entity does not exist or has been removed.
-///
-/// **Common causes:**
-/// - Entity was despawned
-/// - Entity ID was never valid
-/// - Stale entity reference
-///
-/// **How to fix:** Verify entity IDs and check entity lifecycle.
-///
-/// ### ResourceNotFound
-/// A required global resource is not registered.
-///
-/// **Common causes:**
-/// - Resource was never inserted into the pipeline
-/// - Resource was removed before use
-///
-/// **How to fix:** Register the resource before running systems that depend on it.
-///
-/// ### Store
-/// Store operations failed (get/put/remove).
-///
-/// **Common causes:**
-/// - Type mismatches when retrieving data
-/// - Store backend issues
-/// - Concurrent access problems
-///
-/// **How to fix:** Check store keys and ensure type consistency.
-///
-/// ### Scheduler
-/// Scheduler orchestration problems.
-///
-/// **Common causes:**
-/// - Unregistered system references
-/// - Invalid action routing
-/// - Circular dependencies
-///
-/// **How to fix:** Verify system registration and action string routing.
-///
-/// ### Configuration
-/// Invalid system or pipeline configuration.
-///
-/// **Common causes:**
-/// - Invalid concurrency settings
-/// - Negative retry counts
-/// - Conflicting settings
-///
-/// **How to fix:** Review system builder parameters and pipeline setup.
-///
-/// ### RetryExhausted
-/// All retry attempts have been exhausted.
-///
-/// **Common causes:**
-/// - Persistent external failures
-/// - Insufficient retry configuration
-/// - Systemic issues
-///
-/// **How to fix:** Increase retry count, fix root cause, or add exponential backoff.
-///
-/// ## Converting from Other Errors
-///
-/// PCS errors can be created from various sources including standard library
-/// errors, string slices, and owned strings. Use the appropriate constructor
-/// method or the `Into` trait for convenient conversion.
-#[derive(Debug, Clone)]
+/// `From` impls exist for `&str`, `String`, `std::io::Error`, and
+/// `Box<dyn std::error::Error>`, so `?` works against those sources directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PcsError {
     /// Error during system execution (your business logic)
     ///
@@ -353,49 +268,6 @@ impl std::fmt::Display for PcsError {
 }
 
 impl std::error::Error for PcsError {}
-
-impl PartialEq for PcsError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (PcsError::SystemExecution(a), PcsError::SystemExecution(b)) => a == b,
-            (
-                PcsError::ComponentNotFound {
-                    entity_id: eid_a,
-                    type_name: tn_a,
-                },
-                PcsError::ComponentNotFound {
-                    entity_id: eid_b,
-                    type_name: tn_b,
-                },
-            ) => eid_a == eid_b && tn_a == tn_b,
-            (PcsError::EntityNotFound(a), PcsError::EntityNotFound(b)) => a == b,
-            (PcsError::ResourceNotFound(a), PcsError::ResourceNotFound(b)) => a == b,
-            (PcsError::Store(a), PcsError::Store(b)) => a == b,
-            (PcsError::Scheduler(a), PcsError::Scheduler(b)) => a == b,
-            (PcsError::Configuration(a), PcsError::Configuration(b)) => a == b,
-            (
-                PcsError::RetryExhausted {
-                    source: sa,
-                    attempts: aa,
-                },
-                PcsError::RetryExhausted {
-                    source: sb,
-                    attempts: ab,
-                },
-            ) => aa == ab && sa == sb,
-            (PcsError::Generic(a), PcsError::Generic(b)) => a == b,
-            #[cfg(feature = "distributed")]
-            (PcsError::Distributed(a), PcsError::Distributed(b)) => a == b,
-            #[cfg(feature = "distributed")]
-            (PcsError::LeaseExpired { batch_id: a }, PcsError::LeaseExpired { batch_id: b }) => {
-                a == b
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for PcsError {}
 
 // Conversion traits for ergonomic error handling
 

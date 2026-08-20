@@ -29,9 +29,10 @@ use serde::{Deserialize, Serialize};
 use pcs_service::PcsError;
 use pcs_service::System;
 use pcs_service::component::Component;
+use pcs_service::dataset::Dataset;
 use pcs_service::distributed::strategy::CheckpointStrategy;
 use pcs_service::distributed::{DistributedRunner, KeyPartition, RedbSharedStore, RunnerConfig};
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{SystemMeta, system_fn};
 use pcs_service::windows::{
     ReduceAggregate, WindowAccumulator, WindowFunction, WindowResults, WindowSpec,

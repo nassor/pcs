@@ -9,16 +9,16 @@
 #     --config examples/configs/standalone.toml
 #
 # The pipeline reads from examples/configs/fixtures/orders.csv (CSV source),
-# passes rows through (no user systems registered), and writes results to
+# runs a WASM guest component, and writes results to
 # /tmp/pcs-standalone-orders-out.csv (CSV sink).  /tmp always exists;
 # if you change the path, create the parent directory first.
 #
 # BUILT-IN FACTORIES USED:
 #   source:    CsvSource    — reads newline-delimited CSV with a declared schema
 #   sink:      CsvSink      — writes CSV with a declared schema
-#   component: GenericComponent — schema-forward component declared inline
-#   systems:   (none)       — the pipeline is a pure pass-through; add your own
-#                             by registering system factories in a custom binary
+#   pipeline:  a WASM guest component, which declares its own components via
+#              `describe()`. There is no TOML path for declaring components or
+#              systems — see crates/pcs-service/src/service/registry.rs.
 
 # mode: standalone — single process, no distributed coordination.
 mode = "standalone"
@@ -34,32 +34,12 @@ data_dir = "${PCS_DATA_DIR:-/tmp/pcs-standalone}"
 [run_mode]
 kind = "one_shot"
 
-# Components declare the typed columnar data the pipeline operates on.
-# GenericComponent derives its Arrow schema from the 'fields' list below.
-[[pipeline.components]]
-name = "orders"
-type = "GenericComponent"
-
-[[pipeline.components.config.fields]]
-name = "id"
-type = "Int64"
-nullable = false
-
-[[pipeline.components.config.fields]]
-name = "amount"
-type = "Float64"
-nullable = true
-
-[[pipeline.components.config.fields]]
-name = "status"
-type = "Utf8"
-nullable = true
-
-# Systems run in registration order; DAG scheduling applies.
-# No built-in processing systems ship with pcs-service — add your own by
-# forking the binary and registering system factories via ServiceBuilder.
-# Empty array is required when no systems are declared.
-pipeline.systems = []
+# The pipeline is a WASM guest component. Its `describe()` response supplies the
+# component list, so `target_component` / `source_component` below must name
+# components the guest declares. Build the module with
+# `cargo component build --release --target wasm32-wasip2`.
+[pipeline.wasm]
+module = "pipelines/orders.wasm"
 
 # Sources feed rows into component columns before the pipeline runs.
 # CsvSource requires: path (string), schema_fields (array), has_headers (bool,

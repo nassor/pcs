@@ -7,9 +7,12 @@
 #![cfg(feature = "windows")]
 
 pub mod accumulator;
+mod aggregate;
+mod builder;
 pub mod function;
 pub mod hash;
 pub mod result;
+mod sliding;
 pub mod spec;
 pub mod system;
 pub mod time;

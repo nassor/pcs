@@ -17,7 +17,7 @@
 <ol>
     <li>An instance calls <code>PartitionSource::claim_next_batch</code> to lease a row-range partition.</li>
     <li>It reconstructs a <code>Dataset</code> for the partition (via a user-provided <code>world_factory</code> closure).</li>
-    <li>It calls <code>Pipeline::run_on(&amp;mut partition_dataset)</code> &mdash; the template&rsquo;s own data, sources, and sinks are <em>never</em> used.</li>
+    <li>It calls <code>PipelineRuntime::run_on_with_state(&amp;mut partition_dataset, prior)</code> &mdash; the template&rsquo;s own data, sources, and sinks are <em>never</em> used. <code>prior</code> is the opaque state blob the runtime returned for its previous batch; whatever it returns now is persisted and handed back next time.</li>
     <li>Between (configurable) stages, it persists Arrow IPC checkpoints via <code>CheckpointStore::save_checkpoint</code>.</li>
     <li>On success it acks the claim; on crash, the lease expires and another instance picks the partition up, optionally resuming from the latest checkpoint.</li>
 </ol>
@@ -40,56 +40,60 @@
 
 <h2 id="single-node">Single-node example</h2>
 <p>
-    The simplest setup uses one process, one redb file, and a single instance running its own coordinator. There is no Raft, but the same code works in cluster mode by switching the store constructor.
+    The simplest setup uses one process, one redb file, and a single instance running its own coordinator. There is no Raft: <code>RedbSharedStore::single_node</code> applies every command directly to the local database. Cluster mode keeps the pipeline template and the <code>run</code> call identical &mdash; only the store construction changes, and it gains a Raft driver.
 </p>
 
 <div class="getting-started-code">
-    <pre><code class="language-rust">use std::sync::Arc;
-use uuid::Uuid;
+    <pre><code class="language-rust">use std::path::Path;
 
 use pcs_core::prelude::*;
 use pcs_service::distributed::{
-    DistributedRunner, RunnerConfig, CheckpointStrategy, RedbSharedStore,
+    CheckpointStrategy, DistributedRunner, RedbSharedStore, RunnerConfig,
 };
 
 #[tokio::main]
 async fn main() -&gt; PcsResult&lt;()&gt; {
-    // 1. Open the shared redb store.
-    let store = RedbSharedStore::open("/tmp/pcs.redb")?;
+    // 1. Open the shared redb store. Single-node applies state straight to the
+    //    local file — no Raft, no second database.
+    let store = RedbSharedStore::single_node(Path::new("/var/lib/pcs/pcs.redb"))?;
 
-    // 2. Register a master batch — the data this runner will partition over.
-    let trades: Vec&lt;Trade&gt; = load_trades_from_parquet("/data/trades.parquet")?;
-    let batch = Trade::to_record_batch(&amp;trades)?;
-    let mut buf = Vec::new();
-    arrow_ipc::writer::FileWriter::try_new(&amp;mut buf, &amp;Trade::schema())?
-        .write(&amp;batch)?;
-    store.register_master_batch(/*schema_id=*/ 1, "Trade", buf).await?;
+    // 2. Register a master batch — the rows this runner partitions over.
+    //    `ipc_bytes` is an Arrow IPC *stream* (`arrow_ipc::writer::StreamWriter`)
+    //    of at most MAX_LOG_ENTRY_BYTES (1 MiB). Split larger inputs into
+    //    several batches, each with its own `batch_id`.
+    let (ipc_bytes, total_rows) = encode_trades_ipc("/data/trades.parquet")?;
+    store
+        .register_master_batch(
+            0,                         // batch_id
+            Trade::name().to_string(), // component
+            1,                         // schema_id
+            ipc_bytes,
+            total_rows,                // u32 rows in this batch
+        )
+        .await?;
 
-    // 3. Build the pipeline template.
+    // 3. Build the pipeline template. Its own dataset, sources, and sinks are
+    //    never used — every claim runs against a fresh partition Dataset.
     let template = Pipeline::builder("trade-processor")
         .with::&lt;Trade&gt;()
         .with_system(ValidateTradeSystem)
         .with_system(EnrichTradeSystem)
         .build();
 
-    // 4. Drive the runner.
-    let mut runner = DistributedRunner::new(
+    // 4. Drive the runner. `run` takes `&amp;self`; `world_factory` is called once
+    //    per claim to produce the empty Dataset the partition is loaded into.
+    let runner = DistributedRunner::new(
         store,
         Box::new(template),
         RunnerConfig {
-            instance_id: Uuid::new_v4(),
             checkpoint_strategy: CheckpointStrategy::EveryStage,
             schema_id: 1,
             max_batches: None,
-            lease_renewal_check_interval_millis: 250,
             ..Default::default()
         },
     );
-
-    // For each claim, the runner asks `world_factory` to produce a fresh
-    // Dataset and copies the partition's IPC snapshot into it before running.
-    let processed = runner.run(|| Dataset::new()).await?;
-    println!("processed {} batches", processed);
+    let processed = runner.run(Dataset::new).await?;
+    println!("processed {processed} batches");
     Ok(())
 }</code></pre>
 </div>
@@ -120,24 +124,47 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
 </p>
 
 <div class="getting-started-code">
-    <pre><code class="language-rust">use pcs_service::distributed::{
-    ArrowRaftDriver, ArrowRaftDriverConfig, TcpNetworkFactory, PcsTypeConfig,
-};
+    <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::Arc;
 
-let driver = ArrowRaftDriver::new(ArrowRaftDriverConfig {
-    node_id: 1,
-    listen_addr: "0.0.0.0:7001".parse()?,
-    log_db_path:   "/var/lib/pcs/raft-log.redb".into(),
-    state_db_path: "/var/lib/pcs/state-machine.redb".into(),
-    ..Default::default()
-}).await?;
+use pcs_service::distributed::RedbSharedStore;
+use pcs_service::distributed::consensus::{ArrowRaftDriver, ArrowRaftDriverConfig};
 
-let store = RedbSharedStore::with_raft(driver.handle()).await?;
-// ... same pipeline template, same runner.run(...) call as single-node.</code></pre>
+// `start` is async. It opens both redb files, refuses to start if the state
+// machine is behind what the log store already purged, and returns the handle
+// plus the driver's task — keep that task alive for the process lifetime.
+let (handle, _driver_task) = ArrowRaftDriver::start(
+    ArrowRaftDriverConfig {
+        node_id: 1,
+        listen_addr: "0.0.0.0:7001".parse().unwrap(),
+        // "host:port" strings, resolved lazily at connect time, so Docker
+        // service names work. An empty map auto-initialises a single node.
+        peers: HashMap::from([
+            (2, "pcs-2:7001".to_string()),
+            (3, "pcs-3:7001".to_string()),
+        ]),
+        ..Default::default()
+    },
+    "/var/lib/pcs/raft-log.redb",      // openraft log store
+    "/var/lib/pcs/state-machine.redb", // applied state
+)
+.await?;
+
+// `start` wires outbound connections only. Until the inbound listener is
+// spawned, peers cannot deliver votes or heartbeats and no leader is elected.
+let _tcp_server = handle.spawn_tcp_server("0.0.0.0:7001".parse().unwrap());
+
+// Multi-node store: mutations are proposed through Raft, reads lock the very
+// same database handle the state machine writes to — no second open file.
+let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clone());
+// ... same pipeline template, same `runner.run(Dataset::new)` call as single-node.</code></pre>
 </div>
 
 <p>
-    Network framing is length-prefixed TCP (<code>TcpNetworkFactory</code> &rarr; <code>TcpNetwork</code>), so adding nodes only requires reachable TCP ports.
+    One node bootstraps the cluster once: <code>handle.initialize(members)</code> takes a <code>BTreeMap&lt;u64, openraft::BasicNode&gt;</code> of the initial membership and is a no-op on later starts. Skip it entirely when <code>peers</code> is empty &mdash; <code>ArrowRaftDriver::start</code> auto-initialises that case. The <code>pcs-service</code> binary run with <code>mode = "cluster"</code> performs all of the wiring above from TOML, so hand-rolling it is only necessary when embedding the runner in your own process.
+</p>
+<p>
+    Peer framing is length-prefixed TCP with a 16 MiB frame cap. The driver builds the outbound half (<code>TcpNetworkFactory</code> &rarr; <code>TcpNetwork</code>) internally and calling code never names either type, so adding nodes needs only reachable TCP ports plus the <code>spawn_tcp_server</code> listener above.
 </p>
 
 <h2 id="examples">Examples</h2>

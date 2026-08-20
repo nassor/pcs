@@ -141,11 +141,9 @@ impl std::fmt::Debug for BuiltService {
 ///      [`PipelineRuntimeLoader`].
 ///    - Else if [`with_runtime`](Self::with_runtime) was called, use that.
 ///    - Else return [`PcsError::Configuration`].
-/// 2. Emit a deprecation warning if `config.pipeline.systems` is non-empty
-///    (legacy path).
-/// 3. For each `SourceSpec`: look up factory, build source, wrap in
+/// 2. For each `SourceSpec`: look up factory, build source, wrap in
 ///    [`BuiltSource`].
-/// 4. For each `SinkSpec`: look up factory, build sink, wrap in
+/// 3. For each `SinkSpec`: look up factory, build sink, wrap in
 ///    [`BuiltSink`].
 ///
 /// ## Example
@@ -239,32 +237,6 @@ impl ServiceBuilder {
     /// - A source or sink factory is missing or returns an error.
     /// - (wasm) The module cannot be resolved, compiled, or described.
     pub fn build(self, config: &ServiceConfig) -> Result<BuiltService, PcsError> {
-        // Deprecation warnings for legacy `pipeline.systems` and `pipeline.components` config.
-        if !config.pipeline.systems.is_empty() {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                "pipeline.systems is deprecated and will be removed in a future release. \
-                 Provide a runtime via ServiceBuilder::with_runtime() instead."
-            );
-            #[cfg(not(feature = "tracing"))]
-            eprintln!(
-                "[pcs-service] WARN: pipeline.systems is deprecated and will be removed \
-                  in a future release. Provide a runtime via ServiceBuilder::with_runtime() instead."
-            );
-        }
-        if !config.pipeline.components.is_empty() {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                "pipeline.components is deprecated and will be removed in a future release. \
-                 Components are now registered by the runtime at construction time."
-            );
-            #[cfg(not(feature = "tracing"))]
-            eprintln!(
-                "[pcs-service] WARN: pipeline.components is deprecated and will be removed \
-                  in a future release. Components are now registered by the runtime at construction time."
-            );
-        }
-
         // ── Determine runtime ─────────────────────────────────────────────────
         let runtime: Box<dyn PipelineRuntime> = {
             // WASM path takes priority when the config declares a wasm spec.
@@ -364,7 +336,8 @@ pub(crate) fn build_io(
 #[cfg(all(test, feature = "service"))]
 mod tests {
     use super::*;
-    use crate::pipeline::{Dataset, Pipeline};
+    use crate::dataset::Dataset;
+    use crate::pipeline::Pipeline;
     use crate::service::config::{
         NodeConfig, PipelineSpec, ServiceConfig, ServiceMode, SinkSpec, SourceSpec,
         StandaloneConfig,
@@ -427,8 +400,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -476,8 +447,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -525,8 +494,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -562,8 +529,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },

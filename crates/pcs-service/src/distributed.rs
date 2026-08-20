@@ -1,20 +1,21 @@
 //! Arrow-IPC distributed execution layer for PCS.
 //!
-//! This module provides a parallel implementation of distributed batch
-//! processing built natively on Apache Arrow IPC. It coexists with the
-//! existing `crate::distributed` module.
+//! This module implements distributed batch processing natively on Apache
+//! Arrow IPC: partitions are claimed as row ranges of a replicated master
+//! `RecordBatch`, and every persisted artefact — checkpoints, window
+//! accumulators, runtime-state blobs — crosses the wire as IPC bytes.
 //!
 //! # Feature gates
 //!
-//! - `arrow-distributed` — enables this module and the core traits
-//! - `arrow-distributed-raft` — additionally enables openraft consensus
+//! - `distributed` — enables this module and the core traits
+//! - `distributed-raft` — additionally enables openraft consensus
 //!
 //! # Architecture
 //!
 //! ```text
 //! PartitionSource  ─────────────────────────────►  claim row-ranges
 //! CheckpointStore  ─────────────────────────────►  persist IPC snapshots
-//! DistributedRunner ─ claim → run pipeline → checkpoint → ack
+//! DistributedRunner ─ claim → run_on_with_state → checkpoint → ack
 //! RedbSharedStore  ─ single-node or multi-node (via Raft channel)
 //! consensus/            ─ state machine, log store, snapshot, driver, transport
 //! ```
@@ -29,11 +30,14 @@
 pub mod accumulator_store;
 pub mod checkpoint;
 pub mod consensus;
+pub mod guest_state_store;
 pub mod partition;
 pub mod runner;
 pub mod strategy;
 
-pub use checkpoint::{ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore};
+pub use checkpoint::{
+    ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, GUEST_STATE_STAGE_SENTINEL,
+};
 pub use consensus::RedbSharedStore;
 pub use partition::{BatchClaim, MAX_LOG_ENTRY_BYTES, PartitionSource};
 pub use runner::{DistributedRunner, KeyPartition, RunnerConfig};

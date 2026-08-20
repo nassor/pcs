@@ -50,7 +50,7 @@ pub mod prelude {
     };
 
     pub use crate::column::ComponentView;
-    pub use crate::pipeline::DatasetBuilder;
+    pub use crate::dataset::DatasetBuilder;
     pub use crate::system::FieldRef;
 
     pub use async_trait::async_trait;

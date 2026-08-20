@@ -75,9 +75,6 @@ data_dir = "{data_dir_str}"
 
 [run_mode]
 kind = "continuous"
-[[pipeline.systems]]
-name = "process"
-type = "ProcessBatch"
 
 [http]
 bind = "127.0.0.1:0"

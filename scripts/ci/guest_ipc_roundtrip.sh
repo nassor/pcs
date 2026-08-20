@@ -13,6 +13,11 @@
 #      .wasm via WasmPipelineRuntime, drives a RecordBatch through run-batch,
 #      and asserts byte-exact IPC equality on the round-trip.
 #
+# The artifact lands under `target/wasm32-wasip1/release/` even though the
+# build targets `wasm32-wasip2`: cargo-component 0.21.1 compiles the core
+# module for wasip1 and adapts it into a wasip2 component, keeping the
+# pre-adapter directory name.
+#
 # The test fixture (pcs-guest-smoketest) is intentionally trivial — one
 # component with a single u64 field, zero systems. The smoketest is an
 # identity pipeline, so any byte difference between the BEFORE and AFTER IPC

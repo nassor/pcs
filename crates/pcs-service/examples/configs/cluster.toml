@@ -27,10 +27,11 @@
 # here will cause validation to fail with a clear error message.
 #
 # BUILT-IN FACTORIES USED:
-#   component: GenericComponent — schema-forward component declared in TOML
+#   pipeline:  a WASM guest component — it declares the columnar schema via
+#              `describe()`; there is no TOML path for declaring components or
+#              systems (see crates/pcs-service/src/service/registry.rs)
 #   sinks:     CsvSink         — writes output rows to CSV files
 #   sources:   (none)          — cluster mode uses PartitionSource
-#   systems:   (none)          — add your own via a custom binary
 
 # mode: cluster enables the distributed Raft runner.
 mode = "cluster"
@@ -69,29 +70,11 @@ addr = "10.0.0.2:9000"
 id = 3
 addr = "10.0.0.3:9000"
 
-# GenericComponent declares the columnar schema the pipeline operates on.
-[[pipeline.components]]
-name = "events"
-type = "GenericComponent"
-
-[[pipeline.components.config.fields]]
-name = "event_id"
-type = "Int64"
-nullable = false
-
-[[pipeline.components.config.fields]]
-name = "event_type"
-type = "Utf8"
-nullable = true
-
-[[pipeline.components.config.fields]]
-name = "payload"
-type = "Utf8"
-nullable = true
-
-# Systems run in DAG order. No built-in processing systems ship with
-# pcs-service — register your own via a custom binary.
-pipeline.systems = []
+# The pipeline's components come from the guest's `describe()` response, so the
+# sink's `source_component` below must name one of them. Build the module with
+# `cargo component build --release --target wasm32-wasip2`.
+[pipeline.wasm]
+module = "pipelines/events.wasm"
 
 # [[sources]] entries must be ABSENT in cluster mode.
 # The cluster runner ingests through PartitionSource (distributed pull), not

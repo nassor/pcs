@@ -91,7 +91,7 @@ impl Dataset {
     /// ```rust
     /// #
     /// # {
-    /// use pcs_core::pipeline::Dataset;
+    /// use pcs_core::dataset::Dataset;
     /// let dataset = Dataset::new();
     /// assert_eq!(dataset.rows(), 0);
     /// # }
@@ -129,7 +129,7 @@ impl Default for Dataset {
 /// # use std::sync::Arc;
 /// # use arrow_schema::{DataType, Field, Schema};
 /// # use pcs_core::component::Component;
-/// # use pcs_core::pipeline::{Dataset, DatasetBuilder};
+/// # use pcs_core::dataset::{Dataset, DatasetBuilder};
 /// # use serde::{Serialize, Deserialize};
 /// # #[derive(Serialize, Deserialize)]
 /// # struct Order { id: u64 }

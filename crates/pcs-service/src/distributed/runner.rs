@@ -11,14 +11,16 @@
 //! For each claimed batch the runner:
 //! 1. Calls `world_factory()` to produce a fresh, empty [`Dataset`].
 //! 2. Optionally loads prior window accumulator state into the dataset.
-//! 3. Calls `self.runtime.run_on(&mut partition_data)` to execute the runtime
-//!    against the partition dataset.
-//! 4. Optionally saves a checkpoint of the resulting [`Dataset`] via
-//!    [`CheckpointStore`].
-//! 5. Acks or releases the claim based on success or failure.
+//! 3. Loads this runner's opaque runtime-state blob, if any.
+//! 4. Calls `self.runtime.run_on_with_state(&mut partition_data, prior)` to
+//!    execute the runtime against the partition dataset.
+//! 5. Optionally saves a checkpoint of the resulting [`Dataset`] via
+//!    [`CheckpointStore`], plus the accumulator and runtime-state blobs.
+//! 6. Acks or releases the claim based on success or failure.
 //!
 //! **The runtime is re-used across all iterations** — it holds no per-batch
-//! state outside the dataset passed to `run_on`.
+//! state outside the dataset passed to `run_on_with_state` and the blob it
+//! returns, which the runner persists and hands back on the next batch.
 //!
 //! ## Lease contract
 //!
@@ -54,10 +56,10 @@ use pcs_core::PipelineRuntime;
 
 use crate::PcsError;
 use crate::PcsResult;
+use crate::dataset::Dataset;
 use crate::distributed::checkpoint::CheckpointStore;
 use crate::distributed::partition::{MAX_LOG_ENTRY_BYTES, PartitionSource};
 use crate::distributed::strategy::CheckpointStrategy;
-use crate::pipeline::Dataset;
 #[cfg(test)]
 use crate::pipeline::Pipeline;
 
@@ -192,6 +194,11 @@ where
         let sweep_interval = Duration::from_secs(30); // ≈ default TTL (90 s) / 3
         let mut next_sweep = std::time::Instant::now() + sweep_interval;
 
+        // Claim id under which this runner last persisted the runtime's state
+        // blob. See `guest_state_store` for why the pointer has to be chained
+        // rather than derived from a stable partition key.
+        let mut state_claim_id: Option<Uuid> = None;
+
         loop {
             if let Some(max) = self.config.max_batches
                 && processed >= max
@@ -280,6 +287,33 @@ where
                 }
             }
 
+            // ── Load prior runtime state blob ───────────────────────────────
+            // Opaque to the host: whatever `run_on_with_state` returned on this
+            // runner's previous batch, handed straight back to the runtime.
+            let prior_state = match state_claim_id {
+                None => None,
+                Some(prior_id) => {
+                    match crate::distributed::guest_state_store::load_guest_state(
+                        &self.store,
+                        prior_id,
+                    )
+                    .await
+                    {
+                        Ok(blob) => blob,
+                        Err(_e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                claim_id = %claim.claim_id,
+                                error = %_e,
+                                "guest state load failed; releasing claim for retry"
+                            );
+                            Self::release_with_log(&self.store, &claim).await;
+                            continue;
+                        }
+                    }
+                }
+            };
+
             // ── Pre-run lease renewal check ──────────────────────────────────
             if self.store.should_renew(&claim) {
                 match self
@@ -325,17 +359,18 @@ where
             };
 
             enum RunOutcome {
-                Ran(PcsResult<()>),
+                Ran(PcsResult<Option<Vec<u8>>>),
                 RenewalFailed,
             }
             let runtime = &*self.runtime;
             let outcome = tokio::select! {
                 biased;
-                result = runtime.run_on(&mut partition_data) => RunOutcome::Ran(result),
+                result = runtime.run_on_with_state(&mut partition_data, prior_state.as_deref())
+                    => RunOutcome::Ran(result),
                 () = renewal_branch => RunOutcome::RenewalFailed,
             };
 
-            let run_result: PcsResult<()> = match outcome {
+            let run_result: PcsResult<Option<Vec<u8>>> = match outcome {
                 RunOutcome::Ran(r) => r,
                 RunOutcome::RenewalFailed => {
                     Self::release_with_log(&self.store, &claim).await;
@@ -343,7 +378,10 @@ where
                 }
             };
 
-            let mut run_error: Option<PcsError> = run_result.err();
+            let (next_state, mut run_error) = match run_result {
+                Ok(blob) => (blob, None),
+                Err(e) => (None, Some(e)),
+            };
             let mut claim_released = false;
 
             // ── Checkpoint ───────────────────────────────────────────────────
@@ -381,13 +419,43 @@ where
                 }
             }
 
+            // ── Save the runtime's state blob ───────────────────────────────
+            if run_error.is_none()
+                && !claim_released
+                && let Some(blob) = next_state.as_deref()
+            {
+                match crate::distributed::guest_state_store::save_guest_state(
+                    &self.store,
+                    claim.claim_id,
+                    blob,
+                    partition_data.schemas().fingerprint(),
+                )
+                .await
+                {
+                    // Advance the chain only once the blob is durable, so a
+                    // failed save leaves the previous state readable.
+                    Ok(()) => state_claim_id = Some(claim.claim_id),
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            claim_id = %claim.claim_id,
+                            error = %e,
+                            "guest state save failed; releasing claim for retry"
+                        );
+                        Self::release_with_log(&self.store, &claim).await;
+                        claim_released = true;
+                        run_error = Some(e);
+                    }
+                }
+            }
+
             match (run_error, claim_released) {
                 (Some(e), true) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         claim_id = %claim.claim_id,
                         error = %e,
-                        "skipping ack: claim was released on checkpoint or accumulator failure"
+                        "skipping ack: claim was released on a post-run persist failure"
                     );
                     let _ = e;
                     continue;
@@ -467,12 +535,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::Dataset;
     use crate::distributed::checkpoint::{Checkpoint, CheckpointStore};
     use crate::distributed::consensus::state_machine::apply as sm_apply;
     use crate::distributed::consensus::store::RedbSharedStore;
     use crate::distributed::consensus::types::ConsensusCommand;
     use crate::distributed::partition::{BatchClaim, PartitionSource};
-    use crate::pipeline::Dataset;
     use crate::system::{SystemMeta, system_fn};
     use async_trait::async_trait;
     use std::path::PathBuf;

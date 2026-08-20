@@ -4,7 +4,7 @@ description: Source/Sink traits, format implementations (Parquet/JSON/CSV/Channe
 type: project
 ---
 
-Phase 5 delivered the ingestion/egress layer under `src/arrow/io/`. Gated on new `arrow-io` feature that pulls in `arrow-json`, `arrow-csv`, `parquet` crates at version `=58.1.0`.
+Phase 5 delivered the ingestion/egress layer under `src/arrow/io/`. Gated on new `arrow-io` feature that pulls in `arrow-json`, `arrow-csv`, `parquet` crates at version `59.2.0`.
 
 **Test result:** 243 → 277 tests (34 new arrow-io tests). All pass.
 

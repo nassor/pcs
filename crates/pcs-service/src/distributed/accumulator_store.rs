@@ -21,11 +21,11 @@ use arrow_array::RecordBatch;
 #[cfg(feature = "windows")]
 use crate::PcsResult;
 #[cfg(feature = "windows")]
+use crate::dataset::Dataset;
+#[cfg(feature = "windows")]
 use crate::distributed::checkpoint::{ACCUMULATOR_STAGE_SENTINEL, CheckpointStore};
 #[cfg(feature = "windows")]
 use crate::distributed::partition::{BatchClaim, MAX_LOG_ENTRY_BYTES};
-#[cfg(feature = "windows")]
-use crate::pipeline::Dataset;
 
 #[cfg(feature = "windows")]
 use crate::component::Component;

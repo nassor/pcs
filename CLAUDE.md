@@ -4,60 +4,124 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-PCS is a distributed batch processing engine for Rust built on Apache Arrow. Edition 2024, MSRV 1.95.0.
+PCS is a distributed batch processing engine for Rust built on Apache Arrow. Pipelines compile to
+WebAssembly components; a host binary loads them at runtime. Edition 2024, MSRV 1.95.0.
+
+The repository root is a **virtual manifest** — there is no root `src/`. Every command that names a
+target needs `-p <crate>`.
+
+## Workspace layout
+
+```
+crates/
+├── pcs-core/            # Engine primitives: Dataset, Pipeline, System, Scheduler, Component.
+│                        # Arrow-only dependencies; compiles for both host and wasm32-wasip2 guest.
+├── pcs-guest/           # Guest SDK: re-exports pcs-core + the export_pipeline! macro.
+│                        # Owns the canonical WIT package at wit/pipeline.wit.
+├── pcs-guest-smoketest/ # Minimal guest component used as a CI fixture (arrow-ipc drift gate,
+│                        # config delivery, cross-batch state).
+└── pcs-service/         # Host: wasmtime runtime, IO formats, distributed/Raft, HTTP control
+                         # plane, TOML config, and the pcs-service binary.
+examples/wasm/order_processing/   # A realistic guest pipeline built with cargo-component.
+docs/                             # Zola site: content/*.md front matter + templates/*.html prose.
+```
 
 ## Commands
 
 ```bash
-cargo build                                                  # Build
-cargo test --lib                                             # Run unit tests
-cargo test --doc                                             # Run doc tests
+cargo build                                                  # Build (workspace default members)
+cargo test --workspace --all-features                        # Full suite — what CI runs
+cargo test --workspace --all-features --doc                  # Doc tests
 cargo fmt --all -- --check                                   # Check formatting
-cargo clippy --all-targets --all-features -- -D warnings     # Lint (treats warnings as errors)
-cargo bench --bench pipeline                                 # Run a single benchmark
+cargo clippy --all-targets --all-features -- -D warnings     # Lint (warnings are errors)
+cargo bench -p pcs-core --bench pipeline                     # Run a single benchmark
 cargo check --examples                                       # Verify examples compile
-cargo run --example scheduler_etl                            # Run an example
-cargo run --example distributed_scheduler --features distributed  # Distributed example
-cargo run --example scheduler_etl_parallel                   # Parallel stage example
-cargo audit                                                  # Security audit
+cargo run -p pcs-service --example scheduler_etl             # Run an example
+cargo run -p pcs-service --example distributed_scheduler --features distributed
+cargo run -p pcs-service --example scheduler_etl_parallel
+cargo audit                                                  # Security audit (needs cargo-audit)
 ```
 
-## Feature Flags
+`cargo fmt --all -- --check` walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs the
+cargo-component-generated `src/bindings.rs` files on disk even though the host build never compiles
+them. Both are gitignored. Generate them first:
 
-- `tracing` — integrates with the `tracing` crate for observability
-- `io` — adds `Source`/`Sink` traits with Parquet, CSV, JSON, and channel support
-- `datafusion` — enables DataFusion integration (implies `io`)
-- `distributed` — core distributed traits: `PartitionSource`, `CheckpointStore`, `DistributedRunner`; redb storage backend; TCP transport
-- `distributed-raft` — adds openraft-based log storage, state machine, snapshot, and Raft node driver (implies `distributed`)
-- `service` — production binary (`pcs-service`) with axum HTTP control plane, TOML config, metrics, and standalone runner (implies `io`, `distributed`, `distributed-raft`, `tracing`)
-- `service-cluster` — layers cluster/Raft mode on top of `service` (implies `service`, `distributed-raft`)
+```bash
+rustup target add wasm32-wasip2
+cargo install cargo-component --locked --version 0.21.1
+cargo component build -p order-processing-wasm --target wasm32-wasip2
+cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
+```
+
+The second build is also a prerequisite for `cargo test`: `crates/pcs-service/tests/wasm_roundtrip.rs`
+asserts the artifact exists. Note the output lands under `target/wasm32-wasip1/` — cargo-component
+0.21.1 compiles the core module for wasip1 and adapts it into a wasip2 component, keeping the
+pre-adapter directory name.
+
+## Feature flags
+
+### `pcs-core`
+
+- `runtime` (**default**) — tokio + rayon stage parallelism. Disable for wasm guest builds.
+- `guest` — wasm32-wasip2 target: sequential-only execution driven by the `pollster` sync executor.
+- `windows` — windowed aggregation: `WindowedSystem`, `WindowSpec`, watermarks, `WindowAccumulator`.
+- `io` — the `Source`/`Sink` traits plus the in-memory channel implementations (implies `runtime`).
+- `distributed` — types shared with the host's distributed layer (implies `runtime`).
+- `tracing` — `tracing` crate integration.
+
+### `pcs-service`
+
+- `io` — Parquet, CSV, and JSON `Source`/`Sink` implementations (the formats live here, not in core).
+- `datafusion` — DataFusion source (implies `io`).
+- `windows` — forwards `pcs-core/windows`.
+- `wasm` — wasmtime host: `WasmEngine`, `WasmPipelineRuntime`, the `bindgen!` host bindings.
+- `distributed` — `PartitionSource`, `CheckpointStore`, `DistributedRunner`, redb store, TCP transport.
+- `distributed-raft` — openraft log store, state machine, snapshot, node driver (implies `distributed`).
+- `service` — the `pcs-service` binary: axum HTTP control plane, TOML config, metrics, standalone
+  runner (implies `io`, `distributed`, `tracing`). It does **not** imply `distributed-raft`.
+- `service-cluster` — cluster/Raft mode on top of `service` (implies `service`, `distributed-raft`).
 
 ## Architecture
 
-### Columnar Processing Model
+### Columnar processing model (`crates/pcs-core/`)
 
-- **`Component` trait** (`src/component.rs`): Any type that provides a `name() -> &'static str` and an Arrow `Schema`. Data serializes via `serde_arrow`.
-- **`Dataset`** (`src/pipeline.rs`): Arrow-backed columnar data container. Stores one `RecordBatch` per registered component; all batches share the same row count. Holds `SchemaRegistry`, `ResourceMap`, and an alive bitmap. Supports batch `append`, soft-delete (`mark_dead`), compaction, and IPC round-trip serialization. Was called `Pipeline` prior to the April 2026 refactor. Builder: `DatasetBuilder`.
-- **`Row`** (`src/row.rs`): Stable row index (`u32`). Invalidated by `compact`.
-- **`Resource`** (`src/resource.rs`): Boxed Rust singleton stored in `Dataset`, keyed by `TypeId`. Not columnar.
-- **`System` trait** (`src/system.rs`): Processing logic with `meta()` (declares field-level read/write access), `async fn run(&self, data: &mut Dataset)`, and optional sync fast-path `run_sync`. Created via struct impl or `system_fn` closure helper.
-- **`Pipeline`** (`src/pipeline.rs`): Self-contained workload: `{ name, data: Dataset, systems, DAG stages, sources, sinks }`. Builds a dependency graph from `SystemMeta`, topologically sorts into stages, and runs them with per-system retry. Was called `Scheduler` prior to the April 2026 refactor. Builder: `PipelineBuilder`.
-- **`Scheduler`** (`src/scheduler.rs`): Multi-pipeline orchestrator: `{ pipelines: Vec<Pipeline> }`. Drives several independent workloads from one process. Methods: `add_pipeline`, `tick` (sequential), `tick_parallel` (concurrent; each pipeline owns its own `Dataset` so no data contention).
+- **`Component` trait** (`src/component.rs`): any type providing `name() -> &'static str` and an
+  Arrow `Schema`. Rows serialize via `serde_arrow`.
+- **`Dataset`** (`src/dataset.rs` plus the nine-file `src/dataset/` submodule): Arrow-backed columnar
+  container. One `RecordBatch` per registered component; the IPC format requires every component to
+  hold exactly the dataset's row count. Holds a `SchemaRegistry`, a `ResourceMap`, and an alive
+  bitmap. Supports batch `append`, soft delete (`mark_dead`), compaction, and IPC round-trip.
+  Builder: `DatasetBuilder`. Canonical path: `pcs_core::dataset::Dataset`.
+- **`Row`** (`src/row.rs`): stable row index (`u32`). Invalidated by `compact`.
+- **`Resource`** (`src/resource.rs`): boxed Rust singleton stored in `Dataset`, keyed by `TypeId`.
+  Not columnar, and **not** serialized by `write_ipc` — the guest SDK relies on that to keep
+  cross-batch state out of the data plane.
+- **`System` trait** (`src/system.rs`): `meta()` declares field-level read/write access,
+  `async fn run(&self, data: &mut Dataset)` does the work, `run_sync` is an optional sync fast path.
+  Written as a struct impl or via the `system_fn` closure helper.
+- **`Pipeline`** (`src/pipeline.rs` + `src/pipeline/`): self-contained workload
+  `{ name, data: Dataset, systems, DAG stages, sources, sinks }`. Builds a conflict graph from
+  `SystemMeta`, topologically sorts it into stages, and runs them with per-system retry. Builder:
+  `PipelineBuilder`.
+- **`Scheduler`** (`src/scheduler.rs`): multi-pipeline orchestrator over `Vec<Pipeline>`. `tick()`
+  runs every pipeline once, walking a dependency DAG built from `PipelineConfig`. Reachable from
+  library code only — `ServiceConfig.pipeline` is singular, so the TOML-driven binary never builds
+  one.
 
-### Dataset API (`src/pipeline.rs`)
+### Dataset API
 
 ```rust
 let mut dataset = Dataset::new();
 dataset.register_component::<Price>()?;          // must precede append
 dataset.append::<Price>(&rows)?;                 // returns Range<Row>
-let col = dataset.column::<Price>("value");       // -> Option<ArrayRef>
+let col = dataset.column::<Price>("value");      // -> Option<ArrayRef>
 dataset.mark_dead(row);                          // soft delete
 dataset.compact();                               // filter dead rows
 dataset.write_ipc(&mut buf)?;                    // serialize
-let dataset2 = Dataset::read_ipc(&buf)?;         // deserialize
+let dataset2 = Dataset::read_ipc(&mut &buf[..])?;
 ```
 
-### Pipeline API (`src/pipeline.rs`)
+### Pipeline API
 
 ```rust
 // Inline construction
@@ -75,11 +139,15 @@ let pipeline = Pipeline::builder("etl")
     .build();
 ```
 
-`run_on(&self, data: &mut Dataset)` is the escape hatch for `DistributedRunner`: it executes the system DAG against an external dataset without touching the template pipeline's own data, sources, or sinks.
+`run_on(&self, data: &mut Dataset)` is the escape hatch for hosts that own their own dataset: it
+executes the system DAG against an external dataset without touching the template pipeline's data,
+sources, or sinks. `run_on_with_stats` is the same thing returning the per-call `RunStats`, which is
+how the guest SDK fills the WIT `run-metrics` record honestly.
 
 ### System & SystemMeta (`src/system.rs`)
 
-`SystemMeta` declares data access at field granularity via `(component_name, field_name)` pairs. The pipeline uses this to build a conflict graph and group non-conflicting systems into the same stage.
+`SystemMeta` declares data access at field granularity via `(component_name, field_name)` pairs. The
+pipeline uses this to build a conflict graph and group non-conflicting systems into one stage.
 
 ```rust
 SystemMeta::new("enrich")
@@ -97,70 +165,127 @@ Conflict rules (B registered after A):
 
 System trait signatures:
 - `async fn run(&self, data: &mut Dataset) -> PcsResult<()>` — exclusive access
-- `async fn run(&self, data: &Dataset) -> PcsResult<WriteSet>` — `ParallelSystem` read-only pass
-
-### Pipeline DAG Scheduling (`src/pipeline.rs`)
-
-`Pipeline::run()` validates all declared fields against `self.data.schemas()`, builds the stage graph from `SystemMeta` declarations, then runs stages sequentially. Each system run is wrapped in the retry logic from `SystemConfig`. Sources are drained into `self.data` before systems run; sinks are drained from `self.data` after.
-
-### Scheduler Orchestration (`src/scheduler.rs`)
-
-`Scheduler` owns a `Vec<Pipeline>` and provides two tick modes:
-
-- `tick()`: runs each pipeline sequentially in registration order. Simpler to reason about; prefer when pipelines are fast or when deterministic ordering matters.
-- `tick_parallel()`: drives all pipelines concurrently via `futures::try_join_all`. Each pipeline exclusively owns its `Dataset` — no shared mutable state — so parallel execution is trivially sound. Prefer when pipelines are IO-heavy or CPU-bound and independent.
-
-Use `Scheduler` when running multiple independent workloads from one process.
-
-### IO Layer (`src/io/`, feature-gated)
-
-`Source` and `Sink` traits for reading/writing Arrow data. Built-in implementations: Parquet, JSON Lines, CSV, and in-memory channel transport. Pipeline integrates via `drain_into_dataset` / `drain_dataset`.
+- `async fn run(&self, data: &Dataset) -> PcsResult<WriteSet>` — `ParallelSystem`, read-only pass
 
 ### Retry (`src/retry.rs`)
 
-`RetryMode`: `None`, `Fixed`, or `ExponentialBackoff` (default: 3 retries, 100ms base, 2.0x multiplier, 30s cap, 0.1 jitter). `SystemConfig` wraps a `RetryMode` and is returned by `System::config()`.
+`RetryMode`: `None`, `Fixed`, or `ExponentialBackoff` (default: 3 retries, 100 ms base, 2.0×
+multiplier, 30 s cap, 0.1 jitter). `SystemConfig` wraps a `RetryMode` and is returned by
+`System::config()`. Every system run goes through one of two drivers that share the attempt-counting
+core: `run_with_retries` (async, `tokio::time::sleep`) and `run_with_retries_blocking`
+(`std::thread::sleep`, for the rayon/`spawn_blocking` stage path).
 
 ### Error types (`src/error.rs`)
 
-`PcsError` variants: `SystemExecution`, `ComponentNotFound`, `EntityNotFound`, `ResourceNotFound`, `Store`, `Scheduler`, `Configuration`, `RetryExhausted`, `Generic`. With `distributed` feature: `Distributed`, `LeaseExpired`. Alias: `PcsResult<T>`.
+`PcsError` variants: `SystemExecution`, `ComponentNotFound`, `EntityNotFound`, `ResourceNotFound`,
+`Store`, `Scheduler`, `Configuration`, `RetryExhausted`, `Generic`. With the `distributed` feature:
+`Distributed`, `LeaseExpired`. Alias: `PcsResult<T>`. `PartialEq`/`Eq` are derived.
 
-### Distributed Processing (`src/distributed/`, feature-gated)
+### Windowed aggregation (`src/windows/`, `windows` feature)
 
-Multi-instance batch execution with at-least-once processing semantics.
+`WindowedSystem` + `WindowedSystemBuilder` assign rows to tumbling, sliding, or session windows,
+track watermarks, aggregate per key, and publish results as a `WindowResults` resource.
+`WindowAccumulator` is the component that carries open-window state across batches; the host
+persists it through `CheckpointStore`.
 
-**Core traits and types** (`distributed` feature):
+### Guest SDK (`crates/pcs-guest/`)
+
+Owns `wit/pipeline.wit`, the canonical `pcs:pipeline@0.2.0` WIT package. The guest exports exactly
+two functions:
+
+- `describe()` — name, version, component schemas, schema fingerprint, stateful flag.
+- `run-batch(input, prior)` — Arrow IPC in, Arrow IPC out, plus metrics and an updated state blob.
+
+`export_pipeline!(build)` wires a `fn() -> Pipeline` to those exports and emits `pcs_config_get` /
+`pcs_config_parse` into the caller's crate (the WIT bindings are caller-side, so the accessors must
+be too). `export_pipeline!(build, state = C)` additionally installs a `GuestState<C>` resource on the
+batch dataset before the systems run and serializes it back into `run-result.checkpoint` afterwards.
+State is a resource rather than a registered component because resources do not round-trip through
+Arrow IPC, so guest state never leaks into the output.
+
+The host creates a fresh wasmtime `Store` per call, so `prior` / `checkpoint` is the only channel by
+which guest state survives a batch boundary.
+
+### IO layer
+
+`pcs-core`'s `io` feature provides the `Source` / `Sink` traits, the schema-cast helpers, and the
+in-memory channel implementations. The file formats — Parquet, JSON Lines, CSV — and the DataFusion
+source live in `crates/pcs-service/src/io/`, which re-exports the core traits so
+`pcs_service::io::source::Source` resolves. Pipelines integrate via `drain_into_dataset` /
+`drain_dataset`.
+
+### Distributed processing (`crates/pcs-service/src/distributed/`)
+
+Multi-instance batch execution with at-least-once semantics. `pcs-core`'s `distributed` feature
+contributes shared types only; all runner code lives here.
+
+**`distributed` feature:**
 - `PartitionSource` — claims/acks/releases row-range batches across instances
 - `CheckpointStore` — persists Arrow IPC snapshots for crash recovery
-- `DistributedRunner` + `RunnerConfig` — holds a `Pipeline` template. For each claimed batch it calls a `world_factory()` closure to produce a fresh `Dataset`, then calls `pipeline.run_on(&mut partition_dataset)` to execute the system DAG. The template's own `data`, sources, and sinks are **never used** — data arrives via `PartitionSource`, state is saved via `CheckpointStore`.
-- `CheckpointStrategy` — checkpoint frequency: `EveryStage`, `EveryNStages`, `None`
-- `RedbSharedStore` — implements `PartitionSource` + `CheckpointStore` over redb; single-node (direct apply) or multi-node (proposes through Raft channel)
+- `DistributedRunner` + `RunnerConfig` — holds a `Box<dyn PipelineRuntime>` template. Per claimed
+  batch it calls `world_factory()` for a fresh `Dataset`, loads the window accumulator and the
+  runtime's opaque state blob, calls `runtime.run_on_with_state(&mut partition_data, prior)`, then
+  checkpoints and acks. The template's own data, sources, and sinks are never used.
+- `CheckpointStrategy` — `EveryStage`, `EveryNStages`, `None`
+- `RedbSharedStore` — `PartitionSource` + `CheckpointStore` over redb; single-node applies directly,
+  multi-node proposes through the Raft driver
 - `ConsensusCommand` / `ConsensusResponse` — deterministic state machine command types
-- `ParquetCheckpointStore` — archival checkpoint store (requires `io` + `distributed`)
+- `accumulator_store` / `guest_state_store` — free functions that park the window accumulator and the
+  runtime state blob under reserved `stage_idx` sentinels (`ACCUMULATOR_STAGE_SENTINEL`,
+  `GUEST_STATE_STAGE_SENTINEL`)
+- `ParquetCheckpointStore` — archival checkpoint store (needs `io` + `distributed`)
 
-**Raft integration** (`distributed-raft` feature):
-- `ArrowRedbLogStore` — implements openraft's `RaftLogStorage` over redb (log-only file)
-- `ArrowRedbStateMachine` — implements openraft's `RaftStateMachine`; applies `ConsensusCommand` ops to a separate redb file
-- `ArrowRaftDriver` + `ArrowRaftDriverConfig` + `ArrowRaftDriverHandle` — manages openraft node lifecycle with proposal channel
-- `PcsTypeConfig` — openraft type configuration (`NodeId=u64`, `D=String`, `R=String`)
-- `TcpNetworkFactory` / `TcpNetwork` — implements openraft's `RaftNetworkV2` with length-prefixed TCP framing
+**`distributed-raft` feature:**
+- `ArrowRedbLogStore` — openraft `RaftLogStorage` over a log-only redb file
+- `ArrowRedbStateMachine` — openraft `RaftStateMachine`; applies `ConsensusCommand` to a separate file
+- `validate_store_consistency` — refuses startup when the state machine is behind what the log store
+  purged; called by `ArrowRaftDriver::start`
+- `ArrowRaftDriver` + `ArrowRaftDriverConfig` + `ArrowRaftDriverHandle` — openraft node lifecycle
+  with a proposal channel
+- `PcsTypeConfig` — openraft type configuration (`D = ConsensusCommand`, `R = ConsensusResponse`)
+- `TcpNetworkFactory` / `TcpNetwork` / `RaftTcpServer` — `RaftNetworkV2` over length-prefixed TCP
 
-### Service Layer (`src/service/`, `src/bin/pcs-service/`, feature-gated)
+### WASM host (`crates/pcs-service/src/wasm/`, `wasm` feature)
 
-Requires the `service` feature. Provides a production-ready binary (`pcs-service`) with TOML-driven config, factory registry, HTTP control plane, and standalone/cluster runners.
+`WasmEngine` owns the wasmtime `Engine` and epoch ticker. `WasmPipelineRuntime` implements
+`pcs_core::runtime::PipelineRuntime`: it serializes the dataset to Arrow IPC, calls the guest's
+`run-batch` on a fresh `Store`, and reads the result back. `bindings.rs` is 26 lines of
+`wasmtime::component::bindgen!` pointed at `../pcs-guest/wit`, so host bindings cannot drift.
+`host_impl.rs` implements the `host-io` imports (`log`, `metric`, `get-config`).
+
+### Service layer (`crates/pcs-service/src/service/`, `src/bin/pcs-service/`)
+
+Requires the `service` feature. TOML-driven config, factory registry, HTTP control plane, and
+standalone/cluster runners.
 
 Key types:
-- `ServiceConfig` / `ServiceMode` — top-level TOML config schema (`mode = "standalone"` or `mode = "cluster"`)
-- `ServiceBuilder` / `BuiltService` — assembles scheduler, sources, and sinks from config + registered factories
-- `SystemFactory` / `SourceFactory` / `SinkFactory` / `ComponentFactory` — extension points for registering custom types
+- `ServiceConfig` / `ServiceMode` — TOML schema (`mode = "standalone"` or `mode = "cluster"`)
+- `PipelineSpec` / `WasmSpec` — where the pipeline comes from. `#[serde(deny_unknown_fields)]`: a key
+  the service cannot honour is a parse error, not a silently dropped section. There is no TOML path
+  for declaring systems or components.
+- `ServiceBuilder` / `BuiltService` — assembles the runtime, sources, and sinks from config plus
+  registered factories. The runtime is either `[pipeline.wasm]` or `with_runtime(...)`.
+- `Registry`, `SourceFactory`, `SinkFactory` — the whole extension surface. System and component
+  factories were removed.
+- `validate_io_coverage` / `validate_schema_fingerprint` — load-time gates: every declared
+  `target_component` / `source_component` must be in the runtime's `declared_components()`, and a
+  cluster node refuses to start when the pipeline's Arrow schema fingerprint differs from the one its
+  persisted checkpoints were written with.
 - `run_standalone` / `run_cluster` — runner entry points
 - HTTP control plane: `/health`, `/ready`, `/metrics`, `/status` (axum-backed)
 
-CLI subcommands: `serve`, `validate`, `status`, `cluster init`, `cluster join`, `cluster leave`, `cluster status`.
+CLI subcommands: `serve`, `validate`, `status`, `cluster init`, `cluster join`, `cluster leave`,
+`cluster status`.
 
 ## Conventions
 
-- All async traits use `#[async_trait]`.
-- Tracing instrumentation is behind `#[cfg(feature = "tracing")]` conditional compilation.
-- Public API is re-exported through `pcs::prelude::*` (see `src/lib.rs`).
-- Tests live in `#[cfg(test)]` modules within each source file.
-- Benchmarks use Criterion in `benches/`.
+- All async traits use `#[async_trait]`; `PipelineRuntime` uses `#[async_trait(?Send)]`.
+- Tracing instrumentation is behind `#[cfg(feature = "tracing")]`, and every such site keeps a
+  `#[cfg(not(feature = "tracing"))]` fallback so the value is still consumed.
+- Public API is re-exported through `pcs_core::prelude::*` and `pcs_service::prelude::*`. There is no
+  crate named `pcs`.
+- Tests live in `#[cfg(test)]` modules within each source file; integration tests are in each crate's
+  `tests/`. Docker-dependent chaos tests soft-skip with a `SKIP:` line when no daemon is present.
+- Benchmarks use Criterion in each crate's `benches/`.
+- `arrow-ipc = "=59.2.0"` is exact-pinned workspace-wide. It is the host↔guest wire format and the
+  on-disk checkpoint format; see `crates/pcs-guest/PINS.md` before touching it.

@@ -55,9 +55,8 @@ pub use cluster::{ClusterStats, run_cluster};
 pub use config::WasmSpec;
 #[cfg(feature = "service")]
 pub use config::{
-    ClusterConfig, ComponentInstance, HttpConfig, LogFormat, NodeConfig, ObservabilityConfig,
-    PeerSpec, PipelineSpec, RunMode, ServiceConfig, ServiceMode, SinkSpec, SourceSpec,
-    StandaloneConfig, SystemInstance,
+    ClusterConfig, HttpConfig, LogFormat, NodeConfig, ObservabilityConfig, PeerSpec, PipelineSpec,
+    RunMode, ServiceConfig, ServiceMode, SinkSpec, SourceSpec, StandaloneConfig,
 };
 #[cfg(feature = "service")]
 pub use factories::register_builtin_factories;

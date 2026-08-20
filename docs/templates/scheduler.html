@@ -8,14 +8,14 @@
 {% block content %}
 
 <h1 class="animate-in">Scheduler</h1>
-<p class="subtitle animate-in">A multi-pipeline orchestrator. Drives several independent <code>Pipeline</code>s from one process, sequentially or concurrently.</p>
+<p class="subtitle animate-in">A multi-pipeline orchestrator. Drives several independent <code>Pipeline</code>s from one process, in dependency order.</p>
 
 <h2 id="overview">Overview</h2>
 <p>
-    <code>Pipeline</code> is the unit of one workload. <code>Scheduler</code> is the unit of many. It owns a <code>Vec&lt;Pipeline&gt;</code> and provides two tick modes plus dependency edges between pipelines.
+    <code>Pipeline</code> is the unit of one workload. <code>Scheduler</code> is the unit of many. It owns a <code>Vec&lt;Pipeline&gt;</code> and drives them once per tick, in the order its dependency DAG allows.
 </p>
 <p>
-    Each pipeline owns its own <code>Dataset</code> &mdash; there is no shared mutable state between pipelines. That makes parallel execution trivially sound: <code>tick_parallel</code> just calls <code>Pipeline::run</code> on every pipeline concurrently via <code>futures::try_join_all</code>.
+    Each pipeline owns its own <code>Dataset</code> &mdash; there is no shared mutable state between pipelines. Concurrency lives <em>inside</em> each pipeline: stage parallelism already runs independent systems together on the tokio + rayon executor.
 </p>
 
 <h2 id="add-pipelines">Adding pipelines</h2>
@@ -40,20 +40,13 @@ let report = Pipeline::builder("report")
 sched.add_pipeline(report);</code></pre>
 </div>
 
-<h2 id="tick-modes">Tick modes</h2>
+<h2 id="tick">Ticking</h2>
 <p>
-    A <em>tick</em> runs every pipeline once. Choose a mode based on what you&rsquo;re optimizing for:
+    A <em>tick</em> runs every pipeline once, in registration order within each dependency stage, sorted by priority. The first error aborts the tick; later stages do not run.
 </p>
 
 <div class="getting-started-code">
-    <pre><code class="language-rust">// Sequential — pipelines run in registration order, one after another.
-// Easiest to reason about; preferred when pipelines are fast or when
-// deterministic ordering matters for logging/metrics.
-sched.tick().await?;
-
-// Concurrent — pipelines run in parallel within each scheduling stage.
-// Preferred when pipelines are IO-heavy or CPU-bound and independent.
-sched.tick_parallel().await?;</code></pre>
+    <pre><code class="language-rust">sched.tick().await?;</code></pre>
 </div>
 
 <h2 id="dependencies">Dependencies between pipelines</h2>
@@ -83,7 +76,7 @@ sched.add_pipeline_with_config(
 </div>
 
 <p>
-    Dependency edges define a DAG over pipelines (much like <code>SystemMeta</code> defines one over systems within a single pipeline). <code>tick_parallel</code> respects the DAG: independent pipelines run concurrently; dependents wait.
+    Dependency edges define a DAG over pipelines (much like <code>SystemMeta</code> defines one over systems within a single pipeline). <code>tick</code> walks the DAG stage by stage, so a dependent never runs before its predecessor.
 </p>
 
 <h2 id="getting-pipelines">Inspecting pipelines</h2>
@@ -137,7 +130,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
 
     // Drive a few ticks; each respects the dependency DAG.
     for _ in 0..3 {
-        sched.tick_parallel().await?;
+        sched.tick().await?;
     }
 
     Ok(())

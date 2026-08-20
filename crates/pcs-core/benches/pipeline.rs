@@ -15,7 +15,7 @@ use std::sync::Arc;
 use arrow_array::Float64Array;
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
-use pcs_core::{component::Component, pipeline::Dataset};
+use pcs_core::{component::Component, dataset::Dataset};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

@@ -25,8 +25,9 @@ pub use error::{PcsError, PcsResult};
 pub use retry::{RetryMode, SystemConfig};
 
 pub use component::Component;
+pub use dataset::{Dataset, DatasetBuilder};
 pub use partition::KeyPartition;
-pub use pipeline::{Dataset, Pipeline, PipelineBuilder, RunStats};
+pub use pipeline::{Pipeline, PipelineBuilder, RunStats};
 pub use row::Row;
 pub use scheduler::{BackpressureSpec, DependencyKind, PipelineConfig, Scheduler};
 pub use schema::SchemaRegistry;
@@ -47,7 +48,7 @@ pub mod prelude {
     };
 
     pub use crate::column::ComponentView;
-    pub use crate::pipeline::DatasetBuilder;
+    pub use crate::dataset::DatasetBuilder;
     pub use crate::system::FieldRef;
 
     pub use async_trait::async_trait;

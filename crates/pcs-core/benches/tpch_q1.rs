@@ -42,11 +42,15 @@ use async_trait::async_trait;
 use criterion::{Criterion, criterion_group, criterion_main};
 use pcs_core::PcsError;
 use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{
     ParallelSystem, ResourceUpdate, SliceWriteSet, System, SystemMeta, WriteSet,
 };
 use serde::{Deserialize, Serialize};
+
+mod support;
+use support::tpch::Lineitem;
 
 // ---------------------------------------------------------------------------
 // Lineitem schema (TPC-H subset used by Q1)
@@ -58,45 +62,6 @@ const SHIPDATE_THRESHOLD: i32 = 10471;
 const RETURNFLAG_VALUES: &[u8] = &[0, 1, 2];
 // Distinct linestatus values (F=0, O=1)
 const LINESTATUS_VALUES: &[u8] = &[0, 1];
-
-// Lineitem component — only the Q1-relevant fields
-#[derive(Serialize, Deserialize, Clone)]
-struct Lineitem {
-    l_orderkey: i64,
-    l_partkey: i64,
-    l_suppkey: i64,
-    l_linenumber: i32,
-    l_quantity: f64,
-    l_extendedprice: f64,
-    l_discount: f64,
-    l_tax: f64,
-    l_returnflag: u8,
-    l_linestatus: u8,
-    l_shipdate: i32,
-    l_commitdate: i32,
-}
-
-impl Component for Lineitem {
-    fn name() -> &'static str {
-        "Lineitem"
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int64, false),
-            Field::new("l_partkey", DataType::Int64, false),
-            Field::new("l_suppkey", DataType::Int64, false),
-            Field::new("l_linenumber", DataType::Int32, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
-            Field::new("l_returnflag", DataType::UInt8, false),
-            Field::new("l_linestatus", DataType::UInt8, false),
-            Field::new("l_shipdate", DataType::Int32, false),
-            Field::new("l_commitdate", DataType::Int32, false),
-        ]))
-    }
-}
 
 // Derived columns component — disc_price and charge
 #[derive(Serialize, Deserialize, Clone)]

@@ -102,16 +102,6 @@ impl WasmPipelineRuntime {
         *guard = Some(desc.clone());
         Ok(desc)
     }
-
-    /// Call `init(config_json)` on a fresh store. Call after `describe()`.
-    pub fn init(&self, config_json: &str) -> PcsResult<()> {
-        let (mut store, instance) = self.make_store_and_instance()?;
-        let iface = instance.pcs_pipeline_pipeline();
-        iface
-            .call_init(&mut store, config_json)
-            .map_err(|e| PcsError::SystemExecution(format!("guest trap (init): {e}")))?
-            .map_err(|msg| PcsError::Configuration(format!("guest init error: {msg}")))
-    }
 }
 
 /// Decode an Arrow IPC schema-message (produced by the guest's `schema_to_ipc_bytes`)
@@ -132,6 +122,14 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
     }
 
     async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+        self.run_on_with_state(data, None).await.map(|_| ())
+    }
+
+    async fn run_on_with_state(
+        &self,
+        data: &mut Dataset,
+        prior: Option<&[u8]>,
+    ) -> PcsResult<Option<Vec<u8>>> {
         // Serialize the current dataset state → Arrow IPC bytes.
         let mut ipc_bytes: Vec<u8> = Vec::new();
         data.write_ipc(&mut ipc_bytes)?;
@@ -139,15 +137,21 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
         let (mut store, instance) = self.make_store_and_instance()?;
         let iface = instance.pcs_pipeline_pipeline();
 
+        // A fresh Store per call means guest linear memory never survives a
+        // batch, so `prior` is the only channel by which guest state returns.
+        // `bindgen!` lowers `option<list<u8>>` to `Option<&Vec<u8>>`, so the
+        // slice has to be owned for the call; the copy is state-blob-sized and
+        // sits next to the full-dataset IPC serialisation above.
+        let prior_owned = prior.map(<[u8]>::to_vec);
         let run_result = iface
-            .call_run_batch(&mut store, &ipc_bytes, None)
+            .call_run_batch(&mut store, &ipc_bytes, prior_owned.as_ref())
             .map_err(|e| PcsError::SystemExecution(format!("guest trap (run-batch): {e}")))?;
 
         match run_result {
             Ok(result) => {
                 let mut out_slice: &[u8] = &result.output;
                 *data = Dataset::read_ipc(&mut out_slice)?;
-                Ok(())
+                Ok(result.checkpoint)
             }
             Err(RunError::Retryable(msg)) => {
                 Err(PcsError::SystemExecution(format!("guest retryable: {msg}")))
@@ -174,9 +178,9 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
 
         let descriptor = match self.describe() {
             Ok(d) => d,
-            Err(e) => {
+            Err(_e) => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(error = %e, "template_dataset: describe() failed, returning empty dataset");
+                tracing::warn!(error = %_e, "template_dataset: describe() failed, returning empty dataset");
                 return dataset;
             }
         };
@@ -184,9 +188,9 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
         for comp in &descriptor.components {
             let schema = match parse_ipc_schema(&comp.arrow_schema_ipc) {
                 Ok(s) => s,
-                Err(e) => {
+                Err(_e) => {
                     #[cfg(feature = "tracing")]
-                    tracing::warn!(component = %comp.name, error = %e, "template_dataset: schema parse failed, skipping component");
+                    tracing::warn!(component = %comp.name, error = %_e, "template_dataset: schema parse failed, skipping component");
                     continue;
                 }
             };

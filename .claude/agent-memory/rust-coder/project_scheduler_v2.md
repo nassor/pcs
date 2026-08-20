@@ -8,7 +8,7 @@ Scheduler V2 completed. Key additions:
 
 **New types in `src/scheduler.rs`:**
 - `DependencyKind::Order` (run after) vs `DependencyKind::Data` (skip if predecessor produced 0 rows)
-- `BackpressureSpec::Predicate(Box<dyn Fn(&Pipeline) -> bool + Send + Sync>)` — `#[cfg(feature = "io")]` `BackpressureSpec::Channel { component, max_pending }`
+- `BackpressureSpec::Predicate(Box<dyn Fn(&Pipeline) -> bool + Send + Sync>)` — the only variant. (A `Channel { component, max_pending }` variant existed behind `#[cfg(feature = "io")]` and was deleted in the 2026-08 simplification pass: nothing ever constructed it.)
 - `PipelineConfig { dependencies, priority, backpressure }` with builder methods `.after()`, `.priority()`, `.backpressure()`
 - `Scheduler::add_pipeline_with_config()` added; existing `add_pipeline()` unchanged for backwards compat
 - Kahn's topo sort in `build_stages()` — emits `PcsError::configuration` for unknown dep names, `PcsError::scheduler` for cycles
@@ -26,12 +26,12 @@ Scheduler V2 completed. Key additions:
 - Added `buffer_capacity: usize` field (stored at construction time — `tx.capacity()` returns remaining, not configured)
 
 **`Pipeline::sink_pending_rows()` (`src/pipeline/registration.rs`):**
-- `#[cfg(feature = "io")]` method for backpressure probe from `BackpressureSpec::Channel`
+- `#[cfg(feature = "io")]` method a `BackpressureSpec::Predicate` closure can call to probe sink depth
 
 **Prelude:** `BackpressureSpec`, `DependencyKind`, `PipelineConfig`, `RunStats` all re-exported.
 
 **`examples/scheduler_dag.rs`** — 4-demo end-to-end example.
 
-**Why:** BackpressureSpec has closure variant → manual `Debug` impl (prints `Predicate(<fn>)`). `BackpressureSpec::Channel` gated behind `#[cfg(feature = "io")]` — all match sites need matching cfg arm.
+**Why:** BackpressureSpec has a closure variant → manual `Debug` impl (prints `Predicate(<fn>)`).
 
 **How to apply:** `read_component`/`write_component` on `SystemMeta` takes `&'static str`, not a generic — `SystemMeta::new("x").read_component("MyComp")`.

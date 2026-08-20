@@ -42,7 +42,8 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use pcs_core::PcsError;
 use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{ParallelSystem, ResourceUpdate, System, SystemMeta, WriteSet};
 use serde::{Deserialize, Serialize};
 

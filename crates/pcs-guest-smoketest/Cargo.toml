@@ -1,10 +1,10 @@
 [package]
 name = "pcs-guest-smoketest"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 rust-version.workspace = true
-license = "AGPL-3.0-only"
-publish = false
+license.workspace = true
+publish.workspace = true
 description = "Minimal pcs-guest consumer used as a build fixture and Arrow IPC round-trip fixture."
 
 # This crate exists to verify:

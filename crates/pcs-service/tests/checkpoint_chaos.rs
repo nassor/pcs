@@ -15,12 +15,13 @@ use std::sync::Arc;
 
 use pcs_service::PcsError;
 use pcs_service::PcsResult;
+use pcs_service::dataset::Dataset;
 use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
 use pcs_service::distributed::consensus::store::RedbSharedStore;
 use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::pipeline::Pipeline;
 use tempfile::TempDir;
 use uuid::Uuid;
 

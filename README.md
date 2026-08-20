@@ -34,7 +34,7 @@ This is so far a playground project to explore two things:
 - **Distributed execution with Raft consensus** — partition assignment and checkpointing across nodes using an embedded Raft state machine over redb.
 - **Composable `System` trait** — each transform is an independent, testable Rust struct with explicit field-level read/write declarations.
 - **Configurable retry** — per-system `ExponentialBackoff` with max retries, base delay, multiplier, cap, and jitter.
-- **3-gate load-time validation** — structural WASM validation, WIT world match, and semantic schema-fingerprint check before any data flows.
+- **Load-time validation gates** — structural TOML parse (keys the service cannot honour are rejected, not dropped), WIT world match via wasmtime instantiation, and an IO-coverage check of every `target_component` / `source_component` against the runtime's declared components. In cluster mode, startup also refuses a pipeline whose Arrow schema fingerprint differs from the one its persisted checkpoints were written with.
 
 # Quick start
 
@@ -109,7 +109,9 @@ impl Order {
 }
 
 // Systems declare field-level reads/writes for automatic DAG scheduling
-struct TaxSystem;
+struct TaxSystem {
+    rate: f64,
+}
 
 #[async_trait::async_trait]
 impl System for TaxSystem {
@@ -122,29 +124,38 @@ impl System for TaxSystem {
         let orders = data.view::<Order>()?;
         let amounts = orders.f64(Order::AMOUNT)?;
         let taxes: Vec<f64> = (0..orders.len())
-            .map(|i| amounts.value(i) * 0.1)
+            .map(|i| amounts.value(i) * self.rate)
             .collect();
         // ... write taxes back via data.replace_batch
         Ok(())
     }
 }
 
-// Pipeline construction — called once by the macro on first use
+// Pipeline construction — called once by the macro on first use.
+// `pcs_config_parse` is emitted into this crate by `export_pipeline!` and reads
+// the `[pipeline.wasm.config]` table through the host-io `get-config` import.
 fn build() -> Pipeline {
+    let rate = match pcs_config_parse::<f64>("tax_rate") {
+        Some(Ok(rate)) => rate,
+        _ => 0.1,
+    };
     Pipeline::builder("order-tax")
         .with::<Order>()
-        .with_system(TaxSystem)
+        .with_system(TaxSystem { rate })
         .build()
 }
 
 // Wire the pipeline to the WIT exports
-#[cfg(target_arch = "wasm32")]
 #[allow(warnings)]
 mod bindings;
 
-#[cfg(target_arch = "wasm32")]
 pcs_guest::export_pipeline!(build);
 ```
+
+A guest that needs state across batches names the one component that carries
+it — `pcs_guest::export_pipeline!(build, state = Counter)` — and reads it from
+the batch dataset as a `GuestState<Counter>` resource. The host persists the
+blob the guest returns and hands it back on the next batch.
 
 ## 3. Build the WASM component
 
@@ -153,6 +164,10 @@ cargo component build --release --target wasm32-wasip2
 ```
 
 Output: `target/wasm32-wasip1/release/my_pipeline.wasm`
+
+The `wasip1` directory name is expected for a `wasm32-wasip2` build:
+`cargo-component` 0.21.1 compiles the core module for `wasm32-wasip1` and then
+adapts it into a WASI 0.2 component, keeping the pre-adapter target directory.
 
 Validate:
 
@@ -185,7 +200,6 @@ kind = "one_shot"
 
 [pipeline.wasm]
 module = "./my_pipeline.wasm"
-watch = false
 
 [pipeline.wasm.config]
 tax_rate = "0.1"
@@ -311,17 +325,21 @@ crates/
 └── pcs-service/     # Host binary: wasmtime, IO, distributed, config, HTTP
 ```
 
-## WIT interface (`pcs:pipeline@0.1.0`)
+## WIT interface (`pcs:pipeline@0.2.0`)
 
-The guest exports five functions:
+The guest exports two functions:
 
 | Export | Purpose |
 |--------|---------|
-| `describe()` | Returns pipeline metadata (name, version, component schemas, fingerprint). Called once at load time. |
-| `init(config)` | Receives the TOML config block as JSON. Called once before first batch. |
-| `run-batch(ipc, prior)` | The hot path. Receives Arrow IPC input + optional checkpoint, returns IPC output + metrics. |
-| `snapshot()` | Emit a point-in-time checkpoint between batches. |
-| `restore(checkpoint)` | Restore from a persisted checkpoint during cold-start recovery. |
+| `describe()` | Returns pipeline metadata (name, version, component schemas, fingerprint, stateful flag). Called once at load time. |
+| `run-batch(ipc, prior)` | The hot path. Receives Arrow IPC input + the guest's own state blob from the previous batch, returns IPC output + the updated blob + metrics. |
+
+`prior` / `run-result.checkpoint` are the only channel for guest state: the host
+builds a fresh wasmtime `Store` per call, so guest linear memory never survives
+a batch boundary. A stateless guest returns `none` and the host stores nothing.
+
+Config flows the other way, through the `host-io` `get-config` import, which the
+host answers on every call including `describe`.
 
 Data crosses the boundary as Arrow IPC bytes — the only serialization format. The guest's internal `Pipeline::run_on` runs the full DAG, and the host never inspects the system graph.
 
@@ -333,7 +351,7 @@ Errors from `run-batch` are classified into three variants:
 |-------------|---------|-------------|
 | `retryable` | Transient failure (retry exhausted, system error) | Release claim, retry next tick |
 | `permanent` | Bad input, logic bug, unknown error | Ack claim, log, surface to `/status` |
-| `schema-mismatch` | Fingerprint mismatch (only from `restore()`) | Refuse startup |
+| `schema-mismatch` | Reserved for a startup-time schema check; `run-batch` must never emit it | Refuse startup |
 
 Guest panics (WASM traps) are caught by the host and mapped to `permanent`.
 
@@ -385,7 +403,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - **[Website](https://nassor.github.io/pcs/)** — guides and architecture docs
 - **[Examples](./examples/wasm/)** — WASM guest pipeline examples
 - **[Native examples](./crates/pcs-service/examples/)** — Rust-native pipeline examples (internal)
-- **[Benchmark results](./docs/benchmarks/phase7-results.md)** — honest numbers vs postcard and DataFusion
+- **[Benchmark results](./docs/content/benchmarks/phase7-results.md)** — honest numbers vs postcard and DataFusion
 - **[PINS.md](./crates/pcs-guest/PINS.md)** — toolchain version pins for guest development
 
 ## Contributing

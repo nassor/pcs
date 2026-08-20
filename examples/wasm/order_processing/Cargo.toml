@@ -1,10 +1,10 @@
 [package]
 name = "order-processing-wasm"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 rust-version.workspace = true
-license = "AGPL-3.0-only"
-publish = false
+license.workspace = true
+publish.workspace = true
 description = "WASM Component Model port of the scheduler_etl example. Demonstrates field-granular DAG scheduling running inside a WASM guest via pcs-guest."
 
 # This is a guest pipeline component, NOT a binary. cargo-component wraps the

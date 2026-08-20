@@ -1,11 +1,11 @@
 //! [`Pipeline`] — self-contained workload: data + systems + DAG plan + optional IO.
 
-pub use crate::dataset::{Dataset, DatasetBuilder};
 pub(crate) use dag::SystemEntry;
 
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 
+use crate::dataset::{Dataset, DatasetBuilder};
 use crate::error::PcsError;
 use crate::retry::SystemConfig;
 

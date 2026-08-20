@@ -15,8 +15,9 @@ use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
 use pcs_service::component::Component;
+use pcs_service::dataset::Dataset;
 use pcs_service::error::PcsError;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::System;
 use pcs_service::windows::{
     WindowResults, WindowSpec,

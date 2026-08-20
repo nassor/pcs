@@ -30,18 +30,20 @@ following factory types.
 during `pcs-service validate`. The parent directory must exist before running
 `validate` or `serve`. The example configs use `/tmp/` directly to avoid this.
 
-### Components
+### Components and systems
 
-| TOML `type`        | Description                                       | Required config keys |
-|--------------------|---------------------------------------------------|----------------------|
-| `GenericComponent` | Schema-forward component declared inline in TOML  | `fields` (array)     |
+There are no component or system factories: the TOML has no path for declaring
+either. The pipeline is supplied one of two ways —
 
-### Systems
+- `[pipeline.wasm]` names a WASM guest component, which reports its components
+  through the `describe()` export, or
+- a custom binary hands `ServiceBuilder::with_runtime` a
+  `Box<dyn PipelineRuntime>` and omits the `[pipeline]` table entirely.
 
-None. All processing systems must be registered in a custom binary. The stock
-`pcs-service` binary passes data through the pipeline unchanged.
+A `[[pipeline.systems]]` or `[[pipeline.components]]` key is now a parse error
+rather than a silently-dropped section.
 
-### Supported Arrow types for `schema_fields` and `fields`
+### Supported Arrow types for `schema_fields`
 
 `Boolean`, `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`,
 `UInt64`, `Float32`, `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `Date32`,
@@ -100,7 +102,7 @@ OK: config is structurally valid
   node.id:  1
   node.name: pcs-standalone
   mode:     standalone
-  systems:  0
+  pipeline: pipelines/orders.wasm
   sources:  1
   sinks:    1
   http.bind: 127.0.0.1:0
@@ -128,7 +130,7 @@ OK: config is structurally valid
   node.id:  1
   node.name: pcs-node-1
   mode:     cluster
-  systems:  0
+  pipeline: pipelines/events.wasm
   sources:  0
   sinks:    1
   http.bind: 0.0.0.0:8080
@@ -150,17 +152,19 @@ The stock binary calls `register_builtin_factories(ServiceBuilder::new())`. Fork
 factories before calling `builder.build(&config)`:
 
 ```rust
-use pcs::service::ServiceBuilder;
-use pcs::service::factories::register_builtin_factories;
+use pcs_service::service::ServiceBuilder;
+use pcs_service::service::factories::register_builtin_factories;
 
 let builder = register_builtin_factories(ServiceBuilder::new())
     .register_source(MyKafkaSourceFactory)
-    .register_sink(MyPostgresSinkFactory)
-    .register_component(MyOrderComponentFactory)
-    .register_system(MyValidateOrderFactory);
+    .register_sink(MyPostgresSinkFactory);
 
 let built = builder.build(&config)?;
 ```
+
+Sources and sinks are the whole factory surface. The pipeline itself is either a
+`[pipeline.wasm]` module or a `Box<dyn PipelineRuntime>` passed to
+`ServiceBuilder::with_runtime`.
 
 See `extension_example.toml` for a commented config showing all the types you
 would register in a real order-processing service. Validate it to see the

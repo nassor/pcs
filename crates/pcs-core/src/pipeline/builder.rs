@@ -6,8 +6,8 @@ use crate::system::{ParallelSystem, System};
 use crate::io::{Sink, Source};
 
 use super::dag::SystemEntry;
-use super::{Dataset, Pipeline, PipelineBuilder};
-use crate::dataset::DatasetBuilder;
+use super::{Pipeline, PipelineBuilder};
+use crate::dataset::{Dataset, DatasetBuilder};
 
 impl Pipeline {
     /// Create a [`PipelineBuilder`].
@@ -88,7 +88,7 @@ mod tests {
     use crate::pipeline::Pipeline;
     use crate::system::{SystemMeta, system_fn};
 
-    use super::super::Dataset;
+    use crate::dataset::Dataset;
 
     #[derive(Serialize, Deserialize)]
     struct BuilderOrder {

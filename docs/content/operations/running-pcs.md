@@ -160,22 +160,10 @@ data_dir = "/var/lib/pcs/data"
 [run_mode]
 kind = "continuous"   # continuous | one_shot | interval
 
-[[pipeline.components]]
-name = "orders"
-type = "GenericComponent"
-
-[[pipeline.components.config.fields]]
-name = "id"
-type = "Int64"
-nullable = false
-
-[[pipeline.components.config.fields]]
-name = "amount"
-type = "Float64"
-nullable = true
-
-# Add your registered system factories here.
-pipeline.systems = []
+# The pipeline is a WASM guest component; it declares the components that
+# `target_component` / `source_component` below refer to.
+[pipeline.wasm]
+module = "/var/lib/pcs/pipelines/orders.wasm"
 
 [[sources]]
 name = "input"
@@ -314,21 +302,10 @@ addr = "10.0.0.2:9000"
 id = 3
 addr = "10.0.0.3:9000"
 
-[[pipeline.components]]
-name = "events"
-type = "GenericComponent"
-
-[[pipeline.components.config.fields]]
-name = "event_id"
-type = "Int64"
-nullable = false
-
-[[pipeline.components.config.fields]]
-name = "event_type"
-type = "Utf8"
-nullable = true
-
-pipeline.systems = []
+# The pipeline is a WASM guest component; `describe()` supplies the component
+# list that `source_component` below refers to.
+[pipeline.wasm]
+module = "/var/lib/pcs/pipelines/events.wasm"
 
 [[sinks]]
 name = "out"
@@ -623,12 +600,23 @@ one installs. Do not delete these manually while the node is running.
 
 ### `MAX_LOG_ENTRY_BYTES` Cap
 
-The TCP transport enforces a maximum frame size of 16 MiB
-(`MAX_FRAME_BYTES`). Checkpoint payloads embedded in Raft log entries are
-capped at `MAX_LOG_ENTRY_BYTES`. Checkpoint snapshots larger than this limit
-are rejected with a `Store` error. If your workload produces large checkpoints,
-increase `MAX_LOG_ENTRY_BYTES` in `src/distributed/consensus/transport.rs` and
-rebuild with `--features service-cluster`.
+Two independent limits apply, and they are easy to confuse:
+
+- **`MAX_LOG_ENTRY_BYTES`** — 1 MiB, defined in
+  `crates/pcs-service/src/distributed/partition.rs`. Caps the Arrow IPC
+  payload carried *inside a single Raft log entry*: checkpoint snapshots and
+  `RegisterMasterBatch` bodies. Payloads above it are rejected with a `Store`
+  error before they reach Raft.
+- **`MAX_FRAME_BYTES`** — 16 MiB, defined in
+  `crates/pcs-service/src/distributed/consensus/transport.rs`. Caps a single
+  length-prefixed TCP frame on the peer transport. It bounds the wire, not the
+  log entry; snapshot transfers are chunked at 4 MiB to stay under it.
+
+If your workload produces large checkpoints, raise `MAX_LOG_ENTRY_BYTES` in
+`crates/pcs-service/src/distributed/partition.rs` and rebuild with
+`--features service-cluster`. Prefer shorter batches, smaller per-entity
+state, or splitting the component upstream first — every log entry is
+replicated to every node.
 
 ---
 

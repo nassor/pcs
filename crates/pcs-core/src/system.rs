@@ -16,7 +16,7 @@
 //! use async_trait::async_trait;
 //! use pcs_core::component::Component;
 //! use pcs_core::system::{System, SystemMeta};
-//! use pcs_core::pipeline::Dataset;
+//! use pcs_core::dataset::Dataset;
 //! use pcs_core::PcsError;
 //! use serde::{Deserialize, Serialize};
 //!
@@ -56,8 +56,8 @@ pub use write_set::{ResourceUpdate, SliceWriteSet, WriteSet};
 
 use async_trait::async_trait;
 
+use crate::dataset::Dataset;
 use crate::error::PcsError;
-use crate::pipeline::Dataset;
 use crate::retry::SystemConfig;
 
 /// A processing unit that operates on a [`Dataset`] and declares
@@ -88,7 +88,7 @@ use crate::retry::SystemConfig;
 /// use async_trait::async_trait;
 /// use pcs_core::component::Component;
 /// use pcs_core::system::{System, SystemMeta};
-/// use pcs_core::pipeline::Dataset;
+/// use pcs_core::dataset::Dataset;
 /// use pcs_core::PcsError;
 /// use serde::{Deserialize, Serialize};
 ///
@@ -190,7 +190,7 @@ pub const SLICE_PARALLEL_THRESHOLD: u32 = 100_000;
 /// use async_trait::async_trait;
 /// use pcs_core::component::Component;
 /// use pcs_core::system::{ParallelSystem, SystemMeta, WriteSet};
-/// use pcs_core::pipeline::Dataset;
+/// use pcs_core::dataset::Dataset;
 /// use pcs_core::PcsError;
 /// use serde::{Deserialize, Serialize};
 ///
@@ -298,8 +298,8 @@ mod tests {
 
     use super::*;
     use crate::component::Component;
+    use crate::dataset::Dataset;
     use crate::error::PcsError;
-    use crate::pipeline::Dataset;
     use crate::retry::SystemConfig;
 
     #[derive(Serialize, Deserialize)]

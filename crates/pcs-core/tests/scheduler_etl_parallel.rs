@@ -4,80 +4,19 @@
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, Float64Array};
-use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use pcs_core::PcsError;
-use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
-use pcs_core::system::{FieldRef, ParallelSystem, System, SystemMeta, WriteSet, system_fn};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
+use pcs_core::system::{ParallelSystem, System, SystemMeta, WriteSet, system_fn};
+
+mod support;
+use support::{FxRates, Report, Transaction};
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct Transaction {
-    id: u64,
-    amount: f64,
-    currency: String,
-    valid: bool,
-    usd_amount: f64,
-}
-
-impl Component for Transaction {
-    fn name() -> &'static str {
-        "Transaction"
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new("amount", DataType::Float64, false),
-            Field::new("currency", DataType::Utf8, false),
-            Field::new("valid", DataType::Boolean, false),
-            Field::new("usd_amount", DataType::Float64, false),
-        ]))
-    }
-}
-
-impl Transaction {
-    const AMOUNT: FieldRef<Transaction> = FieldRef::new("amount");
-    const CURRENCY: FieldRef<Transaction> = FieldRef::new("currency");
-    const VALID: FieldRef<Transaction> = FieldRef::new("valid");
-    const USD_AMOUNT: FieldRef<Transaction> = FieldRef::new("usd_amount");
-}
-
-// ---------------------------------------------------------------------------
-// Resources
-// ---------------------------------------------------------------------------
-
-struct FxRates {
-    eur: f64,
-    gbp: f64,
-    jpy: f64,
-    cad: f64,
-}
-
-impl FxRates {
-    fn rate_for(&self, currency: &str) -> f64 {
-        match currency {
-            "USD" => 1.0,
-            "EUR" => self.eur,
-            "GBP" => self.gbp,
-            "JPY" => self.jpy,
-            "CAD" => self.cad,
-            _ => 1.0,
-        }
-    }
-}
-
-struct Report {
-    total_rows: usize,
-    valid_count: usize,
-    rejected_count: usize,
-    total_usd: f64,
-}
 
 // ---------------------------------------------------------------------------
 // Systems
@@ -91,71 +30,7 @@ impl System for IngestSystem {
         SystemMeta::new("ingest").write_component("Transaction")
     }
     async fn run(&self, pipeline: &mut Dataset) -> Result<(), PcsError> {
-        let transactions = vec![
-            Transaction {
-                id: 1001,
-                amount: 1500.00,
-                currency: "USD".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1002,
-                amount: 2300.50,
-                currency: "EUR".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1003,
-                amount: 750.00,
-                currency: "GBP".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1004,
-                amount: -50.00,
-                currency: "USD".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1005,
-                amount: 5000.00,
-                currency: "JPY".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1006,
-                amount: 320.75,
-                currency: "EUR".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1007,
-                amount: 1200.00,
-                currency: "GBP".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1008,
-                amount: 0.00,
-                currency: "USD".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-            Transaction {
-                id: 1009,
-                amount: 680.00,
-                currency: "CAD".into(),
-                valid: false,
-                usd_amount: 0.0,
-            },
-        ];
+        let transactions = support::seed_transactions();
         pipeline.append::<Transaction>(&transactions)?;
         Ok(())
     }

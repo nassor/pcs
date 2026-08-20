@@ -37,7 +37,8 @@ use crate::PcsError;
 use crate::PcsResult;
 use crate::distributed::checkpoint::{Checkpoint, CheckpointStore};
 use crate::distributed::consensus::state_machine::{
-    apply as sm_apply, find_first_pending_batch, read_checkpoint as sm_read_checkpoint,
+    apply as sm_apply, find_data_checkpoint_schema_id as sm_find_data_checkpoint_schema_id,
+    find_first_pending_batch, read_checkpoint as sm_read_checkpoint,
 };
 use crate::distributed::consensus::types::{ConsensusCommand, ConsensusResponse};
 use crate::distributed::partition::{BatchClaim, MAX_LOG_ENTRY_BYTES, PartitionSource};
@@ -153,6 +154,13 @@ impl SingleNodeStore {
             .await
             .map_err(|e| PcsError::generic(format!("spawn_blocking: {e}")))?
     }
+
+    async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || sm_find_data_checkpoint_schema_id(&db))
+            .await
+            .map_err(|e| PcsError::generic(format!("spawn_blocking: {e}")))?
+    }
 }
 
 // ── MultiNodeStore ────────────────────────────────────────────────────────────
@@ -207,6 +215,18 @@ impl MultiNodeStore {
                 .lock()
                 .map_err(|_| PcsError::store("read DB mutex poisoned"))?;
             sm_read_checkpoint(&db, claim_id, stage_idx)
+        })
+        .await
+        .map_err(|e| PcsError::generic(format!("spawn_blocking: {e}")))?
+    }
+
+    async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
+        let db = Arc::clone(&self.read_db);
+        tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|_| PcsError::store("read DB mutex poisoned"))?;
+            sm_find_data_checkpoint_schema_id(&db)
         })
         .await
         .map_err(|e| PcsError::generic(format!("spawn_blocking: {e}")))?
@@ -413,6 +433,19 @@ impl RedbSharedStore {
             Self::SingleNode(s) => s.load_checkpoint_record(claim_id, stage_idx).await,
             #[cfg(feature = "distributed-raft")]
             Self::MultiNode(m) => m.load_checkpoint_record(claim_id, stage_idx).await,
+        }
+    }
+
+    /// Schema fingerprint recorded by any persisted data checkpoint on this
+    /// node, or `Ok(None)` when the node has no persisted state yet.
+    ///
+    /// Used at startup to refuse a redeployed pipeline whose schema fingerprint
+    /// no longer matches the state it would resume against.
+    pub async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
+        match self {
+            Self::SingleNode(s) => s.persisted_schema_id().await,
+            #[cfg(feature = "distributed-raft")]
+            Self::MultiNode(m) => m.persisted_schema_id().await,
         }
     }
 }

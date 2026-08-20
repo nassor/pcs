@@ -18,7 +18,7 @@ use arrow_array::Float64Array;
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use pcs_core::component::Component;
-use pcs_core::pipeline::Dataset;
+use pcs_core::dataset::Dataset;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

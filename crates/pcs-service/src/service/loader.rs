@@ -125,7 +125,7 @@ fn verify_sha3_256(bytes: &[u8], expected: &str) -> PcsResult<()> {
 /// let loader = PipelineRuntimeLoader::new(engine, resolver);
 ///
 /// // WasmSpec comes from ServiceConfig::pipeline.wasm (deserialized from TOML).
-/// # let spec = WasmSpec { module: "transform.wasm".into(), sha3_256: None, watch: false,
+/// # let spec = WasmSpec { module: "transform.wasm".into(), sha3_256: None,
 /// #     config: Default::default() };
 /// let runtime = loader.load("my-pipeline", &spec).unwrap();
 /// # }
@@ -238,7 +238,6 @@ mod tests {
         let spec = WasmSpec {
             module: "missing.wasm".to_string(),
             sha3_256: None,
-            watch: false,
             config: HashMap::new(),
         };
         let err = loader.load("test", &spec).err().expect("expected error");
@@ -258,7 +257,6 @@ mod tests {
         let spec = WasmSpec {
             module: "bad.wasm".to_string(),
             sha3_256: None,
-            watch: false,
             config: HashMap::new(),
         };
         let err = loader.load("test", &spec).err().expect("expected error");

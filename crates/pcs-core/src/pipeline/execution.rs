@@ -13,75 +13,41 @@ use crate::system::{ParallelSystem, SLICE_PARALLEL_THRESHOLD, SliceWriteSet, Wri
 #[cfg(feature = "io")]
 use crate::io::{drain_dataset, drain_into_dataset};
 
-use super::Dataset;
 use super::Pipeline;
 use super::dag::SystemEntry;
+use crate::dataset::Dataset;
 
 /// Returns number of retries before success (0 = first attempt succeeded).
 async fn run_arrow_system_with_retries(
     sys: &dyn crate::system::System,
-    _sys_name: &'static str,
     config: &SystemConfig,
-    max_attempts: usize,
     data: &mut Dataset,
 ) -> PcsResult<u32> {
-    let mut attempt = 0usize;
-    loop {
-        let result = if let Some(sync_result) = sys.run_sync(data) {
-            sync_result
-        } else {
-            sys.run(data).await
-        };
-        match result {
-            Ok(()) => return Ok(attempt as u32),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_attempts {
-                    return Err(PcsError::retry_exhausted(e, attempt));
-                }
-                if let Some(delay) = config.retry_mode.delay_for_attempt(attempt - 1) {
-                    #[cfg(feature = "runtime")]
-                    tokio::time::sleep(delay).await;
-                    // On guest path, drop delay — retry immediately.
-                    #[cfg(not(feature = "runtime"))]
-                    let _ = delay;
-                }
-            }
-        }
-    }
+    let (_, retries) = crate::retry::run_with_retries(config, async || match sys.run_sync(data) {
+        Some(sync_result) => sync_result,
+        None => sys.run(data).await,
+    })
+    .await?;
+    Ok(retries)
 }
 
 /// Returns `(write_set, retries)` where retries = 0 means first attempt succeeded.
 #[cfg(feature = "runtime")]
 async fn run_parallel_system_with_retries(
     sys: Arc<dyn ParallelSystem>,
-    _sys_name: &'static str,
     config: &SystemConfig,
     data: &Dataset,
 ) -> PcsResult<(WriteSet, u32)> {
-    let max_attempts = config.retry_mode.max_attempts();
     let use_slices =
         data.rows() as u32 >= SLICE_PARALLEL_THRESHOLD && sys.run_slice(data, 0..0).is_some();
-    let mut attempt = 0usize;
-    loop {
-        let result = if use_slices {
+    crate::retry::run_with_retries(config, async || {
+        if use_slices {
             run_parallel_system_sliced(Arc::clone(&sys), data).await
         } else {
             sys.run(data).await
-        };
-        match result {
-            Ok(ws) => return Ok((ws, attempt as u32)),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_attempts {
-                    return Err(PcsError::retry_exhausted(e, attempt));
-                }
-                if let Some(delay) = config.retry_mode.delay_for_attempt(attempt - 1) {
-                    tokio::time::sleep(delay).await;
-                }
-            }
         }
-    }
+    })
+    .await
 }
 
 /// Split `total_rows` into CPU-count equal-ish ranges for parallel dispatch.
@@ -145,12 +111,9 @@ async fn run_parallel_stage(
     stage: &[usize],
     data: &mut Dataset,
 ) -> PcsResult<u32> {
-    use crate::retry::RetryMode;
-
     struct TaskDesc {
         sys: Arc<dyn ParallelSystem>,
-        max_attempts: usize,
-        retry_mode: RetryMode,
+        config: SystemConfig,
         use_slices: bool,
     }
 
@@ -164,8 +127,7 @@ async fn run_parallel_stage(
                 world_rows >= SLICE_PARALLEL_THRESHOLD && sys.run_slice(data, 0..0).is_some();
             task_descs.push(TaskDesc {
                 sys: Arc::clone(sys),
-                max_attempts: config.retry_mode.max_attempts(),
-                retry_mode: config.retry_mode,
+                config: *config,
                 use_slices,
             });
         }
@@ -185,9 +147,8 @@ async fn run_parallel_stage(
                 // SAFETY: world_ptr is valid; all handles are awaited before return.
                 let data = unsafe { &*(world_ptr as *const Dataset) };
 
-                let mut attempt = 0usize;
-                loop {
-                    let result: Result<WriteSet, PcsError> = if desc.use_slices {
+                crate::retry::run_with_retries_blocking(&desc.config, || {
+                    if desc.use_slices {
                         use rayon::prelude::*;
                         let ranges = compute_row_ranges(world_rows);
 
@@ -203,37 +164,14 @@ async fn run_parallel_stage(
                             .collect();
 
                         let mut slices = Vec::with_capacity(slice_results.len());
-                        let mut collect_err: Option<PcsError> = None;
                         for r in slice_results {
-                            match r {
-                                Ok(s) => slices.push(s),
-                                Err(e) => {
-                                    collect_err = Some(e);
-                                    break;
-                                }
-                            }
+                            slices.push(r?);
                         }
-                        match collect_err {
-                            Some(e) => Err(e),
-                            None => desc.sys.merge_slices(slices),
-                        }
+                        desc.sys.merge_slices(slices)
                     } else {
                         handle.block_on(desc.sys.run(data))
-                    };
-
-                    match result {
-                        Ok(ws) => return Ok((ws, attempt as u32)),
-                        Err(e) => {
-                            attempt += 1;
-                            if attempt >= desc.max_attempts {
-                                return Err(PcsError::retry_exhausted(e, attempt));
-                            }
-                            if let Some(delay) = desc.retry_mode.delay_for_attempt(attempt - 1) {
-                                std::thread::sleep(delay);
-                            }
-                        }
                     }
-                }
+                })
             })
         })
         .collect();
@@ -302,11 +240,9 @@ async fn run_stages(
         } else if all_parallel && stage.len() == 1 {
             let sys_idx = stage[0];
             let config = &configs[sys_idx];
-            let sys_name = systems[sys_idx].meta().name;
-            if let SystemEntry::Parallel(ref sys) = systems[sys_idx] {
+            if let SystemEntry::Parallel(sys) = &systems[sys_idx] {
                 let (write_set, retries) =
-                    run_parallel_system_with_retries(Arc::clone(sys), sys_name, config, data)
-                        .await?;
+                    run_parallel_system_with_retries(Arc::clone(sys), config, data).await?;
                 data.apply_write_set(write_set)?;
                 systems_run += 1;
                 retries_this_batch += retries;
@@ -314,41 +250,19 @@ async fn run_stages(
         } else {
             for &sys_idx in stage {
                 let config = &configs[sys_idx];
-                let max_attempts = config.retry_mode.max_attempts();
-                let sys_name = systems[sys_idx].meta().name;
 
                 match &systems[sys_idx] {
                     SystemEntry::Sequential(sys) => {
-                        if max_attempts <= 1 {
-                            let result = if let Some(sync_result) = sys.run_sync(data) {
-                                sync_result
-                            } else {
-                                sys.run(data).await
-                            };
-                            if let Err(e) = result {
-                                return Err(PcsError::retry_exhausted(e, 1));
-                            }
-                        } else {
-                            let retries = run_arrow_system_with_retries(
-                                sys.as_ref(),
-                                sys_name,
-                                config,
-                                max_attempts,
-                                data,
-                            )
-                            .await?;
-                            retries_this_batch += retries;
-                        }
+                        // `max_attempts == 1` needs no special case: the retry
+                        // driver wraps the first failure in `RetryExhausted`
+                        // with attempt 1 and never sleeps.
+                        retries_this_batch +=
+                            run_arrow_system_with_retries(sys.as_ref(), config, data).await?;
                         systems_run += 1;
                     }
                     SystemEntry::Parallel(sys) => {
-                        let (write_set, retries) = run_parallel_system_with_retries(
-                            Arc::clone(sys),
-                            sys_name,
-                            config,
-                            data,
-                        )
-                        .await?;
+                        let (write_set, retries) =
+                            run_parallel_system_with_retries(Arc::clone(sys), config, data).await?;
                         data.apply_write_set(write_set)?;
                         systems_run += 1;
                         retries_this_batch += retries;
@@ -376,31 +290,11 @@ async fn run_stages_sequential(
     for stage in stages {
         for &sys_idx in stage {
             let config = &configs[sys_idx];
-            let max_attempts = config.retry_mode.max_attempts();
-            let sys_name = systems[sys_idx].meta().name;
 
             match &systems[sys_idx] {
                 SystemEntry::Sequential(sys) => {
-                    if max_attempts <= 1 {
-                        let result = if let Some(sync_result) = sys.run_sync(data) {
-                            sync_result
-                        } else {
-                            sys.run(data).await
-                        };
-                        if let Err(e) = result {
-                            return Err(PcsError::retry_exhausted(e, 1));
-                        }
-                    } else {
-                        let retries = run_arrow_system_with_retries(
-                            sys.as_ref(),
-                            sys_name,
-                            config,
-                            max_attempts,
-                            data,
-                        )
-                        .await?;
-                        retries_this_batch += retries;
-                    }
+                    retries_this_batch +=
+                        run_arrow_system_with_retries(sys.as_ref(), config, data).await?;
                     systems_run += 1;
                 }
                 SystemEntry::Parallel(_) => {
@@ -494,13 +388,17 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Run all systems against a separately-provided `Dataset`.
+    /// Run all systems against a separately-provided `Dataset`, returning the
+    /// stats for **this call**.
     ///
-    /// This is an escape hatch for distributed runners that manage their own
-    /// per-partition datasets. Sources and sinks on `self` are ignored.
-    /// Stats (systems run, retries, duration) are captured in `last_stats`.
+    /// This is an escape hatch for distributed runners and WASM guests that
+    /// manage their own per-partition datasets. Sources and sinks on `self` are
+    /// ignored. The returned [`RunStats`] is also recorded in
+    /// [`last_stats`](Pipeline::last_stats); callers that need a per-call value
+    /// (e.g. the guest SDK filling WIT `run-metrics`) should use the return
+    /// value rather than reading the shared cell back.
     #[cfg(feature = "runtime")]
-    pub async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+    pub async fn run_on_with_stats(&self, data: &mut Dataset) -> PcsResult<RunStats> {
         self.ensure_plan(data.schemas())?;
 
         let start = Instant::now();
@@ -510,31 +408,33 @@ impl Pipeline {
         let configs_val = self.configs.get().unwrap();
 
         if stages_val.is_empty() {
-            self.last_stats.set(RunStats {
+            let stats = RunStats {
                 rows_produced: 0,
                 systems_run: 0,
                 duration_millis: start.elapsed().as_millis() as u64,
                 retries_this_batch: 0,
-            });
-            return Ok(());
+            };
+            self.last_stats.set(stats);
+            return Ok(stats);
         }
 
         let (systems_run, retries_this_batch) =
             run_stages(&self.systems, configs_val, stages_val, data).await?;
 
-        self.last_stats.set(RunStats {
+        let stats = RunStats {
             rows_produced: data.live_rows() as isize - rows_before,
             systems_run,
             duration_millis: start.elapsed().as_millis() as u64,
             retries_this_batch,
-        });
-        Ok(())
+        };
+        self.last_stats.set(stats);
+        Ok(stats)
     }
 
-    /// Run all systems against a separately-provided `Dataset` (guest/sequential path).
-    /// Stats (systems run, retries, duration) are captured in `last_stats`.
+    /// Run all systems against a separately-provided `Dataset` (guest/sequential
+    /// path), returning the stats for **this call**.
     #[cfg(not(feature = "runtime"))]
-    pub async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+    pub async fn run_on_with_stats(&self, data: &mut Dataset) -> PcsResult<RunStats> {
         self.ensure_plan(data.schemas())?;
 
         let start = Instant::now();
@@ -544,25 +444,36 @@ impl Pipeline {
         let configs_val = self.configs.get().unwrap();
 
         if stages_val.is_empty() {
-            self.last_stats.set(RunStats {
+            let stats = RunStats {
                 rows_produced: 0,
                 systems_run: 0,
                 duration_millis: start.elapsed().as_millis() as u64,
                 retries_this_batch: 0,
-            });
-            return Ok(());
+            };
+            self.last_stats.set(stats);
+            return Ok(stats);
         }
 
         let (systems_run, retries_this_batch) =
             run_stages_sequential(&self.systems, configs_val, stages_val, data).await?;
 
-        self.last_stats.set(RunStats {
+        let stats = RunStats {
             rows_produced: data.live_rows() as isize - rows_before,
             systems_run,
             duration_millis: start.elapsed().as_millis() as u64,
             retries_this_batch,
-        });
-        Ok(())
+        };
+        self.last_stats.set(stats);
+        Ok(stats)
+    }
+
+    /// Run all systems against a separately-provided `Dataset`.
+    ///
+    /// Thin wrapper over [`run_on_with_stats`](Self::run_on_with_stats) that
+    /// discards the per-call stats; they remain readable via
+    /// [`last_stats`](Pipeline::last_stats).
+    pub async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+        self.run_on_with_stats(data).await.map(|_| ())
     }
 
     /// Drain sources → run → drain sinks.
@@ -596,45 +507,12 @@ impl Pipeline {
         });
         Ok(())
     }
-
-    /// Attempt to run all systems synchronously without an async runtime.
-    ///
-    /// Returns `None` if any system requires async (and `guest` feature is not
-    /// enabled) or if the plan hasn't been built yet. Retry logic is not applied.
-    ///
-    /// With the `guest` feature enabled, async systems are driven via
-    /// `pollster::block_on` rather than returning `None`.
-    pub fn try_run_sync(&mut self) -> Option<PcsResult<()>> {
-        let stages = self.stages.get()?.as_ref().ok()?.clone();
-
-        for stage in &stages {
-            for &sys_idx in stage {
-                match &self.systems[sys_idx] {
-                    SystemEntry::Parallel(_) => return None,
-                    SystemEntry::Sequential(sys) => {
-                        let result = sys.run_sync(&mut self.data);
-
-                        #[cfg(feature = "guest")]
-                        let result =
-                            result.or_else(|| Some(pollster::block_on(sys.run(&mut self.data))));
-
-                        match result {
-                            Some(Ok(())) => {}
-                            Some(Err(e)) => {
-                                return Some(Err(PcsError::retry_exhausted(e, 1)));
-                            }
-                            None => return None,
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(Ok(()))
-    }
 }
 
-#[cfg(test)]
+// Every test here drives `Pipeline::run` / `run_on` through the tokio+rayon
+// stage executor, so the module is gated on `runtime`. The guest path is
+// covered end-to-end by `pcs-guest-smoketest` against a real component.
+#[cfg(all(test, feature = "runtime"))]
 mod tests {
     use std::sync::Arc;
 
@@ -643,12 +521,10 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::component::Component;
+    use crate::dataset::Dataset;
     use crate::pipeline::Pipeline;
-    #[cfg(feature = "runtime")]
     use crate::row::Row;
     use crate::system::{System, SystemMeta, WriteSet};
-
-    use super::Dataset;
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
     struct ExecOrder {
@@ -702,7 +578,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_pipeline_run_single_system() {
         let mut p = Pipeline::new("test");
@@ -717,7 +592,6 @@ mod tests {
         assert!((arr.value(0) - 1.0).abs() < 1e-9);
     }
 
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_run_on_uses_external_dataset() {
         let p = Pipeline::new("template");
@@ -730,17 +604,6 @@ mod tests {
         assert_eq!(ext.rows(), 3);
     }
 
-    #[test]
-    fn test_try_run_sync_no_systems() {
-        let mut p = Pipeline::new("sync-test");
-        p.data.register_component::<ExecOrder>().unwrap();
-        p.validate().unwrap();
-        let result = p.try_run_sync();
-        assert!(result.is_some());
-        assert!(result.unwrap().is_ok());
-    }
-
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_retries_this_batch_counts_failures_before_success() {
         use crate::error::PcsError;
@@ -789,7 +652,6 @@ mod tests {
         assert_eq!(p.last_stats().retries_this_batch, 3);
     }
 
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_retries_this_batch_zero_on_clean_run() {
         let mut p = Pipeline::new("no-retry-test");
@@ -801,7 +663,6 @@ mod tests {
         assert_eq!(p.last_stats().retries_this_batch, 0);
     }
 
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_pipeline_marks_rows_dead_via_system() {
         struct KillFirstSystem;
@@ -824,33 +685,7 @@ mod tests {
         assert_eq!(p.data.live_rows(), 4);
     }
 
-    /// Verify try_run_sync works under `guest` where pollster::block_on provides
-    /// the async fallback. Without `guest`, systems that only implement `run` (not
-    /// `run_sync`) cause try_run_sync to return None.
-    #[cfg(feature = "guest")]
-    #[test]
-    fn test_try_run_sync_with_sequential_system() {
-        let mut p = Pipeline::new("sync-exec-test");
-        p.data.register_component::<ExecOrder>().unwrap();
-        p.data.append::<ExecOrder>(&make_orders(3)).unwrap();
-        p.add_system(BumpSystem { field: "total" });
-        p.validate().unwrap();
-
-        let result = p.try_run_sync();
-        assert!(
-            result.is_some(),
-            "try_run_sync should return Some under guest"
-        );
-        assert!(result.unwrap().is_ok(), "try_run_sync should succeed");
-
-        let col = p.data.column::<ExecOrder>("total").unwrap();
-        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-        // Row 0: total was 0.0, bumped by 1.0 → 1.0
-        assert!((arr.value(0) - 1.0).abs() < 1e-9);
-    }
-
     /// `run_on` populates `last_stats` with systems_run and retries_this_batch.
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_run_on_populates_last_stats() {
         use crate::error::PcsError;
@@ -914,7 +749,6 @@ mod tests {
     }
 
     /// `run_on` with no systems sets last_stats to zero counts (not stale from prior run).
-    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_run_on_empty_pipeline_stats_are_zero() {
         let p = Pipeline::new("empty-run-on");
@@ -941,24 +775,5 @@ mod tests {
         let stats = p.last_stats();
         assert_eq!(stats.systems_run, 0);
         assert_eq!(stats.retries_this_batch, 0);
-    }
-
-    /// Without `guest`, try_run_sync returns None for systems that don't implement run_sync.
-    #[cfg(not(feature = "guest"))]
-    #[test]
-    fn test_try_run_sync_returns_none_without_sync_impl() {
-        let mut p = Pipeline::new("sync-exec-test");
-        p.data.register_component::<ExecOrder>().unwrap();
-        p.data.append::<ExecOrder>(&make_orders(3)).unwrap();
-        p.add_system(BumpSystem { field: "total" });
-        p.validate().unwrap();
-
-        // BumpSystem only implements async run, not run_sync.
-        // Without guest feature, try_run_sync returns None.
-        let result = p.try_run_sync();
-        assert!(
-            result.is_none(),
-            "try_run_sync should return None when system has no run_sync"
-        );
     }
 }

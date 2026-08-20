@@ -17,11 +17,11 @@ use uuid::Uuid;
 use pcs_service::PcsError;
 use pcs_service::PcsResult;
 use pcs_service::component::Component;
+use pcs_service::dataset::Dataset;
 use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
 use pcs_service::distributed::consensus::state_machine::read_master_batch;
 use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
-use pcs_service::pipeline::Dataset;
 
 use crate::components::{Invoice, Order};
 use crate::resources::{FxRateTable, InventoryCatalog, NodeId, TaxRateTable};

@@ -215,6 +215,13 @@ pub async fn run_cluster(
     let runtime = built.into_runtime();
     let dataset_template = runtime.template_dataset();
 
+    // Gate 3b: the persisted checkpoints on this node must belong to the same
+    // schema shape the pipeline declares, or resuming would mix layouts.
+    crate::service::validation::validate_schema_fingerprint(
+        dataset_template.schemas().fingerprint(),
+        store.persisted_schema_id().await?,
+    )?;
+
     let runner_config = RunnerConfig {
         checkpoint_strategy: CheckpointStrategy::EveryStage,
         ..Default::default()
@@ -469,8 +476,6 @@ mod tests {
                 },
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },
@@ -664,8 +669,6 @@ mod tests {
                 config: StandaloneConfig::default(),
             },
             pipeline: PipelineSpec {
-                systems: vec![],
-                components: vec![],
                 #[cfg(feature = "wasm")]
                 wasm: None,
             },

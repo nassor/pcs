@@ -24,10 +24,11 @@ use serde::{Deserialize, Serialize};
 
 use pcs_service::PcsError;
 use pcs_service::component::Component;
+use pcs_service::dataset::Dataset;
 use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{SystemMeta, system_fn};
 
 // ---------------------------------------------------------------------------

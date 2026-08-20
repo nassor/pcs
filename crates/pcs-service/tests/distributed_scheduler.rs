@@ -11,7 +11,8 @@ use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
 use pcs_core::component::Component;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{SystemMeta, system_fn};
 use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};

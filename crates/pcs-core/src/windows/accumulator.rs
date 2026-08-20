@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::PcsError;
 use crate::PcsResult;
 use crate::component::Component;
+#[cfg(feature = "distributed")]
+use crate::dataset::Dataset;
 
 /// The current schema version written by this binary.
 pub const CURRENT_ACCUMULATOR_VERSION: u32 = 1;
@@ -150,6 +152,182 @@ fn migrate_to_current_inner(from_version: u32, batch: RecordBatch) -> PcsResult<
     // All versions ≤ CURRENT — no migration needed for v1.
     // Future: add `if from_version < 2 { batch = migrate_v1_to_v2(batch)?; }` etc.
     Ok(batch)
+}
+
+// ---------------------------------------------------------------------------
+// WindowedSystem integration
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "distributed")]
+impl super::system::WindowedSystem {
+    /// Update the pipeline's `WindowAccumulator` component with fresh aggregate results.
+    ///
+    /// For each result batch (one per `(window_id, key_hash)` group), the
+    /// existing accumulator row with matching `source_component`, `window_id`,
+    /// and `key_hash` is marked dead, then the new row is appended.
+    /// A compaction is performed at the end to remove dead rows.
+    pub(super) fn flush_accumulator(
+        &self,
+        pipeline: &mut Dataset,
+        result_batches: &[RecordBatch],
+    ) -> Result<(), PcsError> {
+        use arrow_array::{Int64Array, StringArray};
+
+        if result_batches.is_empty() {
+            return Ok(());
+        }
+
+        // Build the set of (window_id, key_hash) pairs we are about to write.
+        let mut new_groups: std::collections::HashSet<(i64, i64)> =
+            std::collections::HashSet::new();
+        for rb in result_batches {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let wid_idx = rb.schema().index_of("window_id").ok();
+            let kh_idx = rb.schema().index_of("key_hash").ok();
+            if let (Some(wi), Some(ki)) = (wid_idx, kh_idx) {
+                let wid_col = rb.column(wi).as_any().downcast_ref::<Int64Array>();
+                let kh_col = rb.column(ki).as_any().downcast_ref::<Int64Array>();
+                if let (Some(wc), Some(kc)) = (wid_col, kh_col) {
+                    for r in 0..rb.num_rows() {
+                        new_groups.insert((wc.value(r), kc.value(r)));
+                    }
+                }
+            }
+        }
+
+        // Mark superseded accumulator rows as dead.
+        if let Some(acc_batch) = pipeline.batch_for(WindowAccumulator::name()) {
+            let acc_batch = acc_batch.clone();
+            let src_idx = acc_batch.schema().index_of("source_component").ok();
+            let wid_idx = acc_batch.schema().index_of("window_id").ok();
+            let kh_idx = acc_batch.schema().index_of("key_hash").ok();
+
+            if let (Some(si), Some(wi), Some(ki)) = (src_idx, wid_idx, kh_idx) {
+                let src_col = acc_batch.column(si).as_any().downcast_ref::<StringArray>();
+                let wid_col = acc_batch.column(wi).as_any().downcast_ref::<Int64Array>();
+                let kh_col = acc_batch.column(ki).as_any().downcast_ref::<Int64Array>();
+
+                if let (Some(sc), Some(wc), Some(kc)) = (src_col, wid_col, kh_col) {
+                    let row_range = pipeline.row_range();
+                    for (row_offset, abs_row) in row_range.enumerate() {
+                        if row_offset >= acc_batch.num_rows() {
+                            break;
+                        }
+                        let matches_component = sc.value(row_offset) == self.source_component;
+                        let group = (wc.value(row_offset), kc.value(row_offset));
+                        if matches_component && new_groups.contains(&group) {
+                            pipeline.mark_dead(crate::row::Row::new(abs_row));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build new accumulator rows from the aggregation results.
+        let new_rows: Vec<WindowAccumulator> = result_batches
+            .iter()
+            .filter_map(|rb| {
+                if rb.num_rows() == 0 {
+                    return None;
+                }
+                let wid_idx = rb.schema().index_of("window_id").ok()?;
+                let kh_idx = rb.schema().index_of("key_hash").ok()?;
+                let wid_col = rb.column(wid_idx).as_any().downcast_ref::<Int64Array>()?;
+                let kh_col = rb.column(kh_idx).as_any().downcast_ref::<Int64Array>()?;
+
+                // Extract session timestamps if present.
+                let sts_idx = rb.schema().index_of("session_start_ts").ok();
+                let ste_idx = rb.schema().index_of("session_end_ts").ok();
+                let sts_val = sts_idx.and_then(|i| {
+                    rb.column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .and_then(|a| {
+                            if a.is_valid(0) {
+                                Some(a.value(0))
+                            } else {
+                                None
+                            }
+                        })
+                });
+                let ste_val = ste_idx.and_then(|i| {
+                    rb.column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .and_then(|a| {
+                            if a.is_valid(0) {
+                                Some(a.value(0))
+                            } else {
+                                None
+                            }
+                        })
+                });
+
+                // Extract aggregate value — look for any Float64 column beyond window_id / key_hash.
+                let mut sum_f64 = None;
+                let mut count = 0i64;
+                let rb_schema = rb.schema();
+                for col_idx in 0..rb_schema.fields().len() {
+                    let field = rb_schema.field(col_idx);
+                    if field.name() == "window_id"
+                        || field.name() == "key_hash"
+                        || field.name() == "session_start_ts"
+                        || field.name() == "session_end_ts"
+                    {
+                        continue;
+                    }
+                    if let arrow_schema::DataType::Float64 = field.data_type()
+                        && let Some(arr) = rb
+                            .column(col_idx)
+                            .as_any()
+                            .downcast_ref::<arrow_array::Float64Array>()
+                    {
+                        if arr.is_valid(0) {
+                            sum_f64 = Some(arr.value(0));
+                        }
+                        count = 1;
+                    }
+                    if let arrow_schema::DataType::Int64 = field.data_type()
+                        && let Some(arr) = rb.column(col_idx).as_any().downcast_ref::<Int64Array>()
+                        && arr.is_valid(0)
+                    {
+                        count = arr.value(0);
+                    }
+                }
+
+                Some(WindowAccumulator {
+                    version: Some(CURRENT_ACCUMULATOR_VERSION),
+                    source_component: self.source_component.to_string(),
+                    window_id: wid_col.value(0),
+                    key_hash: kh_col.value(0),
+                    count,
+                    sum_f64,
+                    min_f64: None,
+                    max_f64: None,
+                    session_start_ts: sts_val,
+                    session_end_ts: ste_val,
+                    finalized_at_watermark: None,
+                })
+            })
+            .collect();
+
+        if !new_rows.is_empty() {
+            pipeline
+                .append::<WindowAccumulator>(&new_rows)
+                .map_err(|e| {
+                    PcsError::generic(format!("WindowedSystem: accumulator append error: {e}"))
+                })?;
+        }
+
+        // Compact to remove the dead rows we just superseded.
+        pipeline
+            .compact()
+            .map_err(|e| PcsError::generic(format!("WindowedSystem: compact error: {e}")))?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

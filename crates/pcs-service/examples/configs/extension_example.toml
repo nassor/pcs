@@ -1,16 +1,18 @@
-# PCS extension example — user-defined factories.
+# PCS extension example — user-defined source and sink factories.
 #
 # WARNING: THIS CONFIG WILL NOT RUN WITH THE STOCK pcs-service BINARY.
 #
-# The types used here (KafkaSource, PostgresSink, OrderComponent, ValidateOrder,
-# EnrichOrder) are NOT built into pcs-service.  You must build a custom binary
-# that registers these factories before this config will work.
+# The types used here (KafkaSource, PostgresSink) are NOT built into
+# pcs-service.  You must build a custom binary that registers these factories
+# via `ServiceBuilder::register_source` / `register_sink` before this config
+# will work.
+#
+# Sources and sinks are the only factory surface: system and component
+# factories were removed (see crates/pcs-service/src/service/registry.rs). The
+# pipeline itself is either a WASM guest module, as below, or a
+# `Box<dyn PipelineRuntime>` handed to `ServiceBuilder::with_runtime`.
 #
 # See examples/configs/README.md for guidance on building a custom binary.
-#
-# This file is provided as a template for teams building their own service
-# binary on top of PCS.  It preserves the educational value of showing what
-# real-world factory types might look like.
 
 mode = "standalone"
 
@@ -23,34 +25,16 @@ data_dir = "${PCS_DATA_DIR:-/var/lib/pcs-orders}"
 kind = "interval"
 interval_ms = 5000   # re-run the pipeline every 5 seconds
 
-# User-defined component: OrderComponent is a custom Rust type registered via
-# ServiceBuilder::register_component(OrderComponentFactory).
-[[pipeline.components]]
-name = "orders"
-type = "OrderComponent"     # REQUIRES: OrderComponentFactory registered
+# The pipeline is a WASM guest component; the components it declares via
+# `describe()` are what `target_component` / `source_component` must name.
+# A custom binary can instead call `ServiceBuilder::with_runtime` and omit the
+# `[pipeline]` table entirely.
+[pipeline.wasm]
+module = "pipelines/order_processing.wasm"
 
-[pipeline.components.config]
-max_rows = 10000
-
-# User-defined systems, registered via ServiceBuilder::register_system.
-# The pipeline builds a dependency DAG from SystemMeta read/write declarations.
-[[pipeline.systems]]
-name = "validate_orders"
-type = "ValidateOrder"      # REQUIRES: ValidateOrderFactory registered
-
-[pipeline.systems.config]
-strict = true
-
-[[pipeline.systems]]
-name = "enrich_orders"
-type = "EnrichOrder"        # REQUIRES: EnrichOrderFactory registered
-
-[pipeline.systems.config]
+[pipeline.wasm.config]
+strict = "true"
 lookup_table = "products"
-
-[[pipeline.systems]]
-name = "aggregate_revenue"
-type = "AggregateRevenue"   # REQUIRES: AggregateRevenueFactory registered
 
 # User-defined source: KafkaSource reads from a Kafka topic.
 # Registered via ServiceBuilder::register_source(KafkaSourceFactory).

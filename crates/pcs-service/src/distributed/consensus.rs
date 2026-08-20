@@ -5,8 +5,8 @@
 //!
 //! # Feature gates
 //!
-//! - `arrow-distributed`: enables core types, state machine, and store.
-//! - `arrow-distributed-raft`: additionally enables openraft log storage,
+//! - `distributed`: enables core types, state machine, and store.
+//! - `distributed-raft`: additionally enables openraft log storage,
 //!   state machine, snapshot builder, driver, and transport.
 
 pub mod state_machine;

@@ -26,9 +26,9 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
+use pcs_service::dataset::Dataset;
 use pcs_service::io::datafusion_source::DataFusionSource;
 use pcs_service::io::source::{Source, drain_into_dataset};
-use pcs_service::pipeline::Dataset;
 use pcs_service::{PcsError, Pipeline, System, SystemMeta};
 
 // ── Schema ────────────────────────────────────────────────────────────────────

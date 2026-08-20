@@ -1,10 +1,10 @@
-//! Row index — a positional handle into a columnar [`Dataset`](super::pipeline::Dataset).
+//! Row index — a positional handle into a columnar [`Dataset`](super::dataset::Dataset).
 //!
 //! A `Row` carries no generation counter. Validity semantics are provided by
 //! the `__alive` boolean column maintained by the dataset. Stale `Row` handles
-//! obtained before a [`mark_dead`](super::pipeline::Dataset::mark_dead) call
+//! obtained before a [`mark_dead`](super::dataset::Dataset::mark_dead) call
 //! will still be accepted by the API; the caller is responsible for checking
-//! [`Dataset::is_alive`](super::pipeline::Dataset::is_alive).
+//! [`Dataset::is_alive`](super::dataset::Dataset::is_alive).
 //!
 //! # Example
 //!
@@ -15,9 +15,9 @@
 //! assert_eq!(row.index(), 42);
 //! ```
 
-/// A positional index into a [`Dataset`](super::pipeline::Dataset)'s columnar storage.
+/// A positional index into a [`Dataset`](super::dataset::Dataset)'s columnar storage.
 ///
-/// Rows are returned by [`Dataset::append`](super::pipeline::Dataset::append) and
+/// Rows are returned by [`Dataset::append`](super::dataset::Dataset::append) and
 /// identify specific positions in every component's `RecordBatch`. The inner `u32`
 /// is kept public for easy pattern-matching and construction in tests.
 #[repr(transparent)]

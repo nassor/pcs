@@ -18,11 +18,12 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
 use pcs_service::PcsError;
+use pcs_service::dataset::Dataset;
 use pcs_service::io::parquet_sink::ParquetSink;
 use pcs_service::io::parquet_source::ParquetSource;
 use pcs_service::io::sink::Sink;
 use pcs_service::io::source::Source;
-use pcs_service::pipeline::{Dataset, Pipeline};
+use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{ParallelSystem, SystemMeta, WriteSet};
 
 // ---------------------------------------------------------------------------

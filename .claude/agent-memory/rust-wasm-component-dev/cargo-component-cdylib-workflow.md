@@ -26,7 +26,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 pcs-core    = { path = "../pcs-core", default-features = false, features = ["guest"] }
-arrow-ipc   = "=58.1.0"          # MUST match pcs-core's pin exactly
+arrow-ipc   = "=59.2.0"          # MUST match pcs-core's pin exactly
 pollster    = "0.4"              # sync executor for guest async (matches pcs-core pin)
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"                # eager parse of init(config) JSON
@@ -104,7 +104,7 @@ wasm-opt -Oz -o target/.../pcs_guest_smoketest.opt.wasm \
 - `wasm-bindgen` is NOT used. That's the browser JS interop stack. We target server-side wasmtime via Component Model.
 - Target must be `wasm32-wasip2`, not `wasip1` or `unknown-unknown`. Component Model requires wasip2.
 - `pcs-core`'s `guest` feature (task #7) must disable rayon, num_cpus, and any tokio runtime dependency. If any transitive dep pulls those in on wasip2, the build fails with a cryptic linker error. #6 audit complete, #7 in progress.
-- `arrow-ipc = "=58.1.0"` MUST be identical between pcs-core and pcs-guest. Use `cargo tree -p pcs-guest-smoketest -i arrow-ipc` to confirm before CI.
+- `arrow-ipc = "=59.2.0"` MUST be identical between pcs-core and pcs-guest. Use `cargo tree -p pcs-guest-smoketest -i arrow-ipc` to confirm before CI.
 - `wit-bindgen-rt` version floats; cargo-component picks it. Don't pin unless forced.
 - `[package.metadata.component.target.path]` is relative to the crate root — `"../pcs-guest/wit"` from inside `crates/pcs-guest-smoketest/`.
 - Owner of the `wasm-tools component wit` CI gate: **me, in #13**. wasm-lead runs it locally during #12 authoring as one-shot sanity; no CI gate in #12.

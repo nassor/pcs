@@ -15,9 +15,9 @@
 //! ## Backpressure
 //!
 //! [`BackpressureSpec::Predicate`] pauses a pipeline when a user-supplied
-//! closure returns `true`.  With the `io` feature,
-//! [`BackpressureSpec::Channel`] pauses when a named sink's
-//! [`pending_rows`](crate::io::sink::Sink::pending_rows) exceeds a threshold.
+//! closure returns `true`. A sink-depth probe is available to the closure via
+//! [`Pipeline::sink_pending_rows`](crate::pipeline::Pipeline::sink_pending_rows)
+//! under the `io` feature.
 //!
 //! ## Example
 //!
@@ -60,34 +60,12 @@ pub enum BackpressureSpec {
     ///
     /// Receives the *current* [`Pipeline`] as argument.
     Predicate(Box<dyn Fn(&Pipeline) -> bool + Send + Sync>),
-
-    /// Skip the pipeline when the named sink's
-    /// [`pending_rows`](crate::io::sink::Sink::pending_rows) exceeds
-    /// `max_pending`.
-    ///
-    /// Only available with the `io` feature.
-    #[cfg(feature = "io")]
-    Channel {
-        /// Name of the component whose sink is probed.
-        component: &'static str,
-        /// Maximum buffered rows before backpressure activates.
-        max_pending: usize,
-    },
 }
 
 impl std::fmt::Debug for BackpressureSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Predicate(_) => f.write_str("Predicate(<fn>)"),
-            #[cfg(feature = "io")]
-            Self::Channel {
-                component,
-                max_pending,
-            } => f
-                .debug_struct("Channel")
-                .field("component", component)
-                .field("max_pending", max_pending)
-                .finish(),
         }
     }
 }
@@ -203,17 +181,6 @@ impl Scheduler {
         };
         match spec {
             BackpressureSpec::Predicate(f) => f(&self.pipelines[idx]),
-            #[cfg(feature = "io")]
-            BackpressureSpec::Channel {
-                component,
-                max_pending,
-            } => {
-                let pipeline = &self.pipelines[idx];
-                pipeline
-                    .sink_pending_rows(component)
-                    .map(|n| n > *max_pending)
-                    .unwrap_or(false)
-            }
         }
     }
 
@@ -268,67 +235,6 @@ impl Scheduler {
 
                 let rows = self.pipelines[idx].last_stats().rows_produced;
                 produced_zero[idx] = rows == 0;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Run all pipelines concurrently within each stage.
-    ///
-    /// Stages are still executed sequentially (a later stage waits for all
-    /// earlier-stage futures to complete).  Within a stage every pipeline
-    /// that is not skipped runs as a separate tokio task.
-    pub async fn tick_parallel(&mut self) -> PcsResult<()> {
-        use futures::future::try_join_all;
-
-        self.ensure_stage_plan()?;
-
-        let stages = self
-            .stage_plan
-            .get()
-            .unwrap()
-            .as_ref()
-            .map_err(|e| PcsError::scheduler(e.to_string()))?
-            .clone();
-
-        let mut produced_zero: Vec<bool> = vec![false; self.pipelines.len()];
-
-        for stage in &stages {
-            let mut ordered: Vec<usize> = stage.clone();
-            ordered.sort_by_key(|&idx| self.configs[idx].priority);
-
-            let active: Vec<usize> = ordered
-                .into_iter()
-                .filter(|&idx| {
-                    !self.should_skip_data_dep(idx, &produced_zero) && !self.is_backpressured(idx)
-                })
-                .collect();
-
-            // Run active pipelines concurrently via try_join_all.
-            let futs: Vec<_> = self.pipelines[..]
-                .iter_mut()
-                .enumerate()
-                .filter(|(idx, _)| active.contains(idx))
-                .map(|(_, p)| async move {
-                    #[cfg(feature = "io")]
-                    return p.run_with_io().await;
-                    #[cfg(not(feature = "io"))]
-                    p.run().await
-                })
-                .collect();
-
-            try_join_all(futs).await?;
-
-            for &idx in &active {
-                let rows = self.pipelines[idx].last_stats().rows_produced;
-                produced_zero[idx] = rows == 0;
-            }
-            // Skipped pipelines are treated as producing zero rows.
-            for (i, flag) in produced_zero.iter_mut().enumerate() {
-                if !active.contains(&i) && stage.contains(&i) {
-                    *flag = true;
-                }
             }
         }
 
@@ -436,9 +342,9 @@ fn build_stages(
 mod tests {
     use super::*;
     #[cfg(feature = "runtime")]
-    use crate::error::PcsError;
+    use crate::dataset::Dataset;
     #[cfg(feature = "runtime")]
-    use crate::pipeline::Dataset;
+    use crate::error::PcsError;
     #[cfg(feature = "runtime")]
     use crate::system::{System, SystemMeta};
     #[cfg(feature = "runtime")]
@@ -573,39 +479,6 @@ mod tests {
         assert!(result.is_err());
         // Second pipeline did not run (both in stage 0, fail aborts stage).
         assert_eq!(*count.lock().unwrap(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // tick_parallel — concurrent
-    // -----------------------------------------------------------------------
-
-    #[cfg(feature = "runtime")]
-    #[tokio::test]
-    async fn test_tick_parallel_runs_both_pipelines() {
-        let count_a = Arc::new(Mutex::new(0usize));
-        let count_b = Arc::new(Mutex::new(0usize));
-
-        let mut sched = Scheduler::new();
-        sched.add_pipeline(make_pipeline("a", Arc::clone(&count_a)));
-        sched.add_pipeline(make_pipeline("b", Arc::clone(&count_b)));
-
-        sched.tick_parallel().await.unwrap();
-
-        assert_eq!(*count_a.lock().unwrap(), 1);
-        assert_eq!(*count_b.lock().unwrap(), 1);
-    }
-
-    #[cfg(feature = "runtime")]
-    #[tokio::test]
-    async fn test_tick_parallel_propagates_error() {
-        let count = Arc::new(Mutex::new(0usize));
-
-        let mut sched = Scheduler::new();
-        sched.add_pipeline(make_pipeline("ok", Arc::clone(&count)));
-        sched.add_pipeline(make_failing_pipeline("bad"));
-
-        let result = sched.tick_parallel().await;
-        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------

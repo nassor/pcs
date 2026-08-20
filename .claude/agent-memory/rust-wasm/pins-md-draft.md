@@ -11,20 +11,20 @@ Ready-to-drop content for `crates/pcs-guest/PINS.md` when task #12 lands. Captur
 
 This crate targets the WebAssembly Component Model. Host and guest share an
 exact-pinned Arrow IPC crate, and the tooling versions below have been tested
-to produce a valid component against the `pcs:pipeline@0.1.0` WIT package.
+to produce a valid component against the `pcs:pipeline@0.2.0` WIT package.
 
 ## Required tools
 
 | Tool              | Version  | Install                                              |
 | ----------------- | -------- | ---------------------------------------------------- |
-| `wasmtime`        | 43.0.1   | `cargo install wasmtime-cli --locked --version 43.0.1` |
+| `wasmtime`        | 47.0.3   | `cargo install wasmtime-cli --locked --version 47.0.3` |
 | `cargo-component` | 0.21.1   | `cargo install cargo-component --locked --version 0.21.1` |
 | `wasm-tools`      | 1.246.2  | `cargo install wasm-tools --locked --version 1.246.2` |
 | Rust target       | `wasm32-wasip2` | `rustup target add wasm32-wasip2` |
 
 ## Load-bearing crate pin
 
-`arrow-ipc = "=58.1.0"` is exact-pinned in the workspace. Both the host and
+`arrow-ipc = "=59.2.0"` is exact-pinned in the workspace. Both the host and
 any guest produced by `pcs-guest` MUST link against this exact version,
 because Arrow IPC is the wire format across the Component Model boundary.
 A patch-release drift here can silently corrupt `Dataset` round-trips between

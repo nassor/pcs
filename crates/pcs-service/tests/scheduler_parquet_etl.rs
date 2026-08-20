@@ -10,7 +10,8 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
 use pcs_core::PcsError;
-use pcs_core::pipeline::{Dataset, Pipeline};
+use pcs_core::dataset::Dataset;
+use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{ParallelSystem, SystemMeta, WriteSet};
 use pcs_service::io::parquet_sink::ParquetSink;
 use pcs_service::io::parquet_source::ParquetSource;

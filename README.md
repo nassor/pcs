@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/logo.png" alt="PCS Logo" width="200">
+  <img src="docs/static/logo.svg" alt="PCS Logo" width="200">
   <h1>PCS — Distributed Batch Processing for Rust, on Apache Arrow</h1>
 
 [![Website](https://img.shields.io/badge/website-nassor.github.io%2Fpcs-blue)](https://nassor.github.io/pcs/)

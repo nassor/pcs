@@ -14,10 +14,17 @@
 <p class="page-lede">{{ section.description }}</p>
 {% endif %}
 
+{# Same wrapper `page.html` uses. Every markdown element rule is scoped to
+   `.markdown`, so a section whose body is written in markdown needs it too or
+   its tables, lists and code render unstyled. #}
+<article class="markdown">
 {{ section.content | safe }}
+</article>
 
-{# A section landing page with nothing but a link list is a dead end. Each entry
-   carries its own description so the reader can choose without clicking. #}
+{# A section landing page with nothing but a link list is a dead end, so each
+   entry carries its own description. A section whose content lives on the index
+   itself has no pages, and must not emit an empty grid. #}
+{% if section.pages | length > 0 %}
 <div class="next-steps-grid">
     {% for page in section.pages %}
     <a href="{{ page.permalink }}" class="next-card">
@@ -27,5 +34,6 @@
     </a>
     {% endfor %}
 </div>
+{% endif %}
 
 {% endblock %}

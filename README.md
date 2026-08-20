@@ -95,7 +95,7 @@ the machine has to move:
 - Checkpointing is a contiguous buffer write, so recovery decodes **19× faster** than a
   row-oriented equivalent at 1M rows.
 
-Numbers and methodology: [benchmark results](./docs/content/benchmarks/phase7-results.md).
+Numbers and methodology: [benchmark results](https://nassor.github.io/pcs/benchmarks/).
 
 ## Quick start
 

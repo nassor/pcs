@@ -58,10 +58,15 @@
     --s5: 1.5rem;   --s6: 2rem;     --s7: 3rem;     --s8: 4rem;
     --s9: 6rem;
 
-    /* Layout */
+    /* Layout — exactly two content edges, and both are absolute.
+
+       `ch` was a trap here: it resolves against the *element's own* font-size,
+       so one `74ch` token meant 625px on a 17px paragraph and 1353px on a 28px
+       heading. Headings escaped the measure entirely and every block landed on
+       a different right edge. These are rem, so one token means one width. */
     --nav-w: 274px;
-    --measure: 74ch;
-    --panel: 46rem;
+    --measure: 41rem;   /* text: prose, headings, lists, notes, TOC, facts */
+    --wide:   64rem;    /* figures only: diagrams, code, tables, card grids */
 
     /* Shape */
     --r-sm: 4px;
@@ -134,14 +139,6 @@ img, svg { display: block; max-width: 100%; }
 }
 .skip-link:focus { transform: translateY(0); }
 
-.visually-hidden {
-    position: absolute;
-    width: 1px; height: 1px;
-    padding: 0; margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-}
 
 /* --------------------------------------------------------------------------
    3. Sidebar
@@ -246,21 +243,21 @@ img, svg { display: block; max-width: 100%; }
     z-index: 1;
     margin-left: var(--nav-w);
     padding: var(--s7) var(--s7) var(--s9);
-    max-width: calc(1040px + var(--s7) * 2);
+    max-width: calc(var(--wide) + var(--s7) * 2);
 }
 
 .main-content > h1,
 .main-content > h2,
 .main-content > h3,
 .main-content > h4,
-.main-content > p:not(.page-lede):not(.lede),
+.main-content > p:not(.page-lede),
 .main-content > ul,
 .main-content > ol:not(.steps),
 .markdown > h1,
 .markdown > h2,
 .markdown > h3,
 .markdown > h4,
-.markdown > p:not(.page-lede):not(.lede),
+.markdown > p:not(.page-lede),
 .markdown > ul,
 .markdown > ol,
 .markdown > blockquote {
@@ -295,13 +292,6 @@ h2::after {
 }
 
 p { margin-bottom: var(--s4); }
-
-.lede {
-    max-width: 66ch;
-    font-size: var(--step-1);
-    line-height: 1.6;
-    color: var(--paper-2);
-}
 
 strong { color: var(--paper); font-weight: 600; }
 em { color: var(--paper-2); }
@@ -365,11 +355,11 @@ hr {
     letter-spacing: -0.01em;
     color: var(--paper);
     margin: var(--s4) 0 var(--s5);
-    max-width: 44ch;
+    max-width: 34rem;
 }
 
 .page-facts {
-    max-width: var(--panel);
+    max-width: var(--measure);
     display: grid;
     grid-template-columns: max-content 1fr;
     gap: var(--s2) var(--s5);
@@ -404,8 +394,24 @@ hr {
     overflow: hidden;
 }
 
-.dgm > svg,
-.dgm-scroll > svg { width: 100%; height: auto; display: block; }
+.dgm > svg { width: 100%; height: auto; display: block; }
+
+/* A diagram is authored at 660 units and its labels are sized for that. Let the
+   frame scroll rather than let the SVG scale below the width its type was
+   designed at; `min-width` makes the threshold the design width itself instead
+   of a guessed breakpoint. */
+.dgm-scroll { overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-width: thin; }
+.dgm-scroll > svg { display: block; width: 100%; min-width: 660px; height: auto; }
+
+/* Shown only when JS confirms the frame actually overflows — see script.js. */
+.dgm.is-pannable::after {
+    content: 'scroll the diagram sideways';
+    display: block;
+    margin-top: var(--s3);
+    font: 500 var(--step--1)/1 var(--font-mono);
+    color: var(--paper-3);
+    letter-spacing: 0.03em;
+}
 
 .dgm-cap {
     display: block;
@@ -442,10 +448,14 @@ hr {
 .dgm .blk-ctl  { stroke: hsl(172 66% 47% / 0.55); }
 .dgm .blk-bnd  { stroke: hsl(266 86% 76% / 0.55); }
 
-.dgm .hd { fill: hsl(230 20% 18%); }
-.dgm .hd-data { fill: hsl(33 96% 60% / 0.16); }
-.dgm .hd-ctl  { fill: hsl(172 66% 47% / 0.16); }
-.dgm .hd-bnd  { fill: hsl(266 86% 76% / 0.16); }
+/* Header bars are built from two overlapping rects — a rounded one plus a
+   square one that squares off its bottom edge. With a translucent fill the
+   overlap composites twice and the bar reads as two different colours, so
+   these are opaque: one rect or two, the result is the same flat tone. */
+.dgm .hd { fill: hsl(230 20% 20%); }
+.dgm .hd-data { fill: hsl(31 34% 21%); }
+.dgm .hd-ctl  { fill: hsl(179 26% 18%); }
+.dgm .hd-bnd  { fill: hsl(265 27% 24%); }
 
 .dgm .row   { fill: hsl(230 20% 17%); }
 .dgm .row-r { fill: hsl(172 66% 47% / 0.26); }   /* a system reads this field  */
@@ -620,18 +630,17 @@ pre:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
 /* --------------------------------------------------------------------------
    10. Cards and grids
    -------------------------------------------------------------------------- */
-.grid-2, .grid-3, .concept-grid, .feature-grid, .next-steps-grid {
+.grid-3, .concept-grid, .next-steps-grid {
     display: grid;
     gap: var(--s4);
     margin: var(--s5) 0 var(--s6);
     max-width: none;
 }
-.grid-2 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-.grid-3, .feature-grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.grid-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .concept-grid { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
 .next-steps-grid { grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); }
 
-.card, .feature-card, .concept-card, .next-card {
+.card, .concept-card, .next-card {
     display: block;
     padding: var(--s5);
     background: var(--ink-2);
@@ -650,12 +659,12 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     transform: translateY(-2px);
 }
 
-.card h3, .feature-card h3, .concept-card h3, .next-card h3 {
+.card h3, .concept-card h3, .next-card h3 {
     margin: 0 0 var(--s2);
     font-size: var(--step-1);
 }
 
-.card p, .feature-card p, .concept-card p, .next-card p {
+.card p, .concept-card p, .next-card p {
     margin: 0;
     font-size: var(--step--1);
     line-height: 1.6;
@@ -782,14 +791,12 @@ a.card:hover, .concept-card:hover, .next-card:hover {
 .rule-table tbody tr:hover td, .markdown tbody tr:hover td { background: hsl(230 22% 11%); }
 .rule-table strong, .markdown td strong { color: var(--paper); }
 
-.table-scroll { overflow-x: auto; margin: var(--s4) 0 var(--s6); }
-.table-scroll > table { margin: 0; }
 
 /* --------------------------------------------------------------------------
    13. Notes
    -------------------------------------------------------------------------- */
 .note {
-    max-width: var(--panel);
+    max-width: var(--measure);
     margin: var(--s5) 0;
     padding: var(--s4) var(--s5);
     background: var(--ink-2);
@@ -817,7 +824,7 @@ a.card:hover, .concept-card:hover, .next-card:hover {
    14. On-page contents
    -------------------------------------------------------------------------- */
 .page-toc {
-    max-width: var(--panel);
+    max-width: var(--measure);
     margin: 0 0 var(--s7);
     padding: var(--s4) var(--s5);
     background: var(--ink-2);
@@ -886,7 +893,7 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     font-size: var(--step-2);
     line-height: 1.45;
     color: var(--paper-2);
-    max-width: 42ch;
+    max-width: 30rem;
     margin-bottom: var(--s5);
 }
 .hero-lede strong { color: var(--paper); font-weight: 600; }
@@ -997,7 +1004,7 @@ a.card:hover, .concept-card:hover, .next-card:hover {
    -------------------------------------------------------------------------- */
 .markdown > h1:first-child { margin-bottom: var(--s5); }
 .markdown blockquote {
-    max-width: var(--panel);
+    max-width: var(--measure);
     margin: var(--s5) 0;
     padding: var(--s4) var(--s5);
     background: var(--ink-2);
@@ -1006,25 +1013,15 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     color: var(--paper-2);
 }
 .markdown blockquote > :last-child { margin-bottom: 0; }
-.markdown table { display: block; overflow-x: auto; white-space: nowrap; }
+/* Tables share the figure edge like code blocks do. `fit-content` was worse
+   than the problem it solved: every table shrink-wrapped to its own width, so a
+   page with eight tables had eight different right edges. Cells wrap instead,
+   which is why no scroll container is needed here — only inline code refuses to
+   break, and `table-layout: auto` gives it the room. */
+.markdown table { display: block; width: 100%; overflow-x: auto; }
 .markdown table code { white-space: nowrap; }
+.markdown td, .markdown th { overflow-wrap: anywhere; }
 
-/* Section index (Operations, Benchmarks) */
-.section-index { list-style: none; padding: 0; margin: var(--s5) 0; }
-.section-index li { margin-bottom: var(--s3); }
-.section-index a {
-    display: block;
-    padding: var(--s4) var(--s5);
-    background: var(--ink-2);
-    border: 1px solid var(--edge-soft);
-    border-radius: var(--r-md);
-    text-decoration: none;
-    font-family: var(--font-display);
-    font-size: var(--step-1);
-    font-weight: 600;
-    color: var(--paper);
-}
-.section-index a:hover { border-color: var(--edge); background: var(--ink-3); color: var(--data); }
 
 /* --------------------------------------------------------------------------
    19. 404
@@ -1063,27 +1060,7 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     .page-facts { grid-template-columns: 1fr; gap: var(--s1) 0; }
     .page-facts dt { margin-top: var(--s3); }
     .page-facts dt:first-of-type { margin-top: 0; }
-    /* A 660-unit diagram scaled into a 340px column renders 10px labels at
-       ~5px. Below the breakpoint the diagram gets its own scroll frame and
-       keeps 1 unit = 1px, so the text stays the size it was designed at and
-       the reader pans instead of squinting. */
     .dgm { padding: var(--s4) var(--s3) var(--s3); }
-    .dgm-scroll {
-        overflow-x: auto;
-        overflow-y: hidden;
-        -webkit-overflow-scrolling: touch;
-        overscroll-behavior-x: contain;
-        scrollbar-width: thin;
-    }
-    .dgm-scroll > svg { width: 660px; max-width: none; flex: none; }
-    .dgm::after {
-        content: 'scroll the diagram sideways';
-        display: block;
-        margin-top: var(--s3);
-        font: 500 var(--step--1)/1 var(--font-mono);
-        color: var(--paper-3);
-        letter-spacing: 0.03em;
-    }
     .hero-actions .btn { flex: 1 1 auto; justify-content: center; }
 }
 

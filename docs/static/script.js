@@ -191,6 +191,33 @@
     }
 
     // ------------------------------------------------------------------------
+    // Diagram pan hint
+    //
+    // A diagram is authored at 660 units and its labels are sized for that, so
+    // the frame scrolls rather than scaling the type down. Whether it actually
+    // scrolls depends on the column width, which no media query knows
+    // precisely — the sidebar width and padding both change at breakpoints.
+    // Measure instead of guessing, and only offer the hint when it is true.
+    // ------------------------------------------------------------------------
+    const frames = document.querySelectorAll('.dgm-scroll');
+    if (frames.length > 0) {
+      const syncHints = () => {
+        frames.forEach((frame) => {
+          const dgm = frame.closest('.dgm');
+          if (!dgm) return;
+          dgm.classList.toggle('is-pannable', frame.scrollWidth > frame.clientWidth + 1);
+        });
+      };
+      syncHints();
+      if ('ResizeObserver' in window) {
+        const ro = new ResizeObserver(syncHints);
+        frames.forEach((frame) => ro.observe(frame));
+      } else {
+        window.addEventListener('resize', syncHints);
+      }
+    }
+
+    // ------------------------------------------------------------------------
     // Reveal-on-scroll for elements marked `.animate-in`
     // ------------------------------------------------------------------------
     const revealTargets = document.querySelectorAll('.animate-in');

@@ -186,8 +186,8 @@ img, svg { display: block; max-width: 100%; }
     color: var(--paper-3);
 }
 
-/* The first groups are a genuine reading order, so they are numbered.
-   The reference groups below them are not, so they are not. */
+/* Every group is numbered, top to bottom, as one map of the site. Only the
+   first two (Start, Core concepts) are a strict prerequisite chain. */
 .nav-num {
     font-variant-numeric: tabular-nums;
     color: var(--control);

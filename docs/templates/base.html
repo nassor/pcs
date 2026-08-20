@@ -26,6 +26,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
     <script src="{{ get_url(path='script.js') }}" defer></script>
 </head>
 <body>
@@ -40,8 +42,9 @@
             <span>PCS</span>
         </a>
 
-        {# The first two groups are a reading order, so they are numbered.
-           The reference groups below are not a sequence, so they are not. #}
+        {# Every group is numbered, top to bottom, so the sidebar reads as one
+           map of the whole site. Only the first two are a strict prerequisite
+           chain; the rest are numbered for orientation, not sequence. #}
         <div class="nav-group">
             <div class="nav-group-label"><span class="nav-num">01</span> Start</div>
             <ul class="nav-links">
@@ -61,14 +64,23 @@
         </div>
 
         <div class="nav-group">
-            <div class="nav-group-label">Moving data</div>
+            <div class="nav-group-label"><span class="nav-num">03</span> Any language</div>
+            <ul class="nav-links">
+                <li><a href="{{ get_url(path='@/polyglot/_index.md') }}">Pipelines in any language</a></li>
+                <li><a href="{{ get_url(path='@/polyglot/writing-a-guest.md') }}">Writing a guest</a></li>
+                <li><a href="{{ get_url(path='@/polyglot/wire-format.md') }}">Host &harr; guest wire format</a></li>
+            </ul>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-group-label"><span class="nav-num">04</span> Moving data</div>
             <ul class="nav-links">
                 <li><a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a></li>
             </ul>
         </div>
 
         <div class="nav-group">
-            <div class="nav-group-label">Running at scale</div>
+            <div class="nav-group-label"><span class="nav-num">05</span> Running at scale</div>
             <ul class="nav-links">
                 <li><a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a></li>
                 <li><a href="{{ get_url(path='@/service.md') }}">Service</a></li>
@@ -77,7 +89,7 @@
         </div>
 
         <div class="nav-group">
-            <div class="nav-group-label">Reference</div>
+            <div class="nav-group-label"><span class="nav-num">06</span> Reference</div>
             <ul class="nav-links">
                 <li><a href="{{ get_url(path='@/tracing.md') }}">Tracing</a></li>
                 <li><a href="{{ get_url(path='@/benchmarks/_index.md') }}">Benchmarks</a></li>

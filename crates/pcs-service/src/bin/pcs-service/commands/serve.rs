@@ -87,6 +87,15 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
     // Users who fork this binary call with_runtime() and register IO factories.
     // Example: register_builtin_factories(ServiceBuilder::new()).with_runtime(...)
     let builder = register_builtin_factories(ServiceBuilder::new());
+    #[cfg(feature = "wasm")]
+    let has_wasm = config.pipeline.wasm.is_some();
+    #[cfg(not(feature = "wasm"))]
+    let has_wasm = false;
+    let builder = if !has_wasm {
+        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new("pcs-service")))
+    } else {
+        builder
+    };
     let built = builder.build(&config)?;
 
     // Gate 3 — semantic: verify IO targets against runtime declared components.

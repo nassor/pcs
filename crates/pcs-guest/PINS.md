@@ -8,14 +8,14 @@ team has validated against the `pcs:pipeline@0.1.0` WIT package.
 
 | Tool              | Version  | Install                                                       |
 | ----------------- | -------- | ------------------------------------------------------------- |
-| `wasmtime`        | 43.0.1   | `cargo install wasmtime-cli --locked --version 43.0.1`        |
+| `wasmtime`        | 47.0.3   | `cargo install wasmtime-cli --locked --version 47.0.3`        |
 | `cargo-component` | 0.21.1   | `cargo install cargo-component --locked --version 0.21.1`    |
 | `wasm-tools`      | 1.246.2  | `cargo install wasm-tools --locked --version 1.246.2`        |
 | Rust target       | `wasm32-wasip2` | `rustup target add wasm32-wasip2`                    |
 
 ## Load-bearing crate pin
 
-`arrow-ipc = "=58.1.0"` is exact-pinned in the workspace (`Cargo.toml`).
+`arrow-ipc = "=59.2.0"` is exact-pinned in the workspace (`Cargo.toml`).
 Both the host and any guest built against this SDK MUST link against this
 exact version, because Arrow IPC is the wire format across the Component
 Model boundary. A patch-release drift here can silently corrupt `Dataset`

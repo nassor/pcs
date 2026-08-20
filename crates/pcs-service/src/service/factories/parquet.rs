@@ -215,7 +215,8 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let tmp = write_parquet(schema, vec![1, 2, 3]);
 
-        let config_str = format!("path = \"{}\"", tmp.path().display());
+        let path_str = tmp.path().to_string_lossy().replace('\\', "/");
+        let config_str = format!("path = \"{path_str}\"");
         let config: toml::Value = toml::from_str(&config_str).unwrap();
         let mut src = ParquetSourceFactory.build(&config).unwrap();
 
@@ -243,9 +244,9 @@ mod tests {
     #[tokio::test]
     async fn test_parquet_sink_factory_builds_and_writes() {
         let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().replace('\\', "/");
         let config_str = format!(
-            "path = \"{}\"\n[[schema_fields]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n",
-            tmp.path().display()
+            "path = \"{path_str}\"\n[[schema_fields]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n"
         );
         let config: toml::Value = toml::from_str(&config_str).unwrap();
         let mut sink = ParquetSinkFactory.build(&config).unwrap();

@@ -159,7 +159,7 @@ impl ToxiproxyClient {
         let body = format!(
             r#"{{"name":"reset_peer","type":"reset_peer","stream":"upstream","toxicity":1.0,"attributes":{{"timeout":{timeout_ms}}}}}"#
         );
-        reqwest_blocking::blocking::Client::new()
+        reqwest::blocking::Client::new()
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body)
@@ -203,7 +203,7 @@ impl ToxiproxyClient {
             "http://127.0.0.1:{}/proxies/{proxy}/toxics/{toxic_name}",
             self.api_port
         );
-        reqwest_blocking::blocking::Client::new()
+        reqwest::blocking::Client::new()
             .delete(&url)
             .send()
             .map_err(|e| anyhow::anyhow!("delete_toxic: {e}"))?

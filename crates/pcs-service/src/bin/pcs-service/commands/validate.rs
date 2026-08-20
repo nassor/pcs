@@ -54,6 +54,15 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
     // Unknown type names produce PcsError::Configuration with a message that
     // names the missing factory.
     let builder = register_builtin_factories(ServiceBuilder::new());
+    #[cfg(feature = "wasm")]
+    let has_wasm = config.pipeline.wasm.is_some();
+    #[cfg(not(feature = "wasm"))]
+    let has_wasm = false;
+    let builder = if !has_wasm {
+        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new("pcs-service")))
+    } else {
+        builder
+    };
     let build_result = builder.build(&config);
 
     // Collect all unknown-type errors; other errors (e.g. schema mismatches)
@@ -180,7 +189,8 @@ mod tests {
     fn test_builtin_only_config_validates_cleanly() {
         // An empty config (no systems, no sources) should always pass.
         let config = make_config(vec![], vec![], vec![], vec![]);
-        let builder = register_builtin_factories(ServiceBuilder::new());
+        let pipeline = pcs_service::pipeline::Pipeline::new("test");
+        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let result = builder.build(&config);
         assert!(
             result.is_ok(),
@@ -188,27 +198,28 @@ mod tests {
             result.unwrap_err()
         );
     }
-
-    // ── Test 2: unknown system type produces PcsError::Configuration ─────────
+    // ── Test 2: unknown sink type is classified as unknown factory error ─────
 
     #[test]
-    fn test_unknown_system_type_is_configuration_error() {
+    fn test_unknown_sink_type_is_unknown_factory_error() {
         let config = make_config(
-            vec![SystemInstance {
-                name: "my_system".to_string(),
-                type_name: "UserDefinedSystem".to_string(),
+            vec![],
+            vec![],
+            vec![],
+            vec![SinkSpec {
+                name: "sink1".to_string(),
+                type_name: "PostgresSink".to_string(), // not built-in
+                source_component: "orders".to_string(),
                 config: toml::Value::Table(toml::Table::new()),
             }],
-            vec![],
-            vec![],
-            vec![],
         );
-        let builder = register_builtin_factories(ServiceBuilder::new());
+        let pipeline = pcs_service::pipeline::Pipeline::new("test");
+        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let err = builder.build(&config).unwrap_err();
         assert_eq!(err.category(), "configuration");
         assert!(
             is_unknown_factory_error(&err),
-            "UserDefinedSystem should be classified as unknown factory: {err}"
+            "PostgresSink should be classified as unknown factory: {err}"
         );
     }
 
@@ -240,7 +251,8 @@ nullable = false
             }],
             vec![],
         );
-        let builder = register_builtin_factories(ServiceBuilder::new());
+        let pipeline = pcs_service::pipeline::Pipeline::new("test");
+        let builder = register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
         let err = builder.build(&config).unwrap_err();
         assert!(
             is_unknown_factory_error(&err),

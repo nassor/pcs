@@ -554,32 +554,33 @@ mod tests {
         }
     }
 
-    /// Bind to an ephemeral port and return the address + cancel token.
-    async fn bind_server(state: ServiceState) -> (String, CancellationToken) {
+    /// Bind to an ephemeral port and return the address + cancel token + task handle.
+    async fn bind_server(
+        state: ServiceState,
+    ) -> (
+        String,
+        CancellationToken,
+        tokio::task::JoinHandle<PcsResult<()>>,
+    ) {
         let cancel = CancellationToken::new();
-        let addr = {
-            // Bind to port 0 to get an OS-assigned ephemeral port.
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().to_string()
-            // listener dropped here — the port is released for serve_http.
-        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
 
         let state_clone = state.clone();
         let cancel_clone = cancel.clone();
-        let addr_clone = addr.clone();
 
-        tokio::spawn(async move {
-            let cfg = HttpConfig {
-                bind: addr_clone,
-                disabled: false,
-            };
-            let _ = serve_http(&cfg, state_clone, cancel_clone).await;
+        let handle = tokio::spawn(async move {
+            let router = build_router(state_clone);
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { cancel_clone.cancelled().await })
+                .await
+                .map_err(|e| PcsError::generic(format!("HTTP server error: {e}")))
         });
 
         // Give the server a moment to start.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        (addr, cancel)
+        (addr, cancel, handle)
     }
 
     // ── Test 1: /health returns 200 when watchdog is fresh ────────────────────
@@ -589,8 +590,7 @@ mod tests {
         let state = make_state(ServiceModeLabel::Standalone);
         // Immediately after start, uptime ≈ 0 s; liveness counter = 0.
         // minimum_expected = 0 - LIVENESS_STALE_SECONDS = 0 (saturating), so 0 >= 0.
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -608,8 +608,7 @@ mod tests {
         state.started_at = Instant::now() - Duration::from_secs(60);
         // Leave liveness counter at 0 — way below the minimum expected ≈ 55.
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
         assert_eq!(resp.status(), 503);
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -625,8 +624,7 @@ mod tests {
         let state = make_state(ServiceModeLabel::Standalone);
         state.ready.store(true, Ordering::Relaxed);
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/ready")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -642,8 +640,7 @@ mod tests {
         let state = make_state(ServiceModeLabel::Standalone);
         // ready is false by default.
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/ready")).await.unwrap();
         assert_eq!(resp.status(), 503);
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -657,8 +654,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_returns_200_with_prometheus_body() {
         let state = make_state(ServiceModeLabel::Standalone);
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/metrics"))
             .await
             .unwrap();
@@ -693,8 +689,7 @@ mod tests {
         let mut state = make_state(ServiceModeLabel::Standalone);
         state.standalone_stats = Some(stats);
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/status")).await.unwrap();
         assert_eq!(resp.status(), 200);
 
@@ -737,8 +732,7 @@ mod tests {
         let mut state = make_state(ServiceModeLabel::Cluster);
         state.cluster_probe = Some(Arc::new(MockProbe));
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/status")).await.unwrap();
         assert_eq!(resp.status(), 200);
 
@@ -761,8 +755,7 @@ mod tests {
         let state = make_state(ServiceModeLabel::Cluster);
         // cluster_probe is None.
 
-        let (addr, cancel) = bind_server(state).await;
-
+        let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/status")).await.unwrap();
         assert_eq!(resp.status(), 200);
 
@@ -778,30 +771,18 @@ mod tests {
     #[tokio::test]
     async fn test_graceful_shutdown_exits_within_2_seconds() {
         let state = make_state(ServiceModeLabel::Standalone);
-        let (addr, cancel) = bind_server(state).await;
+        let (addr, cancel, handle) = bind_server(state).await;
 
         // Confirm server is up.
-        reqwest::get(format!("http://{addr}/health")).await.unwrap();
+        let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+        assert_eq!(resp.status(), 200);
 
-        let start = Instant::now();
         cancel.cancel();
 
-        // Wait up to 2 seconds for the server to stop accepting new connections.
-        let timeout = Duration::from_secs(2);
-        loop {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            // When the server is gone, connections will be refused.
-            if reqwest::get(format!("http://{addr}/health")).await.is_err() {
-                break;
-            }
-            if start.elapsed() > timeout {
-                panic!("server did not shut down within 2 seconds");
-            }
-        }
-        assert!(
-            start.elapsed() <= timeout,
-            "server shutdown took longer than 2 seconds"
-        );
+        // Wait up to 2 seconds for the server task to complete.
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "server shutdown took longer than 2 seconds");
+        assert!(res.unwrap().unwrap().is_ok());
     }
 
     // ── Test 10: Bind failure on taken port returns Err ───────────────────────

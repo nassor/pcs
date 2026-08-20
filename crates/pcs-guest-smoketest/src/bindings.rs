@@ -119,7 +119,7 @@ pub mod pcs {
             }
             #[allow(unused_unsafe, clippy::all)]
             /// Pull a string-typed config value the host injected via
-            /// `pipeline.wasm.config` in service YAML. Returns none if absent.
+            /// `pipeline.wasm.config` in service TOML. Returns none if absent.
             /// Guest is expected to parse numerics itself.
             pub fn get_config(key: &str) -> Option<_rt::String> {
                 unsafe {
@@ -868,7 +868,7 @@ pub mod exports {
                     /// fingerprint matches any persisted checkpoint).
                     fn describe() -> PipelineDescriptor;
                     /// Called once after describe(), before any run-batch. Host passes the
-                    /// full `pipeline.wasm.config` YAML block as a JSON string. Guest parses
+                    /// full `pipeline.wasm.config` TOML table as a JSON string. Guest parses
                     /// and stores locally. Returning err aborts service startup.
                     fn init(config: _rt::String) -> Result<(), _rt::String>;
                     /// The hot path. Host marshals the partition batch to Arrow IPC and
@@ -1116,7 +1116,9 @@ macro_rules! __export_pcs_pipeline_impl {
 #[doc(inline)]
 pub(crate) use __export_pcs_pipeline_impl as export;
 #[cfg(target_arch = "wasm32")]
-#[unsafe(link_section = "component-type:wit-bindgen:0.41.0:pcs:pipeline@0.1.0:pcs-pipeline:encoded world")]
+#[unsafe(
+    link_section = "component-type:wit-bindgen:0.41.0:pcs:pipeline@0.1.0:pcs-pipeline:encoded world"
+)]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
 pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1105] = *b"\

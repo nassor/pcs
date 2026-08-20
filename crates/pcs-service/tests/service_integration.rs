@@ -63,6 +63,7 @@ impl Drop for ChildGuard {
 /// binary will assign an ephemeral port and print the address to stdout.
 fn write_standalone_config(data_dir: &std::path::Path) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("tempfile");
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
     write!(
         f,
         r#"
@@ -70,18 +71,17 @@ mode = "standalone"
 
 [node]
 id = 1
-data_dir = "{data_dir}"
+data_dir = "{data_dir_str}"
 
 [run_mode]
 kind = "continuous"
-
-[pipeline]
-systems = []
+[[pipeline.systems]]
+name = "process"
+type = "ProcessBatch"
 
 [http]
 bind = "127.0.0.1:0"
-"#,
-        data_dir = data_dir.display()
+"#
     )
     .expect("write config");
     f

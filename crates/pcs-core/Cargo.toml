@@ -47,7 +47,7 @@ tokio        = { workspace = true }
 arrow-array  = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ipc    = { workspace = true }
-tempfile     = "3.27.0"
+tempfile     = { workspace = true }
 sha3         = { workspace = true }
 
 [[bench]]

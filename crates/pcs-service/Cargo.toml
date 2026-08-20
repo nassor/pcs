@@ -56,8 +56,8 @@ wasmtime      = { workspace = true, optional = true }
 wasmtime-wasi = { workspace = true, optional = true }
 sha3          = { workspace = true, optional = true }
 
-redb          = { version = "4.0.0", optional = true }
-openraft      = { version = "0.10.0-alpha.17", features = ["serde"], optional = true }
+redb          = { version = "4.2.0", optional = true }
+openraft      = { version = "=0.10.0-alpha.17", features = ["serde"], optional = true }
 postcard      = { version = "1.1", features = ["alloc"], optional = true }
 hex           = { version = "0.4.3", optional = true }
 toml          = { version = "0.8", optional = true }
@@ -66,9 +66,9 @@ tower         = { version = "0.5", optional = true }
 tower-http    = { version = "0.6", default-features = false, features = ["trace", "timeout", "limit"], optional = true }
 tokio-util    = { version = "0.7", features = ["rt"], optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "ansi"], optional = true }
-opentelemetry       = { version = "0.31", optional = true }
-opentelemetry_sdk   = { version = "0.31", features = ["metrics"], optional = true }
-opentelemetry-prometheus = { version = "0.31", optional = true }
+opentelemetry       = { version = "0.32", optional = true }
+opentelemetry_sdk   = { version = "0.32", features = ["metrics"], optional = true }
+opentelemetry-prometheus = { version = "0.32", optional = true }
 prometheus          = { version = "0.14", default-features = false, optional = true }
 clap          = { version = "4", features = ["derive", "env"], optional = true }
 reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -84,7 +84,7 @@ arrow-csv     = { workspace = true, optional = true }
 parquet       = { workspace = true, optional = true }
 
 # DataFusion integration
-datafusion    = { version = "53", default-features = false, features = ["sql", "parquet"], optional = true }
+datafusion    = { version = "55", default-features = false, features = ["sql", "parquet"], optional = true }
 
 [[bin]]
 name = "pcs-service"
@@ -145,31 +145,30 @@ required-features = ["datafusion"]
 
 [dev-dependencies]
 criterion     = { workspace = true }
-tempfile      = "3.27.0"
-serde         = { version = "1.0.228", features = ["derive"] }
-postcard      = { version = "1.1.1", features = ["alloc"] }
-anyhow        = "1"
-sha3          = "0.10"
-libc          = "0.2"
+tempfile      = { workspace = true }
+serde         = { workspace = true }
+postcard      = { workspace = true }
+anyhow        = { workspace = true }
+sha3          = { workspace = true }
+libc          = { workspace = true }
 arrow-array   = { workspace = true }
 arrow-schema  = { workspace = true }
-tokio         = { version = "1.51.1", features = ["macros", "sync", "time", "rt-multi-thread", "signal"] }
+tokio         = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-uuid          = { version = "1.23.0", features = ["v4", "serde"] }
-redb          = { version = "4.0.0" }
-openraft      = { version = "0.10.0-alpha.17", features = ["serde"] }
-tokio-util    = { version = "0.7", features = ["rt"] }
-datafusion    = { version = "53", default-features = false, features = ["sql", "parquet"] }
-reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-reqwest_blocking = { package = "reqwest", version = "0.11", features = ["blocking", "json"] }
-testcontainers = "0.27"
+uuid          = { workspace = true }
+redb          = { version = "4.2.0" }
+openraft      = { version = "=0.10.0-alpha.17", features = ["serde"] }
+tokio-util    = { workspace = true }
+datafusion    = { version = "55", default-features = false, features = ["sql", "parquet"] }
+reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+testcontainers = "0.28"
 toxiproxy_rust = { git = "https://github.com/itarato/toxiproxy_rust", branch = "master" }
-tracing       = { version = "0.1.44" }
-opentelemetry_sdk = { version = "0.31", features = ["metrics"] }
-opentelemetry-prometheus = { version = "0.31" }
-opentelemetry  = { version = "0.31" }
+tracing       = { workspace = true }
+opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
+opentelemetry-prometheus = { version = "0.32" }
+opentelemetry  = { version = "0.32" }
 prometheus     = { version = "0.14", default-features = false }
-num_cpus       = { version = "1" }
-rayon          = { version = "1" }
-serde_arrow    = { version = "0.14.0", features = ["arrow-58"] }
+num_cpus       = { workspace = true }
+rayon          = { workspace = true }
+serde_arrow    = { workspace = true }
 

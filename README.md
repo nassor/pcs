@@ -3,7 +3,7 @@
 
   <h1>PCS</h1>
 
-  <p><strong>Batch pipelines in Rust that work out their own execution order.</strong></p>
+  <p><strong>Batch pipelines as WebAssembly components — write them in any language.</strong></p>
 
 [![Website](https://img.shields.io/badge/docs-nassor.github.io%2Fpcs-2f81f7)](https://nassor.github.io/pcs/)
 [![CI](https://github.com/nassor/pcs/actions/workflows/ci.yml/badge.svg)](https://github.com/nassor/pcs/actions/workflows/ci.yml)
@@ -15,22 +15,26 @@
 
 ## What it is
 
-PCS (Pipeline Component System) is a columnar batch processing engine for Rust, built on
-Apache Arrow.
+PCS (Pipeline Component System) is a columnar batch processing engine built on Apache Arrow.
 
-You write transforms as plain Rust structs. Each one declares **which Arrow fields it reads
+You write transforms as plain structs. Each one declares **which Arrow fields it reads
 and which it writes**. That declaration is the only scheduling input PCS needs: it builds a
 dependency graph from the field overlaps, groups work that cannot conflict into stages it is
 free to run concurrently, retries what fails, and — optionally — spreads the work across a cluster.
 
 You never write a stage list.
 
+The engine and the host are Rust. The *pipeline* contract is the `pcs:pipeline@0.2.0` WIT
+world, so any language that compiles to a WASI 0.2 component can implement it — the Rust
+guest SDK is a convenience, not a requirement. See
+[pipelines in any language](https://nassor.github.io/pcs/polyglot/).
+
 ## What it is for
 
 Reach for PCS when:
 
 - Batches are **100k–100M rows** and latency is measured in seconds, not microseconds.
-- The transform is **imperative Rust** that SQL expresses awkwardly.
+- The transform is **imperative code** that SQL expresses awkwardly.
 - Schemas are **wide** — tens to hundreds of columns, of which each step touches a few.
 - **Recovery time** is a design constraint, not an afterthought.
 
@@ -127,6 +131,27 @@ compiles the core module for `wasip1` and then adapts it into a WASI 0.2 compone
 The full walkthrough — your own component, your own system, and the config that runs it —
 is the **[Build your first pipeline](https://nassor.github.io/pcs/getting-started/)** guide.
 
+## Four languages, one pipeline
+
+`examples/polyglot/` implements a single `Order` workload as four separate WebAssembly
+components, chained by a Rust driver through the same host `pcs-service` uses. Every stage
+exports the same WIT world; nothing but the language differs.
+
+| # | stage | language | toolchain | writes |
+|---|-------|----------|-----------|--------|
+| 1 | `validate-go` | Go | `componentize-go` | `valid` |
+| 2 | `enrich-py` | Python | `componentize-py` | `usd_amount` |
+| 3 | `score-js` | JavaScript | `jco` | `risk_score`, `flagged` |
+| 4 | `settle-rs` | Rust | `cargo-component` | `settlement` + a cross-batch ledger |
+
+```bash
+bash scripts/build-polyglot.sh
+cargo run -p pcs-service --features wasm,tracing --example polyglot_orders
+```
+
+Details, the byte-level contract, and a per-language recipe:
+[pipelines in any language](https://nassor.github.io/pcs/polyglot/).
+
 ## Documentation
 
 | | |
@@ -141,10 +166,12 @@ is the **[Build your first pipeline](https://nassor.github.io/pcs/getting-starte
 | **[Service](https://nassor.github.io/pcs/service/)** | TOML schema, validation gates, HTTP control plane |
 | **[Operating pcs-service](https://nassor.github.io/pcs/operations/running-pcs/)** | Deployment, tuning, failure modes |
 | **[Tracing](https://nassor.github.io/pcs/tracing/)** | Spans, metrics, and the Prometheus endpoint |
+| **[Pipelines in any language](https://nassor.github.io/pcs/polyglot/)** | The four-language example, the wire format, per-language recipes |
 
-Also in this repo: [WASM guest examples](./examples/wasm/), [Rust-native
-examples](./crates/pcs-service/examples/), and [toolchain
-pins](./crates/pcs-guest/PINS.md) for guest development.
+Also in this repo: [WASM guest examples](./examples/wasm/), the [polyglot
+example](./examples/polyglot/), [Rust-native examples](./crates/pcs-service/examples/), and
+toolchain pins for [Rust guests](./crates/pcs-guest/PINS.md) and [the other
+languages](./examples/polyglot/PINS.md).
 
 ## Workspace
 
@@ -154,6 +181,8 @@ pins](./crates/pcs-guest/PINS.md) for guest development.
 | `pcs-guest` | Guest SDK. Re-exports `pcs-core`, provides `export_pipeline!`, owns the canonical WIT at `wit/pipeline.wit`. |
 | `pcs-service` | Host binary: wasmtime, IO, distribution, config, HTTP. |
 | `pcs-guest-smoketest` | Minimal guest component used by CI to gate the Arrow IPC wire format. |
+| `pcs-polyglot-order` | The canonical `Order` schema every stage of the polyglot example shares. |
+| `polyglot-settle-wasm` | Rust stage of the polyglot example: writes `settlement`, keeps the ledger. |
 
 ## Building from source
 

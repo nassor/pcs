@@ -23,6 +23,8 @@ crates/
 └── pcs-service/         # Host: wasmtime runtime, IO formats, distributed/Raft, HTTP control
                          # plane, TOML config, and the pcs-service binary.
 examples/wasm/order_processing/   # A realistic guest pipeline built with cargo-component.
+examples/polyglot/                # Four guest components (Go, Python, JS, Rust) against one WIT
+                                  # world, plus the shared Order schema crate. See PINS.md there.
 docs/                             # Zola site: content/*.md front matter + templates/*.html prose.
 ```
 
@@ -40,6 +42,7 @@ cargo run -p pcs-service --example scheduler_etl             # Run an example
 cargo run -p pcs-service --example distributed_scheduler --features distributed
 cargo run -p pcs-service --example scheduler_etl_parallel
 cargo audit                                                  # Security audit (needs cargo-audit)
+bash scripts/build-polyglot.sh                               # Build the four polyglot guests
 ```
 
 `cargo fmt --all -- --check` walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs the
@@ -50,6 +53,7 @@ them. Both are gitignored. Generate them first:
 rustup target add wasm32-wasip2
 cargo install cargo-component --locked --version 0.21.1
 cargo component build -p order-processing-wasm --target wasm32-wasip2
+cargo component build -p polyglot-settle-wasm --target wasm32-wasip2
 cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
 ```
 

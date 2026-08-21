@@ -41,11 +41,12 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs
-    # `examples/wasm/order_processing/src/bindings.rs` and
-    # `crates/pcs-guest-smoketest/src/bindings.rs` on disk even though the host
-    # build never compiles them. cargo-component generates both files as part of
-    # a wasm32-wasip2 build, and both are gitignored, so they exist only once
-    # the component builds below have run.
+    # `examples/wasm/order_processing/src/bindings.rs`,
+    # `crates/pcs-guest-smoketest/src/bindings.rs` and
+    # `examples/polyglot/stages/rust-settle/src/bindings.rs` on disk even though
+    # the host build never compiles them. cargo-component generates all three
+    # files as part of a wasm32-wasip2 build, and all three are gitignored, so
+    # they exist only once the component builds below have run.
     - name: Install wasm32-wasip2 target
       run: rustup target add wasm32-wasip2
 
@@ -62,12 +63,16 @@ jobs:
     - name: Build smoketest WASM component
       run: cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
 
+    - name: Generate polyglot Rust stage bindings
+      run: cargo component build -p polyglot-settle-wasm --target wasm32-wasip2
+
     # Generated bindings ship unformatted; normalize before the workspace-wide
     # fmt check so `--check` only fails on hand-written code.
     - name: Pre-format generated bindings
       run: |
         rustfmt examples/wasm/order_processing/src/bindings.rs
         rustfmt crates/pcs-guest-smoketest/src/bindings.rs
+        rustfmt examples/polyglot/stages/rust-settle/src/bindings.rs
 
     - name: Check formatting
       run: cargo fmt --all -- --check
@@ -133,6 +138,95 @@ jobs:
 
     - name: Print smoketest component world
       run: wasm-tools component wit target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+
+  polyglot:
+    name: Polyglot Guests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-polyglot-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install wasm32-wasip2 target
+      run: rustup target add wasm32-wasip2
+
+    - name: Install component tooling
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+
+    # Versions are pinned in examples/polyglot/PINS.md; keep the two in sync.
+    - uses: actions/setup-go@v6
+      with:
+        go-version: '1.25.5'
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install guest componentizers
+      run: |
+        go install github.com/bytecodealliance/componentize-go@v0.4.1
+        pip install componentize-py==0.25.0
+        npm install -g @bytecodealliance/jco@1.30.0
+
+    # The three native codec test suites need the generated fixtures, and they
+    # are the tests that localise a flatbuffer-offset bug to one language before
+    # the wasm chain turns it into an opaque byte diff.
+    - name: Generate schema constants and fixtures
+      run: cargo run -p pcs-service --features wasm --example polyglot_orders -- emit
+
+    - name: Go codec tests
+      working-directory: examples/polyglot/stages/go-validate
+      run: |
+        cp ../../generated/schema_gen.go arrowipc/schema_gen.go
+        # Scoped, not `./...`: the generated binding packages use
+        # //go:wasmimport, which does not compile for the host target.
+        go test ./arrowipc/...
+
+    - name: Python codec tests
+      working-directory: examples/polyglot/stages/python-enrich
+      run: |
+        cp ../../generated/schema_gen.py schema_gen.py
+        # Named module, not `discover`: once componentize-py has written its
+        # binding stubs, discovery tries to import a package that only resolves
+        # inside the component.
+        python -m unittest test_arrow_ipc
+
+    - name: JavaScript codec tests
+      working-directory: examples/polyglot/stages/js-score
+      run: |
+        cp ../../generated/schema_gen.js schema_gen.js
+        npm install
+        node --test
+
+    - name: Build all four components
+      run: bash scripts/build-polyglot.sh
+
+    - name: Four-language chain regression
+      run: cargo test -p pcs-service --features wasm --test polyglot_chain -- --nocapture
+
+    - name: Run the polyglot driver
+      run: cargo run -p pcs-service --features wasm,tracing --example polyglot_orders
 
   security_audit:
     name: Security Audit

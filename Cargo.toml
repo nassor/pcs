@@ -5,6 +5,8 @@ members = [
     "crates/pcs-guest-smoketest",
     "crates/pcs-service",
     "examples/wasm/order_processing",
+    "examples/polyglot/order-schema",
+    "examples/polyglot/stages/rust-settle",
 ]
 resolver = "2"
 

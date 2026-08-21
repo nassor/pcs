@@ -3852,6 +3852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcs-polyglot-order"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "pcs-core",
+ "serde",
+]
+
+[[package]]
 name = "pcs-service"
 version = "0.1.0"
 dependencies = [
@@ -3878,6 +3887,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parquet",
  "pcs-core",
+ "pcs-polyglot-order",
  "postcard",
  "prometheus",
  "rand 0.10.2",
@@ -4021,6 +4031,16 @@ name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
+name = "polyglot-settle-wasm"
+version = "0.1.0"
+dependencies = [
+ "pcs-guest",
+ "pcs-polyglot-order",
+ "serde",
+ "wit-bindgen-rt",
+]
 
 [[package]]
 name = "portable-atomic"

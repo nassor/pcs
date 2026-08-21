@@ -1,0 +1,181 @@
+# PCS standalone config running ONE stage of the polyglot example under
+# `pcs-service` — the Python guest from `examples/polyglot/stages/python-enrich/`.
+#
+# HOW TO RUN (paths below are CWD-relative, so start from crates/pcs-service):
+#   cd crates/pcs-service
+#   bash ../../scripts/build-polyglot.sh                # builds all four guests
+#   cargo run --features service,wasm --bin pcs-service -- validate \
+#     --config examples/configs/standalone_polyglot.toml --strict
+#   cargo run --features service,wasm --bin pcs-service -- serve \
+#     --config examples/configs/standalone_polyglot.toml
+#
+# Reads examples/configs/fixtures/polyglot_orders.csv, runs the Python component,
+# writes /tmp/pcs-polyglot-out.csv with `usd_amount` filled in by a guest that
+# contains no Rust whatsoever.
+#
+# WHY ONE STAGE AND NOT THE CHAIN
+#
+# A `pcs-service` process runs exactly one runtime: `ServiceConfig.pipeline` is a
+# single `PipelineSpec` holding one `Option<WasmSpec>`, and `BuiltService.runtime`
+# is one trait object. Chaining four components is therefore a driver-level
+# construct — see `crates/pcs-service/examples/polyglot_orders.rs`. If you want a
+# config-driven chain, the sanctioned route is one `pcs-service` process per
+# stage joined by a Parquet sink → Parquet source.
+#
+# WHY EVERY COLUMN IS IN THE CSV
+#
+# The guests mutate Arrow IPC bytes in place, so they cannot add columns. All
+# nine `Order` fields must exist in the source data, which is why both
+# schema_fields blocks list all nine.
+#
+# Two consequences visible in the fixture:
+#
+#   * `settlement` reads `PENDING`, not an empty string. CsvSource turns an empty
+#     field into a NULL, and the field is declared non-nullable, so an empty
+#     value fails the whole batch with "Column 'settlement' is declared as
+#     non-nullable but contains null values" and zero rows are ingested. Only the
+#     Rust stage writes this column, and it is not in this pipeline.
+#   * `valid` is pre-seeded true/false. The Python stage reads it to decide
+#     whether to convert a row, and the Go stage that would normally produce it
+#     is not in this pipeline either.
+
+mode = "standalone"
+
+[node]
+id = 1
+name = "pcs-polyglot"
+data_dir = "${PCS_DATA_DIR:-/tmp/pcs-polyglot}"
+
+[run_mode]
+kind = "one_shot"
+
+# The Python stage: the one with the most config keys, so the `get-config` path
+# is genuinely exercised.
+[pipeline.wasm]
+module = "../../examples/polyglot/build/enrich-py.wasm"
+
+# FX rates the guest reads through the host-io `get-config` import. Strings; the
+# guest parses them itself.
+[pipeline.wasm.config]
+fx_eur = "1.10"
+fx_gbp = "1.30"
+fx_jpy = "0.0068"
+
+# `target_component` MUST be "Order": `validate_io_coverage` checks it against
+# the component names the guest reports from `describe()` and fails with
+# "source '<name>' targets component '<c>' which is not declared by the runtime".
+[[sources]]
+name = "csv_orders"
+type = "CsvSource"
+target_component = "Order"
+
+[sources.config]
+path = "examples/configs/fixtures/polyglot_orders.csv"
+has_headers = true
+
+[[sources.config.schema_fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "region"
+type = "Utf8"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "currency"
+type = "Utf8"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "valid"
+type = "Boolean"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "usd_amount"
+type = "Float64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "risk_score"
+type = "Float64"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "flagged"
+type = "Boolean"
+nullable = false
+
+[[sources.config.schema_fields]]
+name = "settlement"
+type = "Utf8"
+nullable = false
+
+[[sinks]]
+name = "csv_out"
+type = "CsvSink"
+source_component = "Order"
+
+[sinks.config]
+path = "/tmp/pcs-polyglot-out.csv"
+has_headers = true
+
+[[sinks.config.schema_fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "region"
+type = "Utf8"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "currency"
+type = "Utf8"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "amount"
+type = "Float64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "valid"
+type = "Boolean"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "usd_amount"
+type = "Float64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "risk_score"
+type = "Float64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "flagged"
+type = "Boolean"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "settlement"
+type = "Utf8"
+nullable = false
+
+[http]
+bind = "127.0.0.1:0"
+disabled = false
+
+[observability]
+log_format = "pretty"
+log_level = "info"

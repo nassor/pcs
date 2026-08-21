@@ -11,7 +11,7 @@ only exists when the `wasm` feature is on. `service` does **not** imply it, so
 
 | Config | Features |
 |--------|----------|
-| `standalone.toml`, `standalone_wasm.toml`, `extension_example.toml` | `service,wasm` |
+| `standalone.toml`, `standalone_wasm.toml`, `standalone_polyglot.toml`, `extension_example.toml` | `service,wasm` |
 | `cluster.toml` | `service-cluster,wasm` |
 
 ## Built-in factories
@@ -85,6 +85,8 @@ rather than a silently-dropped section.
 | `standalone_wasm.toml`    | Standalone config that loads a WASM guest pipeline |
 | `extension_example.toml`  | Non-runnable template showing user-defined types   |
 | `fixtures/orders.csv`     | Tiny CSV fixture used by `standalone.toml`         |
+| `standalone_polyglot.toml` | Runs the Python guest from `examples/polyglot/`      |
+| `fixtures/polyglot_orders.csv` | Nine-column fixture used by `standalone_polyglot.toml` |
 
 ---
 

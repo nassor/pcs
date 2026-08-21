@@ -13,6 +13,10 @@ team has validated against the `pcs:pipeline@0.2.0` WIT package.
 | `wasm-tools`      | 1.246.2  | `cargo install wasm-tools --locked --version 1.246.2`        |
 | Rust target       | `wasm32-wasip2` | `rustup target add wasm32-wasip2`                    |
 
+Non-Rust guests need three more componentization toolchains
+(`componentize-go`, `componentize-py`, `jco`), pinned in
+[`examples/polyglot/PINS.md`](../../examples/polyglot/PINS.md).
+
 ## Load-bearing crate pin
 
 `arrow-ipc = "=59.2.0"` is exact-pinned in the workspace (`Cargo.toml`).

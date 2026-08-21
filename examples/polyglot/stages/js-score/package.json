@@ -1,0 +1,15 @@
+{
+  "name": "polyglot-score-js",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stage 3 of the PCS polyglot example: scores usd_amount into risk_score/flagged.",
+  "type": "module",
+  "scripts": {
+    "build": "jco componentize score.js --wit ../../../../crates/pcs-guest/wit --world-name pcs-pipeline --disable http --disable fetch-event --bundle -o score-js.wasm",
+    "types": "jco types ../../../../crates/pcs-guest/wit --world-name pcs-pipeline -o types",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "1.30.0"
+  }
+}

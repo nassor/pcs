@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 #[cfg(feature = "distributed-raft")]
 use std::io;
 #[cfg(feature = "distributed-raft")]
+use std::io::Cursor;
+#[cfg(feature = "distributed-raft")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "distributed-raft")]
 use std::sync::{Arc, LazyLock};
@@ -301,7 +303,7 @@ impl TcpNetwork {
     async fn send_snapshot_chunks(
         pool: &PeerPool,
         vote: VoteOf<PcsTypeConfig>,
-        snapshot: SnapshotOf<PcsTypeConfig>,
+        snapshot: SnapshotOf<PcsTypeConfig, Cursor<Vec<u8>>>,
         transfer_id: u64,
     ) -> Result<SnapshotResponse<PcsTypeConfig>, StreamingError<PcsTypeConfig>> {
         let meta = snapshot.meta.clone();
@@ -406,6 +408,8 @@ impl TcpNetwork {
 
 #[cfg(feature = "distributed-raft")]
 impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
+    type SnapshotData = Cursor<Vec<u8>>;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<PcsTypeConfig>,
@@ -451,7 +455,7 @@ impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<PcsTypeConfig>,
-        snapshot: SnapshotOf<PcsTypeConfig>,
+        snapshot: SnapshotOf<PcsTypeConfig, Self::SnapshotData>,
         cancel: impl Future<Output = ReplicationClosed> + openraft::OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<PcsTypeConfig>, StreamingError<PcsTypeConfig>> {
@@ -465,7 +469,7 @@ impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
         }
     }
 
-    fn backoff(&self) -> Backoff {
+    fn backoff(&self) -> Option<Backoff> {
         // Exponential backoff: 100ms base, 2x multiplier, 10s cap, 20% jitter.
         let base_ms: u64 = 100;
         let cap_ms: u64 = 10_000;
@@ -478,7 +482,7 @@ impl RaftNetworkV2<PcsTypeConfig> for TcpNetwork {
             Some(next + jitter)
         })
         .map(Duration::from_millis);
-        Backoff::new(iter)
+        Some(Backoff::new(iter))
     }
 }
 
@@ -828,9 +832,8 @@ mod tests {
         let meta = SnapshotMeta {
             last_log_id: None,
             last_membership: StoredMembership::default(),
-            snapshot_id: "test-snap-1".to_string(),
         };
-        let snapshot: SnapshotOf<PcsTypeConfig> = Snapshot {
+        let snapshot: SnapshotOf<PcsTypeConfig, Cursor<Vec<u8>>> = Snapshot {
             meta,
             snapshot: Cursor::new(body.clone()),
         };

@@ -17,9 +17,7 @@ use futures_util::StreamExt;
 use openraft::EntryPayload;
 use openraft::StoredMembership;
 use openraft::storage::{EntryResponder, RaftStateMachine};
-use openraft::type_config::alias::{
-    LogIdOf, SnapshotDataOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf,
-};
+use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use redb::{Database, ReadableDatabase};
 
 use super::{SM_META_TABLE, dec, enc, join_to_io, to_io};
@@ -122,6 +120,7 @@ impl ArrowRedbStateMachine {
 }
 
 impl RaftStateMachine<PcsTypeConfig> for ArrowRedbStateMachine {
+    type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = ArrowSnapshotBuilder;
 
     async fn applied_state(
@@ -223,16 +222,10 @@ impl RaftStateMachine<PcsTypeConfig> for ArrowRedbStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<SnapshotDataOf<PcsTypeConfig>, io::Error> {
-        Ok(Cursor::new(vec![]))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<PcsTypeConfig>,
-        snapshot: SnapshotDataOf<PcsTypeConfig>,
+        snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
         // Update in-memory state first so we can encode watermarks below.
@@ -289,7 +282,7 @@ impl RaftStateMachine<PcsTypeConfig> for ArrowRedbStateMachine {
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<SnapshotOf<PcsTypeConfig>>, io::Error> {
+    ) -> Result<Option<SnapshotOf<PcsTypeConfig, Self::SnapshotData>>, io::Error> {
         // If nothing has been applied yet there is no snapshot to return.
         // openraft treats `None` as "no snapshot" and will send the full log
         // instead, which is correct for a freshly-initialized node.
@@ -316,10 +309,6 @@ impl RaftStateMachine<PcsTypeConfig> for ArrowRedbStateMachine {
         let meta = SnapshotMeta {
             last_log_id: self.last_applied,
             last_membership: self.last_membership.clone(),
-            snapshot_id: format!(
-                "arrow-snap-{}",
-                self.last_applied.map(|l| l.index).unwrap_or(0)
-            ),
         };
         Ok(Some(Snapshot {
             meta,

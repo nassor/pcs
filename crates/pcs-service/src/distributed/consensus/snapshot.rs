@@ -258,7 +258,11 @@ pub(crate) mod raft_impl {
     }
 
     impl RaftSnapshotBuilder<PcsTypeConfig> for ArrowSnapshotBuilder {
-        async fn build_snapshot(&mut self) -> Result<SnapshotOf<PcsTypeConfig>, std::io::Error> {
+        type SnapshotData = Cursor<Vec<u8>>;
+
+        async fn build_snapshot(
+            &mut self,
+        ) -> Result<SnapshotOf<PcsTypeConfig, Self::SnapshotData>, std::io::Error> {
             let db = self.db.lock().unwrap();
             let payload = build_snapshot_bytes(&db)
                 .map_err(|e| std::io::Error::other(format!("build_snapshot: {e}")))?;
@@ -266,10 +270,6 @@ pub(crate) mod raft_impl {
             let meta = SnapshotMeta {
                 last_log_id: self.last_applied,
                 last_membership: self.last_membership.clone(),
-                snapshot_id: format!(
-                    "arrow-snap-{}",
-                    self.last_applied.map(|l| l.index).unwrap_or(0)
-                ),
             };
             Ok(Snapshot {
                 meta,

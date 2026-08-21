@@ -319,6 +319,17 @@ run-batch:  func(input: ipc-bytes, prior: option&lt;checkpoint&gt;)
               -&gt; result&lt;run-result, run-error&gt;</code></pre>
 </div>
 
+<div class="note">
+    <span class="note-label">Not just Rust</span>
+    <p>
+        Those two functions are the whole contract. Any WASI 0.2 component that exports them
+        is a PCS pipeline — <code>pcs-guest</code> is a convenience for Rust authors, not a
+        requirement. See
+        <a href="{{ get_url(path='@/polyglot/_index.md') }}">Pipelines in any language</a> for a
+        worked example that chains four guests written in Go, Python, JavaScript and Rust.
+    </p>
+</div>
+
 <p>
     Turning a pipeline into a component is one line at the bottom of your crate.
     The macro writes both exports for you:

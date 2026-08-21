@@ -1,21 +1,21 @@
 {% extends "base.html" %}
 
-{% block title %}PCS — batch pipelines in Rust, shipped as WebAssembly{% endblock %}
-{% block description %}PCS is a columnar batch processing engine for Rust. Declare which Arrow fields each transform touches; PCS works out the execution order, runs independent work in parallel, and distributes it across nodes.{% endblock %}
-{% block og_title %}PCS — batch pipelines in Rust, shipped as WebAssembly{% endblock %}
-{% block og_description %}Declare which Arrow fields each transform touches. PCS works out the execution order, runs independent work in parallel, and distributes it across nodes.{% endblock %}
+{% block title %}PCS — batch pipelines as WebAssembly components{% endblock %}
+{% block description %}PCS is a columnar batch processing engine. Declare which Arrow fields each transform touches; PCS works out the execution order, runs independent work in parallel, and loads the pipeline as a WebAssembly component written in any language that targets WASI 0.2.{% endblock %}
+{% block og_title %}PCS — batch pipelines as WebAssembly components{% endblock %}
+{% block og_description %}Declare which Arrow fields each transform touches. PCS works out the execution order, runs independent work in parallel, and loads the pipeline as a WebAssembly component.{% endblock %}
 
 {% block content %}
 
 <section class="hero">
-    <div class="hero-eyebrow"><b>Apache Arrow</b> &middot; Rust 1.95 &middot; WebAssembly components</div>
+    <div class="hero-eyebrow"><b>Apache Arrow</b> &middot; WebAssembly components &middot; Rust &middot; Go &middot; Python &middot; JavaScript</div>
 
     <h1>Batch pipelines that<br>work out <span class="hl">their own order</span></h1>
 
     <p class="hero-lede">
-        Write transforms in Rust. Say which columns each one reads and writes.
-        <strong>PCS derives the execution plan</strong>, runs independent work concurrently,
-        and ships the whole pipeline as a WebAssembly component.
+        Write transforms in Rust — or Go, Python, or JavaScript. Say which columns each one
+        reads and writes. <strong>PCS derives the execution plan</strong>, runs independent
+        work concurrently, and loads the whole pipeline as a WebAssembly component.
     </p>
 
     <div class="hero-actions">
@@ -197,7 +197,8 @@
 
 <p>
     Each one builds on the previous. Read them in this order and nothing will be
-    forward-referenced.
+    forward-referenced. The sixth card is not part of the sequence — it is the
+    same five concepts, authored in a language other than Rust.
 </p>
 
 <div class="concept-grid">
@@ -225,6 +226,11 @@
         <div class="concept-num">05</div>
         <h3>Distributed Runner</h3>
         <p>The same Pipeline against claimed row ranges across nodes, checkpointed through Raft.</p>
+    </a>
+    <a href="{{ get_url(path='@/polyglot/_index.md') }}" class="concept-card">
+        <div class="concept-num">&plus;</div>
+        <h3>Any language</h3>
+        <p>The contract is a WIT world, not an SDK. A worked example chains four guests — Go, Python, JavaScript, Rust — over one schema.</p>
     </a>
 </div>
 

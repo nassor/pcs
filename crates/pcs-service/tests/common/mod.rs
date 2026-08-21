@@ -3,8 +3,9 @@
 //! ## Components
 //!
 //! - [`ToxiproxyContainer`] — wraps a Toxiproxy Docker container.
-//! - [`ToxiproxyClient`] — thin wrapper over `toxiproxy_rust::client::Client`
-//!   with helpers for `reset_peer` and `delete_toxic`.
+//! - [`ToxiproxyClient`] — minimal client for the Toxiproxy HTTP API. Avoids
+//!   the `toxiproxy_rust` crate, whose pinned `reqwest` 0.11 pulls a
+//!   vulnerable `h2` (RUSTSEC-2026-0258) with no upstream fix.
 //! - [`RaftClusterHarness`] — spins up N PCS Raft nodes with TCP links routed
 //!   through per-edge Toxiproxy proxies.
 //!
@@ -27,12 +28,11 @@ use openraft::BasicNode;
 use pcs_service::distributed::consensus::driver::{
     ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
 };
+use serde_json::json;
 use tempfile::TempDir;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
-use toxiproxy_rust::client::Client as ToxiClient;
-use toxiproxy_rust::proxy::ProxyPack;
 
 // ── Toxiproxy container ───────────────────────────────────────────────────────
 
@@ -89,122 +89,165 @@ impl ToxiproxyContainer {
 
 // ── Toxiproxy client wrapper ──────────────────────────────────────────────────
 
-/// Wraps `toxiproxy_rust::client::Client`, adding `reset_peer` and `delete_toxic`
-/// which the upstream crate doesn't expose directly.
+/// Minimal client for the Toxiproxy HTTP API (see
+/// <https://github.com/Shopify/toxiproxy#http-api>).
+///
+/// Talks to the server directly over `reqwest::blocking` instead of the
+/// `toxiproxy_rust` crate: that crate pins `reqwest` 0.11, which pulls a
+/// vulnerable `h2` (RUSTSEC-2026-0258) with no fix available upstream.
 pub struct ToxiproxyClient {
-    inner: ToxiClient,
+    http: reqwest::blocking::Client,
     pub api_port: u16,
 }
 
 impl ToxiproxyClient {
     pub fn new(api_port: u16) -> Self {
         Self {
-            inner: ToxiClient::new(format!("127.0.0.1:{api_port}")),
+            http: reqwest::blocking::Client::new(),
             api_port,
         }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}/{path}", self.api_port)
     }
 
     /// Create a proxy that listens on `listen_port` (container-internal) and
     /// forwards to `upstream` (`host:port` string).
     pub fn create_proxy(&self, name: &str, upstream: &str, listen_port: u16) -> anyhow::Result<()> {
-        let listen = format!("0.0.0.0:{listen_port}");
-        self.inner
-            .populate(vec![ProxyPack::new(name.into(), listen, upstream.into())])
-            .map_err(|e| anyhow::anyhow!("create_proxy: {e}"))?;
+        self.http
+            .post(self.url("proxies"))
+            .json(&json!({
+                "name": name,
+                "listen": format!("0.0.0.0:{listen_port}"),
+                "upstream": upstream,
+                "enabled": true,
+            }))
+            .send()
+            .map_err(|e| anyhow::anyhow!("create_proxy: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("create_proxy status: {e}"))?;
         Ok(())
     }
 
     /// Delete a named proxy.
     pub fn delete_proxy(&self, name: &str) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(name)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .delete()
-            .map_err(|e| anyhow::anyhow!("delete_proxy: {e}"))
+        self.http
+            .delete(self.url(&format!("proxies/{name}")))
+            .send()
+            .map_err(|e| anyhow::anyhow!("delete_proxy: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("delete_proxy status: {e}"))?;
+        Ok(())
+    }
+
+    /// Register a toxic on `proxy`. `name` follows Toxiproxy's own
+    /// `<type>_<stream>` convention except for `reset_peer`, which callers
+    /// address by its bare type name (see [`Self::add_reset_peer`]).
+    fn add_toxic(
+        &self,
+        proxy: &str,
+        name: &str,
+        toxic_type: &str,
+        stream: &str,
+        attributes: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.http
+            .post(self.url(&format!("proxies/{proxy}/toxics")))
+            .json(&json!({
+                "name": name,
+                "type": toxic_type,
+                "stream": stream,
+                "toxicity": 1.0,
+                "attributes": attributes,
+            }))
+            .send()
+            .map_err(|e| anyhow::anyhow!("add_toxic({toxic_type}): {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("add_toxic({toxic_type}) status: {e}"))?;
+        Ok(())
     }
 
     /// Add a latency toxic (milliseconds).
     pub fn add_latency(&self, proxy: &str, ms: u64) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(proxy)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .with_latency("upstream".into(), ms as u32, 0, 1.0);
-        Ok(())
+        self.add_toxic(
+            proxy,
+            "latency_upstream",
+            "latency",
+            "upstream",
+            json!({ "latency": ms, "jitter": 0 }),
+        )
     }
 
     /// Add a bandwidth toxic (kbps).
     pub fn add_bandwidth(&self, proxy: &str, kbps: u64) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(proxy)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .with_bandwidth("upstream".into(), kbps as u32, 1.0);
-        Ok(())
+        self.add_toxic(
+            proxy,
+            "bandwidth_upstream",
+            "bandwidth",
+            "upstream",
+            json!({ "rate": kbps }),
+        )
     }
 
     /// Add a timeout toxic — closes connection after `timeout_ms` with no data.
     pub fn add_timeout(&self, proxy: &str, timeout_ms: u64) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(proxy)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .with_timeout("upstream".into(), timeout_ms as u32, 1.0);
-        Ok(())
+        self.add_toxic(
+            proxy,
+            "timeout_upstream",
+            "timeout",
+            "upstream",
+            json!({ "timeout": timeout_ms }),
+        )
     }
 
     /// Add a reset_peer toxic — sends TCP RST after `timeout_ms` ms.
-    ///
-    /// `toxiproxy_rust` doesn't expose reset_peer; falls back to a blocking
-    /// HTTP call against the Toxiproxy REST API.
     pub fn add_reset_peer(&self, proxy: &str, timeout_ms: u64) -> anyhow::Result<()> {
-        let url = format!("http://127.0.0.1:{}/proxies/{proxy}/toxics", self.api_port);
-        let body = format!(
-            r#"{{"name":"reset_peer","type":"reset_peer","stream":"upstream","toxicity":1.0,"attributes":{{"timeout":{timeout_ms}}}}}"#
-        );
-        reqwest::blocking::Client::new()
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .map_err(|e| anyhow::anyhow!("add_reset_peer: {e}"))?
-            .error_for_status()
-            .map_err(|e| anyhow::anyhow!("add_reset_peer status: {e}"))?;
-        Ok(())
+        self.add_toxic(
+            proxy,
+            "reset_peer",
+            "reset_peer",
+            "upstream",
+            json!({ "timeout": timeout_ms }),
+        )
     }
 
     /// Add a limit_data toxic — closes connection after `bytes` bytes.
     pub fn add_limit_data(&self, proxy: &str, bytes: u64) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(proxy)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .with_limit_data("upstream".into(), bytes as u32, 1.0);
-        Ok(())
+        self.add_toxic(
+            proxy,
+            "limit_data_upstream",
+            "limit_data",
+            "upstream",
+            json!({ "bytes": bytes }),
+        )
     }
 
     /// Disable a proxy (all connections fail immediately).
     pub fn disable_proxy(&self, name: &str) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(name)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .disable()
-            .map_err(|e| anyhow::anyhow!("disable_proxy: {e}"))
+        self.set_proxy_enabled(name, false)
     }
 
     /// Re-enable a disabled proxy.
     pub fn enable_proxy(&self, name: &str) -> anyhow::Result<()> {
-        self.inner
-            .find_proxy(name)
-            .map_err(|e| anyhow::anyhow!("find_proxy: {e}"))?
-            .enable()
-            .map_err(|e| anyhow::anyhow!("enable_proxy: {e}"))
+        self.set_proxy_enabled(name, true)
+    }
+
+    fn set_proxy_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        self.http
+            .post(self.url(&format!("proxies/{name}")))
+            .json(&json!({ "enabled": enabled }))
+            .send()
+            .map_err(|e| anyhow::anyhow!("set_proxy_enabled: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("set_proxy_enabled status: {e}"))?;
+        Ok(())
     }
 
     /// Delete a named toxic from a proxy.
     pub fn delete_toxic(&self, proxy: &str, toxic_name: &str) -> anyhow::Result<()> {
-        let url = format!(
-            "http://127.0.0.1:{}/proxies/{proxy}/toxics/{toxic_name}",
-            self.api_port
-        );
-        reqwest::blocking::Client::new()
-            .delete(&url)
+        self.http
+            .delete(self.url(&format!("proxies/{proxy}/toxics/{toxic_name}")))
             .send()
             .map_err(|e| anyhow::anyhow!("delete_toxic: {e}"))?
             .error_for_status()
@@ -214,9 +257,13 @@ impl ToxiproxyClient {
 
     /// Reset all proxies (enable all, remove all toxics).
     pub fn reset(&self) -> anyhow::Result<()> {
-        self.inner
-            .reset()
-            .map_err(|e| anyhow::anyhow!("reset: {e}"))
+        self.http
+            .post(self.url("reset"))
+            .send()
+            .map_err(|e| anyhow::anyhow!("reset: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("reset status: {e}"))?;
+        Ok(())
     }
 }
 

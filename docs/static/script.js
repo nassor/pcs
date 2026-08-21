@@ -20,6 +20,22 @@
     return anchor.origin !== window.location.origin;
   }
 
+  // --------------------------------------------------------------------------
+  // Zola tags markdown code fences as `<code data-lang="go">`, while Prism only
+  // looks at `class="language-*"`. Without this bridge no fence in a
+  // content/*.md page is ever highlighted — only the hand-written blocks in
+  // templates/*.html, which carry the class themselves.
+  //
+  // This runs at deferred-script time, before Prism's own DOMContentLoaded
+  // pass, so Prism sees the class on its first and only sweep.
+  // --------------------------------------------------------------------------
+  document.querySelectorAll('pre > code[data-lang]').forEach((code) => {
+    const lang = code.dataset.lang;
+    if (lang && !code.classList.contains(`language-${lang}`)) {
+      code.classList.add(`language-${lang}`);
+    }
+  });
+
   document.addEventListener('DOMContentLoaded', () => {
     const sidebar = document.querySelector('.sidebar');
     const menuToggle = document.getElementById('menu-toggle');

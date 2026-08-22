@@ -129,14 +129,28 @@ impl Dataset {
     /// Schemas remain registered so the dataset can be re-used with the same
     /// component types without calling `register_component` again.
     pub fn clear(&mut self) {
-        for (name, chunks) in &mut self.components {
-            let schema = if let Some(b) = chunks.first() {
-                b.schema()
-            } else {
-                return;
-            };
-            *chunks = vec![RecordBatch::new_empty(schema)];
-            let _ = name;
+        // Disjoint field borrows: `components` mutably, `empty_templates`
+        // shared. Cloning a prebuilt zero-row batch is a few `Arc` bumps,
+        // against an empty Arrow array per column for `RecordBatch::new_empty`.
+        let Self {
+            components,
+            empty_templates,
+            ..
+        } = self;
+        for (name, chunks) in components.iter_mut() {
+            match empty_templates.get(name) {
+                Some(template) => {
+                    chunks.clear();
+                    chunks.push(template.clone());
+                }
+                // Registered before templates existed, or built by hand.
+                None => {
+                    let Some(schema) = chunks.first().map(|b| b.schema()) else {
+                        continue;
+                    };
+                    *chunks = vec![RecordBatch::new_empty(schema)];
+                }
+            }
         }
         self.merged_cache.get_mut().unwrap().clear();
         self.alive = BooleanBufferBuilder::new(0);

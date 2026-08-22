@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
@@ -154,7 +155,13 @@ impl Dataset {
             .get(component_name)
             .expect("schema registered but get() failed — internal inconsistency");
 
-        if batch.schema().fields() != registered_schema.fields() {
+        // Sources build their batches from one cached schema `Arc`, so pointer
+        // equality usually settles this. The fallback compares every field
+        // structurally, including field-name string comparisons, which in
+        // stream mode would run once per item.
+        if !Arc::ptr_eq(&batch.schema(), &registered_schema)
+            && batch.schema().fields() != registered_schema.fields()
+        {
             return Err(PcsError::generic(format!(
                 "Dataset::append_record_batch: schema mismatch for '{component_name}': \
                  got {:?}, expected {:?}",

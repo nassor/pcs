@@ -61,6 +61,7 @@ impl Dataset {
         self.schemas.register::<C>();
         let schema = C::schema();
         let empty = RecordBatch::new_empty(schema);
+        self.empty_templates.insert(C::name(), empty.clone());
         self.components.insert(C::name(), vec![empty]);
         Ok(())
     }
@@ -102,6 +103,7 @@ impl Dataset {
         );
         self.schemas.register_raw(name, schema.clone(), version);
         let empty = RecordBatch::new_empty(schema);
+        self.empty_templates.insert(name, empty.clone());
         self.components.insert(name, vec![empty]);
     }
 }

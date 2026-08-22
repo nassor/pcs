@@ -68,6 +68,13 @@ pub(crate) fn intern_component_name(name: &str) -> &'static str {
 pub struct Dataset {
     pub(crate) components: HashMap<&'static str, Vec<RecordBatch>>,
     merged_cache: RwLock<HashMap<&'static str, Box<RecordBatch>>>,
+    /// Zero-row `RecordBatch` per component, built once at registration.
+    ///
+    /// `clear()` needs an empty sentinel chunk per component so `batch_for`
+    /// keeps working on an emptied dataset. Constructing one means an empty
+    /// Arrow array per column; stream mode clears once per item, so it is
+    /// cheaper to clone a prebuilt batch (a handful of `Arc` bumps).
+    empty_templates: HashMap<&'static str, RecordBatch>,
     schemas: SchemaRegistry,
     row_count: usize,
     alive: BooleanBufferBuilder,
@@ -100,6 +107,7 @@ impl Dataset {
         Self {
             components: HashMap::new(),
             merged_cache: RwLock::new(HashMap::new()),
+            empty_templates: HashMap::new(),
             schemas: SchemaRegistry::new(),
             row_count: 0,
             alive: BooleanBufferBuilder::new(0),

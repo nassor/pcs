@@ -316,8 +316,9 @@ Still open:
   improvement on 4.66× but still short of the ~16× that 16 physical cores
   suggest. `compute_row_ranges` splits uniformly and knows nothing about which
   CCD a worker sits on.
-- **A tracing span per system per attempt.** `pcs-service` enables
-  `pcs-core/tracing`, so every system execution constructs a span. At a 0.284 µs
-  per-item floor that is potentially a double-digit percentage of stream-mode
-  overhead, and no benchmark currently measures it because the bench binaries
-  build without the `tracing` feature.
+
+Measured and closed: the per-system tracing span costs **0.65%** of
+`stream_items_of_1` when `pcs-core/tracing` is compiled in without an active
+subscriber, because `tracing` checks a global level filter before doing any work.
+A build with a subscriber attached pays for what it asked to record, which is an
+operator choice rather than framework overhead.

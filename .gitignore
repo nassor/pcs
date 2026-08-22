@@ -9,3 +9,6 @@
 # Avoid IDE files
 .idea/
 .vscode/
+
+# Local Benchmarks
+performance-improvement.md

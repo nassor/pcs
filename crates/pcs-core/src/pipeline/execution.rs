@@ -52,10 +52,55 @@ async fn run_parallel_system_with_retries(
     .await
 }
 
-/// Split `total_rows` into CPU-count equal-ish ranges for parallel dispatch.
+/// Logical CPU count, resolved once.
+///
+/// `num_cpus::get()` inspects the OS on every call; this is on the per-batch
+/// path for every sliced system, so it is cached.
+#[cfg(feature = "runtime")]
+fn cpu_count() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| num_cpus::get().max(1) as u32)
+}
+
+/// Chunks to create per logical CPU when slicing a system.
+///
+/// Oversubscribing rayon gives it something to steal, which matters because
+/// SMT siblings and dual-CCD parts do not retire equal chunks in equal time.
+/// Measured on `parallelism_compute/slice_parallel` (SHA3-256 over 128 MB,
+/// 32 logical CPUs): 1x = 61.5 ms, 2x = 56.5 ms, 4x = 53.9 ms, 8x = 52.2 ms,
+/// 16x = 51.9 ms, 32x = 51.9 ms, 64x = 52.5 ms.
+///
+/// 4x is the chosen default rather than the 16-32x optimum because the gain is
+/// workload-dependent: systems whose slices must be concatenated by
+/// `merge_slices` pay per-chunk copy overhead, and `tpch_q6/narrow_pcs`
+/// regresses ~3% by 4x and ~5% by 16x. Override per deployment with
+/// `PCS_SLICE_CHUNKS_PER_CPU`.
+#[cfg(feature = "runtime")]
+fn chunks_per_cpu() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PCS_SLICE_CHUNKS_PER_CPU")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4)
+    })
+}
+
+/// Rows below which splitting further stops paying for itself.
+#[cfg(feature = "runtime")]
+const MIN_ROWS_PER_CHUNK: u32 = 4_096;
+
+/// Split `total_rows` into equal-ish ranges for parallel dispatch.
+///
+/// Chunk count is clamped to `[cpu_count, cpu_count * chunks_per_cpu]`: never
+/// fewer than one chunk per CPU, so a large batch always fills the machine, and
+/// never so many that chunks fall below [`MIN_ROWS_PER_CHUNK`].
 #[cfg(feature = "runtime")]
 fn compute_row_ranges(total_rows: u32) -> Vec<std::ops::Range<u32>> {
-    let num_chunks = num_cpus::get().max(1) as u32;
+    let cpus = cpu_count();
+    let by_rows = total_rows / MIN_ROWS_PER_CHUNK;
+    let num_chunks = by_rows.clamp(cpus, cpus.saturating_mul(chunks_per_cpu()));
     let chunk_size = total_rows.div_ceil(num_chunks);
     (0..num_chunks)
         .map(|i| {

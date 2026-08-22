@@ -169,6 +169,15 @@ impl Dataset {
             .get_mut(component_name)
             .expect("component registered but not in components map — internal inconsistency");
 
+        // `clear()` leaves a zero-row sentinel chunk so `batch_for` keeps
+        // working on an emptied dataset. Pushing onto it would leave two
+        // chunks, and every subsequent read would pay `concat_batches` over
+        // them — a full copy of this batch's data. Stream mode clears and
+        // appends once per item, so that copy would be per-item. Drop the
+        // sentinel instead and keep the component single-chunk.
+        if chunks.len() == 1 && chunks[0].num_rows() == 0 {
+            chunks.clear();
+        }
         let old_len: usize = chunks.iter().map(|b| b.num_rows()).sum();
 
         chunks.push(batch);

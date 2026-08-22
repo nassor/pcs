@@ -25,10 +25,15 @@ impl Dataset {
         Ok(())
     }
 
-    /// Merge all components that have more than one pending chunk and warm the
-    /// merged cache for each.
+    /// Collapse every component that has more than one pending chunk into one.
+    ///
+    /// Deliberately does **not** warm the merged cache for single-chunk
+    /// components. It used to, which cost a `RecordBatch` clone and a map
+    /// insert per component on every call — including for components this
+    /// write set never touches, and including for the one it is about to
+    /// invalidate anyway. `get_or_build_merged` populates on demand for the
+    /// same cost, only for components somebody actually reads.
     pub(super) fn flush_all_pending(&mut self) -> Result<(), PcsError> {
-        let cache = self.merged_cache.get_mut().unwrap();
         for (name, chunks) in &mut self.components {
             if chunks.len() > 1 {
                 let schema = self
@@ -38,11 +43,7 @@ impl Dataset {
                 let merged = concat_batches(&schema, chunks.iter())
                     .map_err(|e| PcsError::generic(format!("arrow concat_batches error: {e}")))?;
                 *chunks = vec![merged];
-                cache.insert(name, Box::new(chunks[0].clone()));
-            } else if !cache.contains_key(name)
-                && let Some(batch) = chunks.first()
-            {
-                cache.insert(name, Box::new(batch.clone()));
+                self.merged_cache.get_mut().unwrap().remove(name);
             }
         }
         Ok(())

@@ -670,6 +670,126 @@ fn bench_q6(c: &mut Criterion) {
         })
     });
 
+    // Decomposition: the same three systems invoked directly, sequentially,
+    // with no Pipeline, no stage plan, no spawn_blocking and no rayon. The
+    // delta against `narrow_pcs` is pure framework overhead.
+    group.bench_function("narrow_direct_systems", |b| {
+        b.iter(|| {
+            let mut ds = build_narrow_pipeline(std::hint::black_box(&narrow_batch));
+            rt.block_on(async {
+                let ws = FilterStage {
+                    component: "Lineitem",
+                }
+                .run(&ds)
+                .await
+                .unwrap();
+                ds.apply_write_set(ws).unwrap();
+                let ws = ComputeStage {
+                    component: "Lineitem",
+                }
+                .run(&ds)
+                .await
+                .unwrap();
+                ds.apply_write_set(ws).unwrap();
+                AggregateStage.run(&mut ds).await.unwrap();
+            });
+            std::hint::black_box(ds.get_resource::<Q6Revenue>().map(|r| r.0).unwrap_or(0.0))
+        })
+    });
+
+    // Per-stage decomposition. Datasets are built once, outside the timed
+    // region, so these are the stage bodies alone.
+    {
+        let ds_clean = build_narrow_pipeline(&narrow_batch);
+
+        group.bench_function("narrow_stage_filter", |b| {
+            b.iter(|| {
+                let ws = rt
+                    .block_on(
+                        FilterStage {
+                            component: "Lineitem",
+                        }
+                        .run(std::hint::black_box(&ds_clean)),
+                    )
+                    .unwrap();
+                std::hint::black_box(ws.resource_updates.len())
+            })
+        });
+
+        group.bench_function("narrow_stage_compute", |b| {
+            b.iter(|| {
+                let ws = rt
+                    .block_on(
+                        ComputeStage {
+                            component: "Lineitem",
+                        }
+                        .run(std::hint::black_box(&ds_clean)),
+                    )
+                    .unwrap();
+                std::hint::black_box(ws.fields.len())
+            })
+        });
+
+        // Fully populated dataset so the aggregate has a mask and pieces.
+        let mut ds_full = build_narrow_pipeline(&narrow_batch);
+        let ws = rt
+            .block_on(
+                FilterStage {
+                    component: "Lineitem",
+                }
+                .run(&ds_full),
+            )
+            .unwrap();
+        ds_full.apply_write_set(ws).unwrap();
+        let ws = rt
+            .block_on(
+                ComputeStage {
+                    component: "Lineitem",
+                }
+                .run(&ds_full),
+            )
+            .unwrap();
+        ds_full.apply_write_set(ws).unwrap();
+
+        group.bench_function("narrow_stage_aggregate", |b| {
+            b.iter(|| {
+                rt.block_on(AggregateStage.run(std::hint::black_box(&mut ds_full)))
+                    .unwrap();
+                std::hint::black_box(ds_full.get_resource::<Q6Revenue>().map(|r| r.0))
+            })
+        });
+    }
+
+    // Same sequence as `narrow_direct_systems`, but the dataset is built once
+    // and reused, so no fresh multi-MB allocation happens per iteration. The
+    // stages are idempotent: filter and compute read only Lineitem, which they
+    // never write.
+    {
+        let mut ds_warm = build_narrow_pipeline(&narrow_batch);
+        group.bench_function("narrow_direct_systems_warm", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let ws = FilterStage {
+                        component: "Lineitem",
+                    }
+                    .run(std::hint::black_box(&ds_warm))
+                    .await
+                    .unwrap();
+                    ds_warm.apply_write_set(ws).unwrap();
+                    let ws = ComputeStage {
+                        component: "Lineitem",
+                    }
+                    .run(&ds_warm)
+                    .await
+                    .unwrap();
+                    ds_warm.apply_write_set(ws).unwrap();
+                    AggregateStage.run(&mut ds_warm).await.unwrap();
+                });
+                std::hint::black_box(ds_warm.get_resource::<Q6Revenue>().map(|r| r.0))
+            })
+        });
+    }
+
     group.bench_function("narrow_pcs", |b| {
         b.iter(|| {
             let mut wl = Pipeline::new("q6_narrow");

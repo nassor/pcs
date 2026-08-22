@@ -33,13 +33,16 @@ guest SDK is a convenience, not a requirement. See
 
 Reach for PCS when:
 
-- Batches are **100k–100M rows** and latency is measured in seconds, not microseconds.
+- Work arrives as **batches of 100k–100M rows**, or as a **stream of individual items** you
+  want processed one at a time.
 - The transform is **imperative code** that SQL expresses awkwardly.
 - Schemas are **wide** — tens to hundreds of columns, of which each step touches a few.
 - **Recovery time** is a design constraint, not an afterthought.
 
-Look elsewhere when you want SQL (use [DataFusion](https://datafusion.apache.org/)),
-sub-millisecond streaming, or you have fewer than ~10k rows and a `Vec` would do.
+Look elsewhere when you want SQL (use [DataFusion](https://datafusion.apache.org/)), or you
+have fewer than ~10k rows total and a `Vec` would do. For per-item processing, run the same
+pipeline in [stream mode](https://nassor.github.io/pcs/service/): sub-millisecond per item
+in-process; batch mode remains the default for throughput.
 
 The name is a nod to ECS (Entity Component System) from game development. Where ECS
 organises game entities as components that systems act on each frame, PCS organises a data

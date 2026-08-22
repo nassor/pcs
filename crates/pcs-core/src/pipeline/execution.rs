@@ -8,7 +8,9 @@ use crate::retry::SystemConfig;
 use std::sync::Arc;
 
 #[cfg(feature = "runtime")]
-use crate::system::{ParallelSystem, SLICE_PARALLEL_THRESHOLD, SliceWriteSet, WriteSet};
+use crate::system::{
+    ParallelSystem, SLICE_PARALLEL_THRESHOLD, STAGE_INLINE_THRESHOLD, SliceWriteSet, WriteSet,
+};
 
 #[cfg(feature = "io")]
 use crate::io::{drain_dataset, drain_into_dataset};
@@ -234,7 +236,12 @@ async fn run_stages(
     for stage in stages.iter() {
         let all_parallel = stage.iter().all(|&idx| systems[idx].is_parallel());
 
-        if all_parallel && stage.len() > 1 {
+        // Concurrent dispatch of a whole stage costs a `spawn_blocking` per
+        // system plus write-set merging; below `STAGE_INLINE_THRESHOLD` rows
+        // that dominates the work itself, so fall through to the sequential
+        // loop below (systems sharing a stage are non-conflicting by
+        // construction, so the result is identical either way).
+        if all_parallel && stage.len() > 1 && data.rows() as u32 >= STAGE_INLINE_THRESHOLD {
             systems_run += stage.len();
             retries_this_batch += run_parallel_stage(systems, configs, stage, data).await?;
         } else if all_parallel && stage.len() == 1 {
@@ -507,6 +514,89 @@ impl Pipeline {
         });
         Ok(())
     }
+
+    /// Process each source batch individually, end-to-end, as it arrives.
+    ///
+    /// Unlike [`run_with_io`](Self::run_with_io) — which drains the source to
+    /// EOF, runs once over everything, then flushes — this pulls one
+    /// [`RecordBatch`](arrow_array::RecordBatch) at a time and runs the full
+    /// system DAG plus every sink for that item alone. Sinks are finalised
+    /// once, after the source reaches EOF.
+    ///
+    /// Requires exactly one source; zero or more sinks are fine.
+    ///
+    /// Each item is processed against a cleared dataset — [`Dataset::clear`]
+    /// drops per-run resources — so state that must survive across items has
+    /// to live inside the system structs themselves (interior mutability).
+    /// This is the same contract the batch loop already has per iteration.
+    ///
+    /// # Errors
+    ///
+    /// Any source, system, or sink error aborts the stream and is returned;
+    /// retry-and-continue policy belongs to the caller.
+    #[cfg(feature = "io")]
+    pub async fn run_stream(&mut self) -> PcsResult<RunStats> {
+        if self.sources.len() != 1 {
+            return Err(PcsError::configuration(format!(
+                "run_stream requires exactly one source; {} configured",
+                self.sources.len()
+            )));
+        }
+        self.ensure_plan(self.data.schemas())?;
+
+        let start = Instant::now();
+        let mut systems_run = 0usize;
+        let mut retries_this_batch = 0u32;
+        let mut rows_produced = 0isize;
+
+        {
+            let Self {
+                data,
+                systems,
+                stages,
+                configs,
+                sources,
+                sinks,
+                ..
+            } = &mut *self;
+
+            let stages_val = stages.get().unwrap().as_ref().unwrap();
+            let configs_val = configs.get().unwrap();
+            let (comp, source) = {
+                let (c, s) = &mut sources[0];
+                (*c, s)
+            };
+
+            while let Some(batch) = source.next_batch().await? {
+                data.clear();
+                data.append_record_batch(comp, batch)?;
+
+                if !stages_val.is_empty() {
+                    let (run, retries) = run_stages(systems, configs_val, stages_val, data).await?;
+                    systems_run += run;
+                    retries_this_batch += retries;
+                }
+
+                for (sink_comp, sink) in sinks.iter_mut() {
+                    drain_dataset(data, sink_comp, sink.as_mut()).await?;
+                }
+                rows_produced += data.live_rows() as isize;
+            }
+
+            for (_, sink) in sinks.iter_mut() {
+                sink.finish().await?;
+            }
+        }
+
+        let stats = RunStats {
+            rows_produced,
+            systems_run,
+            duration_millis: start.elapsed().as_millis() as u64,
+            retries_this_batch,
+        };
+        self.last_stats.set(stats);
+        Ok(stats)
+    }
 }
 
 // Every test here drives `Pipeline::run` / `run_on` through the tokio+rayon
@@ -775,5 +865,212 @@ mod tests {
         let stats = p.last_stats();
         assert_eq!(stats.systems_run, 0);
         assert_eq!(stats.retries_this_batch, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Stream mode
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "io")]
+    fn one_order(id: u64, total: f64) -> arrow_array::RecordBatch {
+        use arrow_array::{Float64Array, RecordBatch, UInt64Array};
+        RecordBatch::try_new(
+            ExecOrder::schema(),
+            vec![
+                Arc::new(UInt64Array::from(vec![id])),
+                Arc::new(Float64Array::from(vec![total])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Each source batch is a separate end-to-end invocation: three one-row
+    /// batches in, three transformed sink writes out, three system calls.
+    #[cfg(feature = "io")]
+    #[tokio::test]
+    async fn test_run_stream_processes_each_batch_individually() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::io::channel_sink::ChannelSink;
+        use crate::io::channel_source::ChannelSource;
+        use crate::system::{SystemMeta, system_fn};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+
+        let mut p = Pipeline::new("stream");
+        p.data.register_component::<ExecOrder>().unwrap();
+        p.add_system(system_fn(
+            SystemMeta::new("double")
+                .read("ExecOrder", "total")
+                .write("ExecOrder", "total"),
+            move |data| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let batch = data.columns::<ExecOrder>().unwrap().clone();
+                let col = batch
+                    .column(batch.schema().index_of("total").unwrap())
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let doubled: Float64Array = col.iter().map(|v| v.map(|x| x * 2.0)).collect();
+                data.apply_write_set(WriteSet::new().put("ExecOrder", "total", Arc::new(doubled)))
+            },
+        ));
+
+        let (tx, source) = ChannelSource::new(ExecOrder::schema(), 4);
+        let (sink, mut rx) = ChannelSink::new(ExecOrder::schema(), 8);
+        p.add_source("ExecOrder", source);
+        p.add_sink("ExecOrder", sink);
+
+        for i in 0..3u64 {
+            tx.send(one_order(i, (i as f64 + 1.0) * 10.0))
+                .await
+                .unwrap();
+        }
+        drop(tx); // EOF
+
+        let stats = p.run_stream().await.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "system must run once per source batch"
+        );
+        assert_eq!(stats.systems_run, 3);
+        assert_eq!(stats.rows_produced, 3);
+
+        let mut got = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            got.push(batch);
+        }
+        assert_eq!(got.len(), 3, "one sink write per item");
+        for (i, batch) in got.iter().enumerate() {
+            assert_eq!(batch.num_rows(), 1);
+            let col = batch
+                .column(batch.schema().index_of("total").unwrap())
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let expected = (i as f64 + 1.0) * 10.0 * 2.0;
+            assert!(
+                (col.value(0) - expected).abs() < 1e-9,
+                "item {i}: got {}, want {expected}",
+                col.value(0)
+            );
+        }
+    }
+
+    #[cfg(feature = "io")]
+    #[tokio::test]
+    async fn test_run_stream_requires_exactly_one_source() {
+        use crate::io::channel_source::ChannelSource;
+
+        let mut none = Pipeline::new("no-source");
+        none.data.register_component::<ExecOrder>().unwrap();
+        let err = none.run_stream().await.unwrap_err().to_string();
+        assert!(
+            err.contains("run_stream requires exactly one source; 0 configured"),
+            "got: {err}"
+        );
+
+        let mut two = Pipeline::new("two-sources");
+        two.data.register_component::<ExecOrder>().unwrap();
+        let (_tx_a, a) = ChannelSource::new(ExecOrder::schema(), 1);
+        let (_tx_b, b) = ChannelSource::new(ExecOrder::schema(), 1);
+        two.add_source("ExecOrder", a);
+        two.add_source("ExecOrder", b);
+        let err = two.run_stream().await.unwrap_err().to_string();
+        assert!(
+            err.contains("run_stream requires exactly one source; 2 configured"),
+            "got: {err}"
+        );
+    }
+
+    /// A multi-system all-parallel stage must produce identical results whether
+    /// it runs inline (below `STAGE_INLINE_THRESHOLD`) or dispatched.
+    #[tokio::test]
+    async fn test_small_parallel_stage_matches_dispatched_results() {
+        use crate::system::{ParallelSystem, STAGE_INLINE_THRESHOLD, SystemMeta};
+
+        #[derive(Serialize, Deserialize, Clone, Debug)]
+        struct StageRow {
+            seed: f64,
+            a: f64,
+            b: f64,
+        }
+
+        impl Component for StageRow {
+            fn name() -> &'static str {
+                "StageRow"
+            }
+            fn schema() -> Arc<Schema> {
+                Arc::new(Schema::new(vec![
+                    Field::new("seed", DataType::Float64, false),
+                    Field::new("a", DataType::Float64, false),
+                    Field::new("b", DataType::Float64, false),
+                ]))
+            }
+        }
+
+        struct Scale {
+            field: &'static str,
+            factor: f64,
+        }
+
+        #[async_trait::async_trait]
+        impl ParallelSystem for Scale {
+            fn meta(&self) -> SystemMeta {
+                SystemMeta::new("scale")
+                    .read("StageRow", "seed")
+                    .write("StageRow", self.field)
+            }
+            async fn run(&self, data: &Dataset) -> crate::PcsResult<WriteSet> {
+                let batch = data.columns::<StageRow>().unwrap();
+                let seed = batch
+                    .column(batch.schema().index_of("seed").unwrap())
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let out: Float64Array = seed.iter().map(|v| v.map(|x| x * self.factor)).collect();
+                Ok(WriteSet::new().put("StageRow", self.field, Arc::new(out)))
+            }
+        }
+
+        async fn run_n(n: usize) -> Vec<(f64, f64)> {
+            let mut p = Pipeline::new("stage");
+            p.data.register_component::<StageRow>().unwrap();
+            let rows: Vec<StageRow> = (0..n)
+                .map(|i| StageRow {
+                    seed: i as f64,
+                    a: 0.0,
+                    b: 0.0,
+                })
+                .collect();
+            p.data.append::<StageRow>(&rows).unwrap();
+            p.add_parallel_system(Scale {
+                field: "a",
+                factor: 2.0,
+            });
+            p.add_parallel_system(Scale {
+                field: "b",
+                factor: 3.0,
+            });
+            p.run().await.unwrap();
+
+            let a = p.data.column::<StageRow>("a").unwrap();
+            let b = p.data.column::<StageRow>("b").unwrap();
+            let a = a.as_any().downcast_ref::<Float64Array>().unwrap();
+            let b = b.as_any().downcast_ref::<Float64Array>().unwrap();
+            (0..n).map(|i| (a.value(i), b.value(i))).collect()
+        }
+
+        let small = run_n(10).await; // inline path
+        let large = run_n(STAGE_INLINE_THRESHOLD as usize + 16).await; // dispatched path
+
+        for (i, (a, b)) in small.iter().enumerate() {
+            assert!((a - i as f64 * 2.0).abs() < 1e-9, "row {i} field a");
+            assert!((b - i as f64 * 3.0).abs() < 1e-9, "row {i} field b");
+            assert_eq!((*a, *b), large[i], "row {i} differs between paths");
+        }
     }
 }

@@ -95,7 +95,7 @@ fn generate_blob_batch(n: usize, seed: u64) -> RecordBatch {
         }
     }
 
-    let arr = FixedSizeBinaryArray::try_from_iter(flat.chunks_exact(128))
+    let arr = FixedSizeBinaryArray::try_from_iter(flat.as_chunks::<128>().0.iter())
         .expect("FixedSizeBinaryArray construction failed");
 
     let schema = Blob::schema();
@@ -108,7 +108,7 @@ fn zero_hash_batch(n: usize) -> RecordBatch {
     let zero: Vec<u8> = vec![0u8; 32];
     // Repeat the zero slice n times
     let flat: Vec<u8> = zero.iter().cloned().cycle().take(n * 32).collect();
-    let arr = FixedSizeBinaryArray::try_from_iter(flat.chunks_exact(32))
+    let arr = FixedSizeBinaryArray::try_from_iter(flat.as_chunks::<32>().0.iter())
         .expect("zero_hash_batch construction failed");
     RecordBatch::try_new(Hash::schema(), vec![Arc::new(arr)])
         .expect("zero_hash_batch: RecordBatch construction failed")
@@ -134,7 +134,8 @@ fn hashes_to_array(flat: Vec<u8>, n: usize) -> Arc<dyn arrow_array::Array> {
         return Arc::new(FixedSizeBinaryArray::new_null(32, 0));
     }
     Arc::new(
-        FixedSizeBinaryArray::try_from_iter(flat.chunks_exact(32)).expect("hashes_to_array failed"),
+        FixedSizeBinaryArray::try_from_iter(flat.as_chunks::<32>().0.iter())
+            .expect("hashes_to_array failed"),
     )
 }
 

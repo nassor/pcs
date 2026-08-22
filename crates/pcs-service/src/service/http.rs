@@ -396,6 +396,10 @@ struct StandaloneStatusBody {
     source_batches_drained: u64,
     sink_batches_written: u64,
     iteration_errors: u64,
+    /// Sum of per-item processing time; stream mode only (0 in batch mode).
+    total_busy_micros: u64,
+    /// Slowest single item; stream mode only (0 in batch mode).
+    max_item_micros: u64,
 }
 
 #[derive(Serialize)]
@@ -453,6 +457,8 @@ async fn handle_status(State(state): State<ServiceState>) -> impl IntoResponse {
                     source_batches_drained: stats.source_batches_drained,
                     sink_batches_written: stats.sink_batches_written,
                     iteration_errors: stats.iteration_errors,
+                    total_busy_micros: stats.total_busy_micros,
+                    max_item_micros: stats.max_item_micros,
                 })
             }
             None => Some(StandaloneStatusBody {
@@ -461,6 +467,8 @@ async fn handle_status(State(state): State<ServiceState>) -> impl IntoResponse {
                 source_batches_drained: 0,
                 sink_batches_written: 0,
                 iteration_errors: 0,
+                total_busy_micros: 0,
+                max_item_micros: 0,
             }),
         }
     } else {

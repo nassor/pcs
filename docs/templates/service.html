@@ -115,7 +115,7 @@ cargo install --path crates/pcs-service --features service-cluster,wasm</code></
         </tr>
         <tr>
             <td><strong>Pacing</strong></td>
-            <td><code>[run_mode]</code>: <code>continuous</code>, <code>one_shot</code>, or <code>interval</code>.</td>
+            <td><code>[run_mode]</code>: <code>continuous</code>, <code>one_shot</code>, <code>interval</code>, or <code>stream</code>.</td>
             <td>As fast as claims arrive, until cancelled.</td>
         </tr>
         <tr>
@@ -137,6 +137,82 @@ cargo install --path crates/pcs-service --features service-cluster,wasm</code></
     each sink, publish the stats snapshot, <code>dataset.clear()</code>, then sleep
     according to <code>[run_mode]</code>. <code>continuous</code> pauses 100&nbsp;ms
     between iterations; <code>one_shot</code> exits after the first.
+</p>
+
+<h3 id="stream-mode">Stream mode</h3>
+
+<p>
+    <code>[run_mode] kind = "stream"</code> replaces that loop with a per-item one. Each
+    <code>RecordBatch</code> the source yields &mdash; typically one row &mdash; is
+    appended to a cleared dataset, pushed through the runtime, and drained to every sink
+    before the next item is pulled. There is no inter-item sleep: latency is bounded by
+    the pipeline, not by a pacing timer. Sinks are drained per item but
+    <code>finish()</code> is called once, at exit.
+</p>
+
+<table class="rule-table">
+    <thead><tr><th></th><th><code>kind = "stream"</code></th></tr></thead>
+    <tbody>
+        <tr>
+            <td><strong>Sources</strong></td>
+            <td>Exactly one, enforced at config-validation time. Cluster mode is not supported.</td>
+        </tr>
+        <tr>
+            <td><strong>Invocation</strong></td>
+            <td>One <code>run-batch</code> call per received batch. No coalescing &mdash; the producer chooses the item size.</td>
+        </tr>
+        <tr>
+            <td><strong>Guest state</strong></td>
+            <td>The checkpoint blob returned by one item is handed back as the next item's <code>prior</code>, so guest state survives even though the store does not.</td>
+        </tr>
+        <tr>
+            <td><strong>Durability</strong></td>
+            <td>At-most-once. The state blob lives in loop memory only: it is never checkpointed and is lost on restart. A failed item is logged, counted, and dropped; <code>prior</code> is left at the last good value.</td>
+        </tr>
+        <tr>
+            <td><strong>Stats</strong></td>
+            <td><code>iterations</code> counts items; <code>total_busy_micros</code> and <code>max_item_micros</code> report per-item cost. <code>/status</code> is refreshed at most every 100&nbsp;ms &mdash; a per-item lock write would dominate the budget.</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>stream mode with the TCP ingest source</em></div>
+    <pre><code class="language-toml">mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/var/lib/pcs/node-1"
+
+[run_mode]
+kind = "stream"
+
+[[sources]]
+name = "ticks"
+type = "tcp"
+target_component = "Tick"
+
+[sources.config]
+bind = "0.0.0.0:9500"       # required
+buffer = 64                 # decoded batches queued before backpressure (default 64)
+max_frame_bytes = 8388608   # per-frame cap, 8 MiB default
+
+[[sources.config.schema_fields]]
+name = "price"
+type = "Float64"
+nullable = false</code></pre>
+</div>
+
+<p>
+    <code>type = "tcp"</code> is a live source: it never reaches EOF, so config validation
+    rejects it outside standalone stream mode &mdash; the batch loop's drain would block on
+    it forever. Producers send one frame per item: a <code>u32</code> <b>big-endian</b>
+    length prefix followed by that many bytes of Arrow IPC <em>stream</em> payload (schema
+    header plus exactly one <code>RecordBatch</code>), the same framing the Raft transport
+    uses. Closing the connection between frames is a normal disconnect. An oversized frame,
+    an undecodable payload, or a schema mismatch closes that one connection and is logged;
+    the listener and every other producer keep running. Concurrent connections are
+    accepted; ordering holds within a connection, not across them.
 </p>
 
 <p>
@@ -184,8 +260,9 @@ id = 1                            # u64, unique and stable across restarts
 name = "pcs-1"                    # optional label for logs and /status
 data_dir = "/var/lib/pcs/node-1"  # must be non-empty; the cluster runner writes here
 
-# Standalone pacing. kind = "continuous" | "one_shot" | "interval".
+# Standalone pacing. kind = "continuous" | "one_shot" | "interval" | "stream".
 # interval_ms applies to "interval" only. Defaults to continuous if omitted.
+# "stream" processes each arriving batch individually; see Stream mode above.
 [run_mode]
 kind = "interval"
 interval_ms = 5000

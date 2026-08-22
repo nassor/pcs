@@ -652,6 +652,24 @@ fn bench_q6(c: &mut Criterion) {
         })
     });
 
+    // Decomposition: how much of `narrow_pcs` / `wide_pcs` is per-iteration
+    // dataset construction rather than stage execution? `build_*_pipeline`
+    // allocates and zero-fills a fresh 1M-row Revenue column every iteration,
+    // which the scalar baselines never do.
+    group.bench_function("narrow_pcs_setup_only", |b| {
+        b.iter(|| {
+            let ds = build_narrow_pipeline(std::hint::black_box(&narrow_batch));
+            std::hint::black_box(ds.rows())
+        })
+    });
+
+    group.bench_function("wide_pcs_setup_only", |b| {
+        b.iter(|| {
+            let ds = build_wide_pipeline(std::hint::black_box(&wide_batch));
+            std::hint::black_box(ds.rows())
+        })
+    });
+
     group.bench_function("narrow_pcs", |b| {
         b.iter(|| {
             let mut wl = Pipeline::new("q6_narrow");

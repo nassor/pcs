@@ -138,6 +138,11 @@ name = "polyglot_orders"
 path = "examples/polyglot_orders.rs"
 required-features = ["wasm"]
 
+[[example]]
+name = "stream_latency"
+path = "examples/stream_latency.rs"
+required-features = ["service"]
+
 [[bench]]
 name = "distributed"
 harness = false

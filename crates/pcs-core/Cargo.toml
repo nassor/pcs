@@ -55,6 +55,11 @@ name = "pipeline"
 harness = false
 
 [[bench]]
+name = "batch_vs_stream"
+harness = false
+required-features = ["io"]
+
+[[bench]]
 name = "parallelism"
 harness = false
 

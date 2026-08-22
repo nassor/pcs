@@ -45,6 +45,8 @@ pub mod shutdown;
 #[cfg(feature = "service")]
 pub mod standalone;
 #[cfg(feature = "service")]
+pub mod stream;
+#[cfg(feature = "service")]
 pub mod validation;
 
 #[cfg(feature = "service")]
@@ -75,5 +77,7 @@ pub use registry::{Registry, SinkFactory, SourceFactory};
 pub use shutdown::ShutdownCoordinator;
 #[cfg(feature = "service")]
 pub use standalone::{StandaloneStats, run_standalone};
+#[cfg(feature = "service")]
+pub use stream::run_stream;
 #[cfg(feature = "service")]
 pub use validation::validate_io_coverage;

@@ -6,7 +6,7 @@
 //! ## Included factories
 //!
 //! - **IO sources** (feature = "io"): [`ParquetSourceFactory`], [`JsonSourceFactory`],
-//!   [`CsvSourceFactory`], [`ChannelSourceFactory`]
+//!   [`CsvSourceFactory`], [`ChannelSourceFactory`], [`TcpSourceFactory`]
 //! - **IO sinks** (feature = "io"): [`ParquetSinkFactory`], [`JsonSinkFactory`],
 //!   [`CsvSinkFactory`], [`ChannelSinkFactory`]
 //!
@@ -33,6 +33,8 @@ pub mod csv;
 pub mod json;
 #[cfg(feature = "io")]
 pub mod parquet;
+#[cfg(feature = "io")]
+pub mod tcp;
 
 #[cfg(feature = "io")]
 pub use channel::{ChannelSinkFactory, ChannelSourceFactory};
@@ -42,12 +44,14 @@ pub use csv::{CsvSinkFactory, CsvSourceFactory};
 pub use json::{JsonSinkFactory, JsonSourceFactory};
 #[cfg(feature = "io")]
 pub use parquet::{ParquetSinkFactory, ParquetSourceFactory};
+#[cfg(feature = "io")]
+pub use tcp::TcpSourceFactory;
 
 use super::builder::ServiceBuilder;
 
 /// Register all built-in IO factories into `builder`.
 ///
-/// This includes IO source/sink factories (Parquet, JSON, CSV, Channel) —
+/// This includes IO source/sink factories (Parquet, JSON, CSV, Channel, TCP) —
 /// all gated on `feature = "io"`. The runtime must be provided separately
 /// via [`ServiceBuilder::with_runtime`] or via `pipeline.wasm` in the config.
 ///
@@ -72,6 +76,7 @@ pub fn register_builtin_factories(builder: ServiceBuilder) -> ServiceBuilder {
         .register_source(JsonSourceFactory)
         .register_source(CsvSourceFactory)
         .register_source(ChannelSourceFactory)
+        .register_source(TcpSourceFactory)
         .register_sink(ParquetSinkFactory)
         .register_sink(JsonSinkFactory)
         .register_sink(CsvSinkFactory)

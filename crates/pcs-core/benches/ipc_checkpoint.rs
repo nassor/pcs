@@ -245,6 +245,16 @@ fn bench_ipc_at_size(c: &mut Criterion, n: usize) {
     group.finish();
 }
 
+/// Stream mode round-trips one checkpoint per item, so the single-row cost is
+/// the per-item state overhead, not an amortised bulk figure.
+fn bench_ipc_1(c: &mut Criterion) {
+    bench_ipc_at_size(c, 1);
+}
+
+fn bench_ipc_1k(c: &mut Criterion) {
+    bench_ipc_at_size(c, 1_000);
+}
+
 fn bench_ipc_10k(c: &mut Criterion) {
     bench_ipc_at_size(c, 10_000);
 }
@@ -257,5 +267,12 @@ fn bench_ipc_1m(c: &mut Criterion) {
     bench_ipc_at_size(c, 1_000_000);
 }
 
-criterion_group!(benches, bench_ipc_10k, bench_ipc_100k, bench_ipc_1m);
+criterion_group!(
+    benches,
+    bench_ipc_1,
+    bench_ipc_1k,
+    bench_ipc_10k,
+    bench_ipc_100k,
+    bench_ipc_1m
+);
 criterion_main!(benches);

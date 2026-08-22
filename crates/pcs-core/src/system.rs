@@ -155,6 +155,21 @@ pub trait System: Send + Sync {
 /// small batches.
 pub const SLICE_PARALLEL_THRESHOLD: u32 = 100_000;
 
+/// Minimum row count at or above which a stage containing multiple
+/// [`ParallelSystem`]s dispatches its systems concurrently, one
+/// `spawn_blocking` each. Below this, the systems in the stage run
+/// sequentially inline: dispatch plus write-set merging costs more than the
+/// work it parallelises.
+///
+/// Measured on a two-system stage (`benches/batch_vs_stream.rs`,
+/// `stage_dispatch` group), inline versus dispatched at equal row counts:
+/// inline wins 3.5× at 1 024 rows, 1.7× at 16 384, and 1.20× at 65 536;
+/// dispatch first wins at 131 072 (1.05×). The crossover therefore sits
+/// between 65 536 and 131 072, and this constant is placed inside that
+/// bracket — coincidentally the same order as
+/// [`SLICE_PARALLEL_THRESHOLD`].
+pub const STAGE_INLINE_THRESHOLD: u32 = 100_000;
+
 /// A processing unit that operates on an **immutable** [`Dataset`] view and
 /// produces a [`WriteSet`] for atomic write-back.
 ///

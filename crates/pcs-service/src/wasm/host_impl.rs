@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::bindings::{HostIo, LogLevel, TypesHost};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -14,13 +15,15 @@ pub struct HostState {
     /// Pipeline name, used to prefix log output.
     pub name: String,
     /// Key/value config extracted from the TOML `[pipeline.wasm.config]` table.
-    pub config: HashMap<String, String>,
+    /// Shared with the owning runtime — one `Arc` bump per guest call, no map
+    /// copy.
+    pub config: Arc<HashMap<String, String>>,
     pub wasi_ctx: WasiCtx,
     pub resource_table: ResourceTable,
 }
 
 impl HostState {
-    pub fn new(name: impl Into<String>, config: HashMap<String, String>) -> Self {
+    pub fn new(name: impl Into<String>, config: Arc<HashMap<String, String>>) -> Self {
         Self {
             name: name.into(),
             config,
@@ -97,10 +100,12 @@ mod tests {
     fn make_host(config: &[(&str, &str)]) -> HostState {
         HostState::new(
             "test-pipeline",
-            config
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            Arc::new(
+                config
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
         )
     }
 

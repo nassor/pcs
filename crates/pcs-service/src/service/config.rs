@@ -136,6 +136,11 @@ pub enum RunMode {
         /// Milliseconds between successive pipeline runs.
         interval_ms: u64,
     },
+    /// Process each source batch individually as it arrives (streaming).
+    ///
+    /// Requires exactly one declared source and standalone mode. No
+    /// inter-item sleep: latency is bounded by the pipeline itself.
+    Stream,
 }
 
 // ── StandaloneConfig ──────────────────────────────────────────────────────────
@@ -502,6 +507,27 @@ impl ServiceConfig {
                     self.sources.len()
                 )));
             }
+        }
+
+        // 2b. Standalone stream-mode constraints.
+        let stream_mode = matches!(
+            &self.mode,
+            ServiceMode::Standalone { config } if config.run_mode == RunMode::Stream
+        );
+        if stream_mode && self.sources.len() != 1 {
+            return Err(PcsError::configuration(format!(
+                "stream run mode requires exactly one 'sources:' entry ({} declared)",
+                self.sources.len()
+            )));
+        }
+
+        // A TCP source never reaches EOF, so the batch drain loop would block
+        // on it forever. Only the stream runner pulls one batch at a time.
+        if !stream_mode && self.sources.iter().any(|s| s.type_name == "tcp") {
+            return Err(PcsError::configuration(
+                "source type 'tcp' never reaches EOF; it requires standalone mode \
+                 with run_mode kind = \"stream\"",
+            ));
         }
 
         // 3. Source / sink component references and the presence of a pipeline
@@ -1021,6 +1047,96 @@ target_component = "orders"
             err.to_string().contains("source"),
             "error should mention sources: {err}"
         );
+    }
+
+    // ── Stream run mode ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_mode_stream_parses() {
+        let restored: RunMode = toml::from_str("kind = \"stream\"\n").expect("deserialize");
+        assert_eq!(restored, RunMode::Stream);
+    }
+
+    fn stream_toml(sources: &str) -> String {
+        format!(
+            r#"
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/tmp/pcs"
+
+[run_mode]
+kind = "stream"
+{sources}
+"#
+        )
+    }
+
+    const ONE_TCP_SOURCE: &str = r#"
+[[sources]]
+name = "ticks"
+type = "tcp"
+target_component = "Tick"
+"#;
+
+    #[test]
+    fn test_stream_mode_with_one_source_validates() {
+        let cfg: ServiceConfig = toml::from_str(&stream_toml(ONE_TCP_SOURCE)).expect("parse");
+        match &cfg.mode {
+            ServiceMode::Standalone { config } => assert_eq!(config.run_mode, RunMode::Stream),
+            _ => panic!("expected standalone"),
+        }
+        cfg.validate().expect("one source + stream mode is valid");
+    }
+
+    #[test]
+    fn test_stream_mode_requires_exactly_one_source() {
+        for (sources, count) in [
+            ("", 0usize),
+            (
+                r#"
+[[sources]]
+name = "a"
+type = "tcp"
+target_component = "Tick"
+
+[[sources]]
+name = "b"
+type = "tcp"
+target_component = "Tick"
+"#,
+                2,
+            ),
+        ] {
+            let cfg: ServiceConfig = toml::from_str(&stream_toml(sources)).expect("parse");
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(err.category(), "configuration", "got: {err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "stream run mode requires exactly one 'sources:' entry ({count} declared)"
+                )),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tcp_source_rejected_outside_stream_mode() {
+        let raw = format!(
+            r#"
+mode = "standalone"
+
+[node]
+id = 1
+data_dir = "/tmp/pcs"
+{ONE_TCP_SOURCE}
+"#
+        );
+        let cfg: ServiceConfig = toml::from_str(&raw).expect("parse");
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(err.to_string().contains("never reaches EOF"), "got: {err}");
     }
 
     // ── Keys the service cannot honour are rejected, not dropped ─────────────

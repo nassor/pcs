@@ -59,6 +59,12 @@ pub struct StandaloneStats {
     pub iteration_errors: u64,
     /// Wall-clock time from the first iteration to the last, in milliseconds.
     pub total_duration_ms: u64,
+    /// Sum of per-item processing time in microseconds. Stream mode only —
+    /// the batch loop leaves this at 0.
+    pub total_busy_micros: u64,
+    /// Slowest single item, in microseconds. Stream mode only — the batch
+    /// loop leaves this at 0.
+    pub max_item_micros: u64,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -67,7 +73,7 @@ pub struct StandaloneStats {
 ///
 /// Appropriate for service-lifetime strings (component names). The leaked
 /// allocation lives until the process exits, which is fine for a service runner.
-fn leak_str(s: String) -> &'static str {
+pub(super) fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
@@ -114,6 +120,12 @@ pub async fn run_standalone(
             ));
         }
     };
+
+    // Stream mode is a different loop shape entirely: one pipeline invocation
+    // per arriving batch, no inter-item pacing.
+    if run_mode == RunMode::Stream {
+        return super::stream::run_stream(built, cancel, live_stats).await;
+    }
 
     // Destructure BuiltService so we can hold runtime, sources, and sinks
     // without fighting the borrow checker. runtime is immutable (&self for
@@ -319,6 +331,9 @@ pub async fn run_standalone(
                     }
                 }
             }
+
+            // Dispatched to `super::stream::run_stream` before the loop starts.
+            RunMode::Stream => unreachable!("stream mode never reaches the batch loop"),
         }
     }
 

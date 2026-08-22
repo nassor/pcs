@@ -176,7 +176,7 @@
     <div class="positioning-col positioning-is">
         <div class="positioning-label">Reach for PCS when</div>
         <ul>
-            <li>Batches are <strong>100k&ndash;100M rows</strong> and latency is measured in seconds, not microseconds</li>
+            <li>Work arrives as <strong>batches of 100k&ndash;100M rows</strong>, or as a <strong>stream of individual items</strong></li>
             <li>The transform is <strong>imperative Rust</strong> that SQL expresses awkwardly</li>
             <li>Schemas are <strong>wide</strong> &mdash; tens to hundreds of columns, of which each step reads a few</li>
             <li>You need <strong>recovery time</strong> to be a design constraint, not an afterthought</li>
@@ -186,7 +186,7 @@
         <div class="positioning-label">Look elsewhere when</div>
         <ul>
             <li>You want <strong>SQL</strong> &mdash; there is no query planner here; DataFusion will win</li>
-            <li>You need <strong>sub-millisecond streaming</strong> &mdash; PCS is batch-first by design</li>
+            <li>You need <strong>hard real-time guarantees</strong> &mdash; stream mode is sub-millisecond per item in-process, but it is not a real-time scheduler</li>
             <li>You are building a <strong>game engine</strong> &mdash; the ECS vocabulary is a naming nod, nothing more</li>
             <li>Your data is <strong>under ~10k rows</strong> &mdash; a plain <code>Vec</code> will beat this</li>
         </ul>

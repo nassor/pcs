@@ -8,7 +8,7 @@ use pcs_core::{Dataset, PcsError, PcsResult};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
-use super::bindings::{PcsPipeline, PipelineDescriptor, RunError};
+use super::bindings::{PcsPipeline, PcsPipelinePre, PipelineDescriptor, RunError};
 use super::engine::WasmEngine;
 use super::host_impl::HostState;
 
@@ -19,14 +19,23 @@ use super::host_impl::HostState;
 /// 2. Calls the guest's `run-batch` export via wasmtime on a fresh `Store`.
 /// 3. Deserialises the output IPC bytes back, replacing the dataset contents.
 ///
+/// Linking (WASI-p2 + host-io) and instantiation planning happen **once**, at
+/// load time, producing a reusable [`PcsPipelinePre`]. A per-call `Store` is
+/// still created — guest linear memory never survives a batch, so the
+/// checkpoint blob remains the only channel for guest state — but the per-call
+/// cost is now store creation plus instantiation from the pre-built plan, not
+/// re-linking the whole WASI surface.
+///
 /// Guest traps are mapped to `PcsError::SystemExecution`. The epoch deadline
 /// (100 ms ticks) limits runaway guest execution.
 pub struct WasmPipelineRuntime {
     name: String,
     engine: WasmEngine,
-    /// Compiled component — reused across all calls (compilation is expensive).
-    component: Component,
-    config: HashMap<String, String>,
+    /// Pre-linked, pre-instantiation-planned component — reused across all
+    /// calls. Cloning is an `Arc` bump.
+    pre: PcsPipelinePre<HostState>,
+    /// Shared with every per-call `HostState`; never mutated after load.
+    config: Arc<HashMap<String, String>>,
     /// Per-call epoch deadline in ticks (100 ms / tick → `ticks * 100 ms`).
     epoch_deadline: u64,
     /// Cached descriptor, populated on first `describe()` call.
@@ -36,10 +45,11 @@ pub struct WasmPipelineRuntime {
 }
 
 impl WasmPipelineRuntime {
-    /// Compile a WASM component from raw bytes.
+    /// Compile a WASM component from raw bytes, then link and pre-instantiate it.
     ///
-    /// Compilation is synchronous and expensive; do this once at load time.
-    /// The resulting runtime is `Send` and can be wrapped in `Arc` for sharing.
+    /// Compilation and linking are synchronous and expensive; both happen here,
+    /// once. The resulting runtime is `Send` and can be wrapped in `Arc` for
+    /// sharing.
     pub fn from_bytes(
         engine: WasmEngine,
         name: impl Into<String>,
@@ -49,31 +59,6 @@ impl WasmPipelineRuntime {
     ) -> PcsResult<Self> {
         let component = Component::from_binary(&engine.engine, wasm_bytes)
             .map_err(|e| PcsError::Configuration(format!("wasm compile error: {e}")))?;
-        Ok(Self {
-            name: name.into(),
-            engine,
-            component,
-            config,
-            epoch_deadline: epoch_deadline_ticks,
-            descriptor: Mutex::new(None),
-            component_names: OnceLock::new(),
-        })
-    }
-
-    /// Build a fresh `Store` and instantiate the component.
-    ///
-    /// Associated rather than a method so it can run inside `spawn_blocking`
-    /// without borrowing `self` across the thread boundary.
-    fn make_store_and_instance(
-        engine: &WasmEngine,
-        component: &Component,
-        name: &str,
-        config: &HashMap<String, String>,
-        epoch_deadline: u64,
-    ) -> PcsResult<(Store<HostState>, PcsPipeline)> {
-        let host = HostState::new(name.to_string(), config.clone());
-        let mut store = Store::new(&engine.engine, host);
-        store.set_epoch_deadline(epoch_deadline);
 
         let mut linker: Linker<HostState> = Linker::new(&engine.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
@@ -81,21 +66,62 @@ impl WasmPipelineRuntime {
         PcsPipeline::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)
             .map_err(|e| PcsError::Configuration(format!("wasm linker error: {e}")))?;
 
-        let instance = PcsPipeline::instantiate(&mut store, component, &linker)
+        let instance_pre = linker
+            .instantiate_pre(&component)
+            .map_err(|e| PcsError::Configuration(format!("wasm pre-instantiate error: {e}")))?;
+        let pre = PcsPipelinePre::new(instance_pre)
+            .map_err(|e| PcsError::Configuration(format!("wasm binding error: {e}")))?;
+
+        Ok(Self {
+            name: name.into(),
+            engine,
+            pre,
+            config: Arc::new(config),
+            epoch_deadline: epoch_deadline_ticks,
+            descriptor: Mutex::new(None),
+            component_names: OnceLock::new(),
+        })
+    }
+
+    /// Build a fresh `Store` and instantiate the pre-linked component.
+    ///
+    /// Associated rather than a method so it can run inside `spawn_blocking`
+    /// without borrowing `self` across the thread boundary.
+    fn make_store_and_instance(
+        engine: &WasmEngine,
+        pre: &PcsPipelinePre<HostState>,
+        name: &str,
+        config: Arc<HashMap<String, String>>,
+        epoch_deadline: u64,
+    ) -> PcsResult<(Store<HostState>, PcsPipeline)> {
+        let host = HostState::new(name.to_string(), config);
+        let mut store = Store::new(&engine.engine, host);
+        store.set_epoch_deadline(epoch_deadline);
+
+        let instance = pre
+            .instantiate(&mut store)
             .map_err(|e| PcsError::SystemExecution(format!("guest trap (instantiate): {e}")))?;
 
         Ok((store, instance))
     }
 
     /// Everything `self` contributes to a guest call, owned so the call can be
-    /// moved onto a blocking thread. All three clones are `Arc` bumps or a
-    /// small config map.
-    fn call_parts(&self) -> (WasmEngine, Component, String, HashMap<String, String>, u64) {
+    /// moved onto a blocking thread. Every clone is an `Arc` bump or a short
+    /// string.
+    fn call_parts(
+        &self,
+    ) -> (
+        WasmEngine,
+        PcsPipelinePre<HostState>,
+        String,
+        Arc<HashMap<String, String>>,
+        u64,
+    ) {
         (
             self.engine.clone(),
-            self.component.clone(),
+            self.pre.clone(),
             self.name.clone(),
-            self.config.clone(),
+            Arc::clone(&self.config),
             self.epoch_deadline,
         )
     }
@@ -112,9 +138,9 @@ impl WasmPipelineRuntime {
             }
         }
 
-        let (engine, component, name, config, epoch_deadline) = self.call_parts();
+        let (engine, pre, name, config, epoch_deadline) = self.call_parts();
         let (mut store, instance) =
-            Self::make_store_and_instance(&engine, &component, &name, &config, epoch_deadline)?;
+            Self::make_store_and_instance(&engine, &pre, &name, config, epoch_deadline)?;
         let iface = instance.pcs_pipeline_pipeline();
         let desc = iface
             .call_describe(&mut store)
@@ -165,7 +191,7 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
         // slice has to be owned for the call; the copy is state-blob-sized and
         // sits next to the full-dataset IPC serialisation above.
         let prior_owned = prior.map(<[u8]>::to_vec);
-        let (engine, component, name, config, epoch_deadline) = self.call_parts();
+        let (engine, pre, name, config, epoch_deadline) = self.call_parts();
 
         // The guest is linked against the *synchronous* WASI implementation
         // (`add_to_linker_sync`). Any WASI import the guest touches routes
@@ -180,7 +206,7 @@ impl pcs_core::runtime::PipelineRuntime for WasmPipelineRuntime {
         // boundary: IPC bytes in, IPC bytes out.
         let joined = tokio::task::spawn_blocking(move || -> PcsResult<_> {
             let (mut store, instance) =
-                Self::make_store_and_instance(&engine, &component, &name, &config, epoch_deadline)?;
+                Self::make_store_and_instance(&engine, &pre, &name, config, epoch_deadline)?;
             instance
                 .pcs_pipeline_pipeline()
                 .call_run_batch(&mut store, &ipc_bytes, prior_owned.as_ref())

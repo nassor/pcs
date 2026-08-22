@@ -19,6 +19,9 @@ pub mod json_sink;
 pub mod json_source;
 pub mod parquet_sink;
 pub mod parquet_source;
+/// Live TCP ingest — requires the `service` feature (tokio net + io-util).
+#[cfg(feature = "service")]
+pub mod tcp_source;
 
 // Convenient re-exports.
 pub use cast::{CastingSource, build_target_schema, cast_batch};
@@ -32,6 +35,8 @@ pub use parquet_sink::ParquetSink;
 pub use parquet_source::ParquetSource;
 pub use sink::{Sink, drain_dataset};
 pub use source::{Source, drain_into_dataset};
+#[cfg(feature = "service")]
+pub use tcp_source::TcpIngestSource;
 
 // DataFusion integration — requires `datafusion` feature.
 #[cfg(feature = "datafusion")]

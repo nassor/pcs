@@ -50,40 +50,10 @@ organises game entities as components that systems act on each frame, PCS organi
 PCS is service-first. You do not deploy a binary containing your pipeline — you deploy
 `pcs-service` once and hand it WebAssembly components.
 
-```mermaid
-flowchart LR
-    subgraph AUTHOR["1 · You write"]
-        direction TB
-        C["Component<br/><i>a struct, stored as Arrow columns</i>"]
-        S["System<br/><i>a transform + its field declarations</i>"]
-        P["Pipeline<br/><i>components + systems</i>"]
-        C --> P
-        S --> P
-    end
-
-    subgraph BUILD["2 · You build"]
-        direction TB
-        W["pipeline.wasm<br/><i>wasm32-wasip2 component</i>"]
-    end
-
-    subgraph RUN["3 · pcs-service runs"]
-        direction TB
-        SRC["Sources<br/><i>CSV · JSON · Parquet</i>"]
-        HOST["Host<br/><i>loads · validates · drives</i>"]
-        SNK["Sinks<br/><i>CSV · JSON · Parquet</i>"]
-        SRC -- "Arrow IPC" --> HOST
-        HOST -- "Arrow IPC" --> SNK
-    end
-
-    subgraph SCALE["4 · Optionally, at scale"]
-        direction TB
-        R["Raft cluster<br/><i>row-range leases · checkpoints</i>"]
-    end
-
-    P -- "cargo component build" --> W
-    W -- "named in config.toml" --> HOST
-    HOST -.-> R
-```
+<p align="center">
+  <img src="docs/static/end-to-end.svg" width="880"
+       alt="End to end: you write Component, System, and Pipeline structs; cargo component build produces pipeline.wasm, a wasm32-wasip2 component; pcs-service loads the component named in config.toml and drives Arrow IPC from sources through the host to sinks; optionally the host coordinates a Raft cluster with row-range leases and checkpoints.">
+</p>
 
 The guest component owns the DAG, the stage plan, and retry. The host owns IO,
 checkpointing, distribution, and the HTTP control plane. Data crosses the boundary as

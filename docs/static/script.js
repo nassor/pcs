@@ -53,7 +53,9 @@
       if (!isExternal(link)) return;
       link.setAttribute('target', '_blank');
       link.setAttribute('rel', 'noopener noreferrer');
-      link.classList.add('is-external');
+      // Image-only links (e.g. the CI badge) get no ↗ mark: the glyph wraps
+      // below the image and knocks it out of line with its neighbours.
+      if (!link.querySelector('img')) link.classList.add('is-external');
     });
 
     // ------------------------------------------------------------------------

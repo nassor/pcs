@@ -49,6 +49,7 @@ arrow-schema = { workspace = true }
 arrow-ipc    = { workspace = true }
 tempfile     = { workspace = true }
 sha3         = { workspace = true }
+mimalloc = "0.1.52"
 
 [[bench]]
 name = "pipeline"

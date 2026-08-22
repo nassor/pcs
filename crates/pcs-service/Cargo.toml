@@ -8,6 +8,9 @@ description = "The pcs-service binary: TOML configuration, factory registry, axu
 license.workspace = true
 
 [features]
+# The binary ships with mimalloc by default; see performance-improvement.md
+# round 1. Opt out with `--no-default-features` plus the features you want.
+default = ["mimalloc"]
 tracing = ["dep:tracing", "pcs-core/tracing"]
 io = [
     "dep:arrow-json",
@@ -36,6 +39,7 @@ service = [
     "dep:clap", "dep:reqwest",
 ]
 service-cluster = ["service", "distributed-raft"]
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 pcs-core = { path = "../pcs-core" }
@@ -85,6 +89,7 @@ parquet       = { workspace = true, optional = true }
 
 # DataFusion integration
 datafusion    = { version = "55", default-features = false, features = ["sql", "parquet"], optional = true }
+mimalloc = { version = "0.1.52", optional = true }
 
 [[bin]]
 name = "pcs-service"
@@ -182,4 +187,5 @@ prometheus     = { version = "0.14", default-features = false }
 num_cpus       = { workspace = true }
 rayon          = { workspace = true }
 serde_arrow    = { workspace = true }
+mimalloc = "0.1.52"
 

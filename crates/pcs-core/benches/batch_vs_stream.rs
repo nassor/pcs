@@ -45,6 +45,13 @@ use pcs_core::system::{
     ParallelSystem, STAGE_INLINE_THRESHOLD, System, SystemMeta, WriteSet, system_fn,
 };
 
+// PCS deploys with mimalloc (see `pcs-service`'s `mimalloc` feature). Windows'
+// heap sends allocations over ~512 KB straight to VirtualAlloc and releases
+// them on free, so pipelines that churn multi-MB Arrow arrays per batch
+// re-fault them every time. Benchmark the allocator we actually ship.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Q6 predicate constants, same as `tpch_q6`.
 const SHIPDATE_GE: i32 = 8766; // 1994-01-01
 const SHIPDATE_LT: i32 = 9131; // 1995-01-01

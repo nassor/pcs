@@ -18,6 +18,20 @@ use clap::Parser;
 mod cli;
 mod commands;
 
+// A pipeline allocates and frees its output Arrow arrays once per batch, and
+// those are routinely multi-megabyte. Windows' heap sends allocations above
+// ~512 KB straight to `VirtualAlloc` and hands the pages back on free, so the
+// next batch soft-faults all of them again; glibc's arena behaviour is milder
+// but not free either. mimalloc retains large blocks instead, which measured
+// 2.3x on `tpch_q6/narrow_pcs` and 2.6x on `wide_pcs`. See
+// `performance-improvement.md`, round 1.
+//
+// Opt out with `--no-default-features` plus the feature set you want; the
+// library itself never installs an allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let parsed = cli::Cli::parse();

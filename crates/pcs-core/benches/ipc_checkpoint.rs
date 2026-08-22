@@ -27,6 +27,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use pcs_core::dataset::Dataset;
 use serde::{Deserialize, Serialize};
 
+// PCS deploys with mimalloc (see `pcs-service`'s `mimalloc` feature). Windows'
+// heap sends allocations over ~512 KB straight to VirtualAlloc and releases
+// them on free, so pipelines that churn multi-MB Arrow arrays per batch
+// re-fault them every time. Benchmark the allocator we actually ship.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ---------------------------------------------------------------------------
 // Component — 10-column mixed schema (3×i64, 3×f64, 2×str, 1×bool, 1×nullable f64)
 // ---------------------------------------------------------------------------

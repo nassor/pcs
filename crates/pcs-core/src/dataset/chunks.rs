@@ -60,11 +60,27 @@ impl Dataset {
     ///    `HashMap` reallocations (the `Box` pointer moves; the heap
     ///    allocation it points to does not).
     /// 2. We hold `&self`, so no `&mut Dataset` can coexist.
-    /// 3. The `Mutex` serialises concurrent `&self` reads that both trigger
+    /// 3. The `RwLock` serialises concurrent `&self` reads that both trigger
     ///    cache population, preventing data races on the `HashMap` itself.
     pub(super) fn get_or_build_merged(&self, name: &'static str) -> &RecordBatch {
-        let mut cache = self.merged_cache.lock().unwrap();
+        // Fast path: a shared read. A sliced system calls `batch_for` once per
+        // slice, and with oversubscribed chunking that is hundreds of calls
+        // arriving from every worker thread at once. An exclusive lock here
+        // serialises the whole fan-out.
+        {
+            let cache = self.merged_cache.read().unwrap();
+            if let Some(boxed) = cache.get(name) {
+                // SAFETY: see method-level doc comment.
+                let ptr: *const RecordBatch = boxed.as_ref();
+                drop(cache);
+                return unsafe { &*ptr };
+            }
+        }
 
+        let mut cache = self.merged_cache.write().unwrap();
+
+        // Re-check: another thread may have populated the entry while this one
+        // was upgrading from the read lock.
         if let Some(boxed) = cache.get(name) {
             // SAFETY: see method-level doc comment.
             let ptr: *const RecordBatch = boxed.as_ref();

@@ -19,7 +19,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, OnceLock, RwLock},
 };
 
 use arrow_array::RecordBatch;
@@ -67,7 +67,7 @@ pub(crate) fn intern_component_name(name: &str) -> &'static str {
 /// rows in total. The alive bitmap also has exactly `row_count` bits.
 pub struct Dataset {
     pub(crate) components: HashMap<&'static str, Vec<RecordBatch>>,
-    merged_cache: Mutex<HashMap<&'static str, Box<RecordBatch>>>,
+    merged_cache: RwLock<HashMap<&'static str, Box<RecordBatch>>>,
     schemas: SchemaRegistry,
     row_count: usize,
     alive: BooleanBufferBuilder,
@@ -99,7 +99,7 @@ impl Dataset {
     pub fn new() -> Self {
         Self {
             components: HashMap::new(),
-            merged_cache: Mutex::new(HashMap::new()),
+            merged_cache: RwLock::new(HashMap::new()),
             schemas: SchemaRegistry::new(),
             row_count: 0,
             alive: BooleanBufferBuilder::new(0),

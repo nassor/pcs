@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use arrow_array::{ArrayRef, RecordBatch};
 
 use crate::component::Component;
@@ -84,7 +82,12 @@ impl Dataset {
     pub fn apply_write_set(&mut self, write_set: crate::system::WriteSet) -> Result<(), PcsError> {
         self.flush_all_pending()?;
 
-        let mut by_component: HashMap<&'static str, Vec<(&'static str, ArrayRef)>> = HashMap::new();
+        // Write sets touch one component in the overwhelming majority of cases
+        // and a handful at most, so group with a `Vec` and a linear scan. A
+        // `HashMap` here allocates and hashes on a path that stream mode runs
+        // once per item.
+        let mut by_component: Vec<(&'static str, Vec<(&'static str, ArrayRef)>)> =
+            Vec::with_capacity(1);
         for ((component, field), array) in write_set.fields {
             if array.len() != self.row_count {
                 return Err(PcsError::generic(format!(
@@ -94,10 +97,10 @@ impl Dataset {
                     self.row_count
                 )));
             }
-            by_component
-                .entry(component)
-                .or_default()
-                .push((field, array));
+            match by_component.iter_mut().find(|(name, _)| *name == component) {
+                Some((_, updates)) => updates.push((field, array)),
+                None => by_component.push((component, vec![(field, array)])),
+            }
         }
 
         for (component_name, field_updates) in by_component {

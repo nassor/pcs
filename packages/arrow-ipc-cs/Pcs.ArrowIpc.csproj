@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Arrow IPC codec for PCS WebAssembly guests, as a plain net10.0 library.
+       No RuntimeIdentifier and no NuGet dependencies: only the component project
+       that references this one carries wasi-wasm, SelfContained and
+       PublishTrimmed. The codec uses no reflection, so it needs no trimmer
+       roots. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Pcs.ArrowIpc</RootNamespace>
+    <AssemblyName>Pcs.ArrowIpc</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Pcs.ArrowIpc</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Nassor Frazier-Silva</Authors>
+    <Description>Arrow IPC codec for PCS WebAssembly guests: base class library only.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/nassor/pcs</PackageProjectUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- tests/ is a separate host-targeted project that references this one. The
+         default glob would otherwise pull its xunit sources into the library. -->
+    <Compile Remove="tests/**" />
+    <None Include="README.md" Pack="true" PackagePath="" />
+    <None Include="LICENSE" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+</Project>

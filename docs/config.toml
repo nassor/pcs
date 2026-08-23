@@ -1,0 +1,114 @@
+base_url = "https://nassor.github.io/pcs"
+title = "PCS Documentation"
+description = "Distributed Batch Processing for Rust, on Apache Arrow."
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+
+# Output to docs/public so GitHub Pages workflow can upload it.
+output_dir = "public"
+
+# Pretty URLs (default true): /world.md → /world/
+[markdown]
+render_emoji = false
+
+[extra]
+github_repo = "https://github.com/nassor/pcs"
+crates_io = "https://crates.io/crates/pcs"
+docs_rs = "https://docs.rs/pcs"
+
+# The reading order, declared once. `base.html` renders the sidebar, the
+# breadcrumb and the previous/next pager from this list, so all three agree.
+[[extra.nav]]
+label = "Start"
+[[extra.nav.items]]
+title = "What PCS is"
+path = "/"
+
+[[extra.nav]]
+label = "Native"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/native/_index.md"
+[[extra.nav.items]]
+title = "Build your first pipeline"
+path = "@/native/tutorial.md"
+
+[[extra.nav]]
+label = "Core concepts"
+[[extra.nav.items]]
+title = "Dataset & Components"
+path = "@/dataset.md"
+[[extra.nav.items]]
+title = "Systems"
+path = "@/systems.md"
+[[extra.nav.items]]
+title = "Pipeline"
+path = "@/pipeline.md"
+[[extra.nav.items]]
+title = "Scheduler"
+path = "@/scheduler.md"
+
+[[extra.nav]]
+label = "WebAssembly guests"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/guests/_index.md"
+[[extra.nav.items]]
+title = "The WIT contract"
+path = "@/guests/wit-contract.md"
+[[extra.nav.items]]
+title = "A Rust guest"
+path = "@/guests/rust.md"
+[[extra.nav.items]]
+title = "A Go guest"
+path = "@/guests/go.md"
+[[extra.nav.items]]
+title = "A Python guest"
+path = "@/guests/python.md"
+[[extra.nav.items]]
+title = "A TypeScript guest"
+path = "@/guests/typescript.md"
+[[extra.nav.items]]
+title = "A Kotlin guest"
+path = "@/guests/kotlin.md"
+[[extra.nav.items]]
+title = "A C# guest"
+path = "@/guests/csharp.md"
+[[extra.nav.items]]
+title = "Six languages, one pipeline"
+path = "@/guests/six-languages.md"
+
+[[extra.nav]]
+label = "Moving data"
+[[extra.nav.items]]
+title = "Sources & Sinks"
+path = "@/io.md"
+
+[[extra.nav]]
+label = "Running at scale"
+[[extra.nav.items]]
+title = "Distributed Runner"
+path = "@/distributed.md"
+[[extra.nav.items]]
+title = "Service"
+path = "@/service.md"
+[[extra.nav.items]]
+title = "Operating pcs-service"
+path = "@/operations/running-pcs.md"
+
+[[extra.nav]]
+label = "Reference"
+[[extra.nav.items]]
+title = "Host to guest wire format"
+path = "@/reference/wire-format.md"
+[[extra.nav.items]]
+title = "The Arrow codec packages"
+path = "@/reference/arrow-ipc-packages.md"
+[[extra.nav.items]]
+title = "Tracing"
+path = "@/tracing.md"
+[[extra.nav.items]]
+title = "Benchmarks"
+path = "@/benchmarks/_index.md"

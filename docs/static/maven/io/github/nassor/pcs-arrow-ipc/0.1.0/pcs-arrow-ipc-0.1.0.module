@@ -1,0 +1,169 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.github.nassor",
+    "module": "pcs-arrow-ipc",
+    "version": "0.1.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14.4"
+    }
+  },
+  "variants": [
+    {
+      "name": "metadataApiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "pcs-arrow-ipc-metadata-0.1.0.jar",
+          "url": "pcs-arrow-ipc-0.1.0.jar",
+          "size": 4279,
+          "sha512": "5226c0ab6cb120ef8a48bb5577790a5cedd56a1e902f96cc424afb2a031d992a6f9758b3578cb498874e64a84ccf509939e766dee6f819cdd1f3b069a6433c57",
+          "sha256": "0dc3385eb231a05b1cf71514f22daecb5c8e58e2596d32dcf20eae1ce0c72628",
+          "sha1": "25ae631ad47cff12a4e3d173c1469dab73437dee",
+          "md5": "ff4f03cf445b84bb9c868f0bf2cec729"
+        }
+      ]
+    },
+    {
+      "name": "metadataSourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "files": [
+        {
+          "name": "pcs-arrow-ipc-kotlin-0.1.0-sources.jar",
+          "url": "pcs-arrow-ipc-0.1.0-sources.jar",
+          "size": 9072,
+          "sha512": "5c029d42731bedb0a7f053f2a7c0cc1093e20db7624d4424bb2106c09c1693dec48950438f561dc636d2bfa542ccbb50b61b393e2a944df4c1924ea56e8d90e6",
+          "sha256": "21eaba1a827f50125d5a6c24d885a2925529ac9de0b5af6ac289ff1ea03638a3",
+          "sha1": "1733f3ac20179897c12ba5114e86a5649514c532",
+          "md5": "c313ab88c56881d7beb397be2b87c3b4"
+        }
+      ]
+    },
+    {
+      "name": "jvmApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-jvm/0.1.0/pcs-arrow-ipc-jvm-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-jvm",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "name": "jvmRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-jvm/0.1.0/pcs-arrow-ipc-jvm-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-jvm",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "name": "jvmSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-jvm/0.1.0/pcs-arrow-ipc-jvm-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-jvm",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "name": "wasmWasiApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.platform.type": "wasm",
+        "org.jetbrains.kotlin.wasm.target": "wasi"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-wasm-wasi/0.1.0/pcs-arrow-ipc-wasm-wasi-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-wasm-wasi",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "name": "wasmWasiRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "wasm",
+        "org.jetbrains.kotlin.wasm.target": "wasi"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-wasm-wasi/0.1.0/pcs-arrow-ipc-wasm-wasi-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-wasm-wasi",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "name": "wasmWasiSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "wasm",
+        "org.jetbrains.kotlin.wasm.target": "wasi"
+      },
+      "available-at": {
+        "url": "../../pcs-arrow-ipc-wasm-wasi/0.1.0/pcs-arrow-ipc-wasm-wasi-0.1.0.module",
+        "group": "io.github.nassor",
+        "module": "pcs-arrow-ipc-wasm-wasi",
+        "version": "0.1.0"
+      }
+    }
+  ]
+}

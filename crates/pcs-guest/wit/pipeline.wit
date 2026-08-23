@@ -1,0 +1,116 @@
+package pcs:pipeline@0.2.0;
+
+// No `required-host-io-version` field on pipeline-descriptor: the WIT package
+// version (`@0.2.0`) already signals host-io compatibility.
+
+/// Types shared by the pipeline interface.
+interface types {
+    /// Arrow IPC stream bytes (schema + batches). Host serializes a Dataset
+    /// on input; guest re-serializes the (possibly mutated) Dataset on output.
+    type ipc-bytes = list<u8>;
+
+    /// Opaque guest-owned checkpoint blob. Host persists verbatim via
+    /// pcs-core CheckpointStore; guest owns the layout.
+    type checkpoint = list<u8>;
+
+    /// One component declared by the guest pipeline. `arrow-schema-ipc` is its
+    /// Arrow IPC schema message. Host validates source and sink component
+    /// targets against this list at load time.
+    record component-descriptor {
+        name: string,
+        arrow-schema-ipc: list<u8>,
+    }
+
+    /// Stable identity of the pipeline. Host gates config and checkpoint
+    /// compatibility on this. `schema-fingerprint` is computed from all
+    /// component schemas concatenated (see pcs-core SchemaRegistry).
+    record pipeline-descriptor {
+        name: string,
+        version: string,
+        components: list<component-descriptor>,
+        stateful: bool,
+        schema-fingerprint: string,
+    }
+
+    /// Lightweight metrics the guest reports after each batch. Host surfaces
+    /// to prometheus via host-io::metric.
+    record run-metrics {
+        wall-ns: u64,
+        rows-in: u64,
+        rows-out: u64,
+        systems-run: u32,
+        retries: u32,
+    }
+
+    record run-result {
+        output: ipc-bytes,
+        checkpoint: option<checkpoint>,
+        metrics: run-metrics,
+    }
+
+    /// Structured errors so the host can distinguish "release claim and retry"
+    /// from "ack claim and surface to operator". Variant names match the
+    /// DistributedRunner vocabulary: `retryable` maps to `release_claim`,
+    /// `permanent` to `ack_claim`.
+    variant run-error {
+        /// Transient failure worth retrying. Host releases the claim and
+        /// retries next tick.
+        retryable(string),
+        /// Permanent failure: bad input shape, guest logic bug, unknown error.
+        /// Host acks the claim, logs, and surfaces it to /status.
+        permanent(string),
+        /// Reserved for a future startup-time schema check. `run-batch` MUST
+        /// NOT emit this; a mid-batch schema error folds into `permanent`.
+        schema-mismatch(string),
+    }
+}
+
+/// Host capabilities the guest may call during run-batch: logging, metric
+/// counters, static config read. No filesystem, no network, no clock.
+interface host-io {
+    enum log-level { trace, debug, info, warn, error }
+
+    /// Structured log line bridged to tracing on the host.
+    log: func(level: log-level, target: string, message: string);
+
+    /// Increment or observe a named metric. Host routes to prometheus.
+    /// Value is f64 to cover counters, gauges, and histograms.
+    metric: func(name: string, value: f64);
+
+    /// Pull a string-typed config value the host injected via
+    /// `pipeline.wasm.config` in service TOML. Returns none if absent.
+    /// Guest is expected to parse numerics itself.
+    get-config: func(key: string) -> option<string>;
+}
+
+/// The sole guest export. All functions are sync from the WIT perspective;
+/// the host wraps each call in spawn_blocking + epoch interruption.
+interface pipeline {
+    use types.{pipeline-descriptor, ipc-bytes, checkpoint, run-result, run-error};
+
+    /// Called once at load time. Host validates the descriptor against
+    /// ServiceConfig (declared components cover sources/sinks, schema
+    /// fingerprint matches any persisted checkpoint).
+    describe: func() -> pipeline-descriptor;
+
+    /// The hot path. Host marshals the partition batch to Arrow IPC and hands
+    /// it in with the guest's state blob from the previous batch. The guest
+    /// runs its Pipeline::run_on DAG against a fresh Dataset and returns IPC
+    /// bytes, the updated state blob, and metrics.
+    ///
+    /// `prior` is `none` on the first batch after a cold start. Whatever the
+    /// guest returns in `run-result.checkpoint` is persisted verbatim by the
+    /// host and handed back as the next call's `prior`; a stateless guest
+    /// returns `none`. This is the only channel for guest state: the host
+    /// creates a fresh wasmtime Store per call, so guest linear memory never
+    /// survives a batch boundary.
+    ///
+    /// Invariant: run-batch MUST NOT return run-error::schema-mismatch. A
+    /// mismatch surfacing mid-batch is a guest bug and folds into `permanent`.
+    run-batch: func(input: ipc-bytes, prior: option<checkpoint>) -> result<run-result, run-error>;
+}
+
+world pcs-pipeline {
+    import host-io;
+    export pipeline;
+}

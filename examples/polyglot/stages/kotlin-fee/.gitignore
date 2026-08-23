@@ -1,0 +1,13 @@
+# Gradle and Kotlin build state.
+build/
+.gradle/
+.kotlin/
+
+# Copied from examples/polyglot/generated/ by scripts/build-polyglot.sh.
+src/wasmWasiMain/kotlin/impl/SchemaGen.kt
+
+# Written by `wit-bindgen kotlin`.
+src/wasmWasiMain/kotlin/bindings/
+
+# Component collected into examples/polyglot/build/.
+fee-kt.wasm

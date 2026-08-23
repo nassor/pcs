@@ -1,0 +1,279 @@
+name: CI
+
+on:
+  push:
+      branches: [ "main" ]
+  pull_request:
+      branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+        components: rustfmt, clippy
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs
+    # `examples/wasm/order_processing/src/bindings.rs`,
+    # `crates/pcs-guest-smoketest/src/bindings.rs` and
+    # `examples/polyglot/stages/rust-settle/src/bindings.rs` on disk even though
+    # the host build never compiles them. cargo-component generates all three
+    # files as part of a wasm32-wasip2 build, and all three are gitignored, so
+    # they exist only once the component builds below have run.
+    - name: Install wasm32-wasip2 target
+      run: rustup target add wasm32-wasip2
+
+    - name: Install cargo-component
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component
+
+    - name: Generate WASM bindings
+      run: cargo component build -p order-processing-wasm --target wasm32-wasip2
+
+    # `tests/wasm_roundtrip.rs` hard-asserts this artifact exists, so the
+    # component must be built before the test job runs.
+    - name: Build smoketest WASM component
+      run: cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
+
+    - name: Generate polyglot Rust stage bindings
+      run: cargo component build -p polyglot-settle-wasm --target wasm32-wasip2
+
+    # Generated bindings ship unformatted; normalize before the workspace-wide
+    # fmt check so `--check` only fails on hand-written code.
+    - name: Pre-format generated bindings
+      run: |
+        rustfmt examples/wasm/order_processing/src/bindings.rs
+        rustfmt crates/pcs-guest-smoketest/src/bindings.rs
+        rustfmt examples/polyglot/stages/rust-settle/src/bindings.rs
+
+    - name: Check formatting
+      run: cargo fmt -q --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy -q --all-targets --all-features -- -D warnings
+
+    - name: Build
+      run: cargo build -q
+
+    - name: Check benchmarks
+      run: cargo check -q --benches
+
+    - name: Check examples
+      run: cargo check -q --examples
+
+    - name: Run tests
+      run: cargo test -q --workspace --all-features
+
+    - name: Run doctests
+      run: cargo test -q --workspace --all-features --doc
+
+  wasm_guest:
+    name: WASM Guest (wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-wasm-guest-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install component tooling
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+
+    - name: Check pcs-core for wasm32-wasip2
+      run: bash scripts/check-wasm-guest.sh
+
+    # The arrow-ipc exact pin is load-bearing across the component boundary;
+    # crates/pcs-guest/PINS.md forbids relaxing it without this gate.
+    - name: Host-guest arrow-ipc round-trip
+      run: bash scripts/ci/guest_ipc_roundtrip.sh
+
+    # cargo-component 0.21.1 emits under wasm32-wasip1 even for a
+    # --target wasm32-wasip2 build; the round-trip script above produced it.
+    - name: Validate smoketest component
+      run: wasm-tools validate --features component-model target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+
+    - name: Print smoketest component world
+      run: wasm-tools component wit target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+
+  polyglot:
+    name: Polyglot Guests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-polyglot-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install wasm32-wasip2 target
+      run: rustup target add wasm32-wasip2
+
+    - name: Install component tooling
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+
+    # Versions are pinned in examples/polyglot/PINS.md; keep the two in sync.
+    - uses: actions/setup-go@v6
+      with:
+        go-version: '1.25.5'
+
+    # Node 24. The TypeScript stage needs 22.18 for type stripping in
+    # `node --test` and 24.12 for jco's `@napi-rs/lzma`; 24 clears both.
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '24'
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.14.4'
+
+    - uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Install guest componentizers
+      run: |
+        go install github.com/bytecodealliance/componentize-go@v0.4.1
+        pip install componentize-py==0.25.0 build
+        npm install -g @bytecodealliance/jco@1.30.0
+        # Kotlin has no released WIT binding generator. JetBrains maintains a
+        # wit-bindgen fork with a Kotlin backend, built from the branch.
+        cargo install wit-bindgen-cli --git https://github.com/Kotlin/wit-bindgen --branch kotlin
+
+    # The five native codec test suites need the generated fixtures, and they
+    # are the tests that localise a flatbuffer-offset bug to one language before
+    # the wasm chain turns it into an opaque byte diff.
+    - name: Generate schema constants and fixtures
+      run: cargo run -p pcs-service --features wasm --example polyglot_orders -- emit
+
+    # The conformance corpus is committed so a codec's suite runs without a Rust
+    # toolchain. Regenerating it here proves the committed vectors still match
+    # what the generator produces, so the corpus cannot drift from the wire
+    # format it is supposed to pin.
+    - name: Conformance corpus is current
+      run: |
+        cargo run -p pcs-service --features conformance --example conformance_vectors -- emit
+        git diff --exit-code -- packages/arrow-ipc-conformance
+
+    - name: Go codec tests
+      working-directory: packages/arrow-ipc-go
+      run: go test ./...
+
+    - name: Python codec tests
+      working-directory: packages/arrow-ipc-py
+      run: PYTHONPATH=src python -m unittest discover -s tests
+
+    - name: TypeScript codec tests
+      working-directory: packages/arrow-ipc-ts
+      run: |
+        npm ci
+        npm run typecheck
+        npm run build
+        npm test
+
+    - name: Kotlin codec tests
+      working-directory: packages/arrow-ipc-kt
+      run: gradle jvmTest
+
+    - name: C# codec tests
+      working-directory: packages/arrow-ipc-cs
+      run: dotnet test tests
+
+    # Keeps the packaging honest between releases: every manifest still agrees
+    # with packages/VERSION and every artifact still builds. Every toolchain it
+    # needs is already installed above.
+    - name: Pack the Arrow codec packages
+      run: bash scripts/pack-arrow-ipc.sh
+
+    - name: Build all six components
+      run: bash scripts/build-polyglot.sh
+
+    - name: Six-language chain regression
+      run: cargo test -p pcs-service --features wasm --test polyglot_chain -- --nocapture
+
+    - name: Run the polyglot driver
+      run: cargo run -p pcs-service --features wasm,tracing --example polyglot_orders
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+    
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@cargo-audit
+    
+    - name: Run security audit
+      run: cargo audit

@@ -1,0 +1,61 @@
+# PCS extension example: user-defined source and sink factories.
+#
+# This config does not run with the stock pcs-service binary. KafkaSource and
+# PostgresSink are not built in, so a custom binary must register them through
+# `ServiceBuilder::register_source` and `register_sink`.
+#
+# Sources and sinks are the only factory surface. The pipeline itself is either
+# a WASM guest module, as below, or a `Box<dyn PipelineRuntime>` handed to
+# `ServiceBuilder::with_runtime`.
+#
+# See examples/configs/README.md for building a custom binary.
+
+mode = "standalone"
+
+[node]
+id = 1
+name = "order-processor"
+data_dir = "${PCS_DATA_DIR:-/var/lib/pcs-orders}"
+
+[run_mode]
+kind = "interval"
+interval_ms = 5000   # re-run the pipeline every 5 seconds
+
+# The components the guest declares through `describe()` are what
+# `target_component` and `source_component` must name. A custom binary can call
+# `ServiceBuilder::with_runtime` instead and omit the `[pipeline]` table.
+[pipeline.wasm]
+module = "pipelines/order_processing.wasm"
+
+[pipeline.wasm.config]
+strict = "true"
+lookup_table = "products"
+
+# KafkaSource reads from a Kafka topic.
+[[sources]]
+name = "kafka_orders"
+type = "KafkaSource"        # REQUIRES: KafkaSourceFactory registered
+target_component = "orders"
+
+[sources.config]
+brokers = "${KAFKA_BROKERS:-localhost:9092}"
+topic = "orders-raw"
+group_id = "pcs-order-processor"
+
+# PostgresSink writes enriched rows to a database.
+[[sinks]]
+name = "pg_enriched_orders"
+type = "PostgresSink"        # REQUIRES: PostgresSinkFactory registered
+source_component = "orders"
+
+[sinks.config]
+dsn = "${POSTGRES_DSN:-postgres://user:pass@localhost:5432/warehouse}"
+table = "enriched_orders"
+
+[http]
+bind = "0.0.0.0:8080"
+disabled = false
+
+[observability]
+log_format = "pretty"
+log_level = "${LOG_LEVEL:-info}"

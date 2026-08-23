@@ -1,0 +1,420 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background Circle Radial Gradient -->
+    <radialGradient id="bg-grad-deep" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#284870"/>
+      <stop offset="55%" stop-color="#1c3452"/>
+      <stop offset="100%" stop-color="#122236"/>
+    </radialGradient>
+
+    <!-- Outer Rim Metallic Stroke Gradient -->
+    <linearGradient id="rim-gradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#466f9c" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#0a1420" stop-opacity="0.95"/>
+    </linearGradient>
+
+    <!-- Long 45-Degree Drop Shadow -->
+    <linearGradient id="long-shadow-mat" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a131e" stop-opacity="0.8"/>
+      <stop offset="45%" stop-color="#0a131e" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#0a131e" stop-opacity="0.0"/>
+    </linearGradient>
+
+    <!-- Steel Pipe Shading - Vertical Stem -->
+    <linearGradient id="steel-stem" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#405566"/>
+      <stop offset="16%" stop-color="#5d788e"/>
+      <stop offset="40%" stop-color="#9fc0d9"/>
+      <stop offset="60%" stop-color="#d4e8f7"/>
+      <stop offset="82%" stop-color="#7290a8"/>
+      <stop offset="100%" stop-color="#364957"/>
+    </linearGradient>
+
+    <!-- Steel Pipe Shading - Upper Loop Arc -->
+    <linearGradient id="steel-loop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#364957"/>
+      <stop offset="16%" stop-color="#7290a8"/>
+      <stop offset="38%" stop-color="#d4e8f7"/>
+      <stop offset="62%" stop-color="#9fc0d9"/>
+      <stop offset="84%" stop-color="#5d788e"/>
+      <stop offset="100%" stop-color="#405566"/>
+    </linearGradient>
+
+    <!-- Flange Collar Gradient - Vertical -->
+    <linearGradient id="flange-vert" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2e4252"/>
+      <stop offset="14%" stop-color="#547187"/>
+      <stop offset="38%" stop-color="#abcee8"/>
+      <stop offset="58%" stop-color="#e8f3fc"/>
+      <stop offset="82%" stop-color="#69879e"/>
+      <stop offset="100%" stop-color="#263745"/>
+    </linearGradient>
+
+    <!-- Flange Collar Gradient - Horizontal -->
+    <linearGradient id="flange-horiz" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#263745"/>
+      <stop offset="18%" stop-color="#69879e"/>
+      <stop offset="42%" stop-color="#e8f3fc"/>
+      <stop offset="62%" stop-color="#abcee8"/>
+      <stop offset="86%" stop-color="#547187"/>
+      <stop offset="100%" stop-color="#2e4252"/>
+    </linearGradient>
+
+    <!-- Angled Flange Gradient for Opening -->
+    <linearGradient id="flange-angle-outlet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#e8f3fc"/>
+      <stop offset="32%" stop-color="#96b9d4"/>
+      <stop offset="68%" stop-color="#466275"/>
+      <stop offset="100%" stop-color="#20303d"/>
+    </linearGradient>
+
+    <!-- Pipe Interior Hollow Depth -->
+    <radialGradient id="pipe-interior" cx="40%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#080605"/>
+      <stop offset="65%" stop-color="#18120e"/>
+      <stop offset="100%" stop-color="#2d231c"/>
+    </radialGradient>
+
+    <!-- Rust Patches Shaders -->
+    <radialGradient id="rust-patch-a" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#d66e27"/>
+      <stop offset="38%" stop-color="#a64a13"/>
+      <stop offset="72%" stop-color="#6e2b07"/>
+      <stop offset="100%" stop-color="#421803" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="rust-patch-b" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#c9621e"/>
+      <stop offset="48%" stop-color="#87350b"/>
+      <stop offset="82%" stop-color="#471904"/>
+      <stop offset="100%" stop-color="#2d0e01" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Rivet Head Shader -->
+    <radialGradient id="rivet-metal" cx="32%" cy="28%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="26%" stop-color="#cee2f2"/>
+      <stop offset="68%" stop-color="#56738a"/>
+      <stop offset="100%" stop-color="#1e2f3d"/>
+    </radialGradient>
+
+    <filter id="rivet-shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="1.5" dy="2.2" stdDeviation="1.2" flood-color="#070e16" flood-opacity="0.9"/>
+    </filter>
+
+    <!-- Ferris Shading -->
+    <radialGradient id="ferris-skin" cx="44%" cy="26%" r="74%">
+      <stop offset="0%" stop-color="#ff8938"/>
+      <stop offset="38%" stop-color="#f55507"/>
+      <stop offset="78%" stop-color="#bf3700"/>
+      <stop offset="100%" stop-color="#801f00"/>
+    </radialGradient>
+
+    <radialGradient id="ferris-claw-skin" cx="36%" cy="24%" r="76%">
+      <stop offset="0%" stop-color="#ff9042"/>
+      <stop offset="42%" stop-color="#f75a0c"/>
+      <stop offset="80%" stop-color="#b83400"/>
+      <stop offset="100%" stop-color="#701a00"/>
+    </radialGradient>
+
+    <radialGradient id="eye-shading" cx="35%" cy="30%" r="65%">
+      <stop offset="0%" stop-color="#261b17"/>
+      <stop offset="65%" stop-color="#0a0604"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </radialGradient>
+
+    <!-- Drop Shadows for 2.5D Depth -->
+    <filter id="pipe-3d-shadow" x="-20%" y="-20%" width="160%" height="160%">
+      <feDropShadow dx="12" dy="18" stdDeviation="14" flood-color="#060c14" flood-opacity="0.85"/>
+    </filter>
+
+    <filter id="ferris-3d-shadow" x="-30%" y="-30%" width="170%" height="170%">
+      <feDropShadow dx="5" dy="9" stdDeviation="7" flood-color="#060403" flood-opacity="0.7"/>
+    </filter>
+
+    <!-- Gear Metal -->
+    <linearGradient id="gear-mat" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4c677d" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#304454" stop-opacity="0.95"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ==================== 1. CIRCULAR BADGE ==================== -->
+  <g id="badge">
+    <!-- Outer Rim -->
+    <circle cx="256" cy="256" r="240" fill="url(#rim-gradient)"/>
+    <!-- Main Navy Circle -->
+    <circle cx="256" cy="256" r="232" fill="url(#bg-grad-deep)"/>
+
+    <!-- 45-Degree Long Cast Shadow from the 'P' Pipe -->
+    <path d="M 225,130 
+             L 472,377 C 490,315 493,248 480,185 L 395,100 Z" 
+          fill="url(#long-shadow-mat)"/>
+    <path d="M 225,325 
+             L 375,475 C 420,460 458,428 478,385 L 355,262 Z" 
+          fill="url(#long-shadow-mat)"/>
+    <path d="M 152,430 
+             L 218,496 C 250,502 284,498 312,488 L 202,378 Z" 
+          fill="url(#long-shadow-mat)"/>
+  </g>
+
+  <!-- ==================== 2. INDUSTRIAL 'P' PIPELINE ==================== -->
+  <g id="pipeline-p" filter="url(#pipe-3d-shadow)">
+
+    <!-- A. VERTICAL STEM (X: 135..215, Y: 110..415) -->
+    <!-- Dark Outline Contour -->
+    <rect x="133" y="108" width="84" height="308" rx="8" fill="#182633"/>
+    <!-- Pipe Surface -->
+    <rect x="136" y="111" width="78" height="302" rx="6" fill="url(#steel-stem)"/>
+
+    <!-- B. UPPER LOOP (Curved Arced Pipe) -->
+    <!-- Dark Outline Contour for Loop -->
+    <path d="M 175,152 
+             C 175,76  288,68  356,102 
+             C 424,136 438,232 384,295 
+             C 345,340 260,342 208,310" 
+          fill="none" stroke="#182633" stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
+    
+    <!-- Pipe Loop Metal Surface -->
+    <path d="M 175,152 
+             C 175,76  288,68  356,102 
+             C 424,136 438,232 384,295 
+             C 345,340 260,342 208,310" 
+          fill="none" stroke="url(#steel-loop)" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Specular Highlight Streak -->
+    <path d="M 180,138 
+             C 180,90  282,82  344,114 
+             C 402,144 414,226 368,280 
+             C 336,316 266,318 218,294" 
+          fill="none" stroke="#f0f7fd" stroke-width="12" stroke-linecap="round" opacity="0.9"/>
+    
+    <!-- Ambient Occlusion Shadow on Inner Radius -->
+    <path d="M 206,164 
+             C 206,130 272,122 314,144 
+             C 358,168 360,224 330,258 
+             C 304,282 258,280 226,266" 
+          fill="none" stroke="#141f29" stroke-width="14" stroke-linecap="round" opacity="0.85"/>
+
+    <!-- C. EMBOSSED GEARS (Components Motif) -->
+    <!-- Gear 1 on Vertical Stem (Y: 230) -->
+    <g transform="translate(175, 230) scale(0.75)" fill="url(#gear-mat)" stroke="#141e26" stroke-width="1.8">
+      <path d="M-8,-26 L8,-26 L10,-20 L18,-18 L24,-24 L34,-14 L28,-8 L30,0 L36,4 L34,16 L28,18 L24,24 L14,34 L8,28 L0,30 L-4,36 L-16,34 L-18,28 L-24,24 L-34,14 L-28,8 L-30,0 L-36,-4 L-34,-16 L-28,-18 L-24,-24 L-14,-34 L-8,-28 Z"/>
+      <circle cx="0" cy="0" r="11" fill="#1b2833" stroke="#101820" stroke-width="2"/>
+    </g>
+
+    <!-- Gear 2 on Upper Curve (X: 286, Y: 108) -->
+    <g transform="translate(286, 108) scale(0.6)" fill="url(#gear-mat)" stroke="#141e26" stroke-width="1.8">
+      <path d="M-8,-26 L8,-26 L10,-20 L18,-18 L24,-24 L34,-14 L28,-8 L30,0 L36,4 L34,16 L28,18 L24,24 L14,34 L8,28 L0,30 L-4,36 L-16,34 L-18,28 L-24,24 L-34,14 L-28,8 L-30,0 L-36,-4 L-34,-16 L-28,-18 L-24,-24 L-14,-34 L-8,-28 Z"/>
+      <circle cx="0" cy="0" r="11" fill="#1b2833" stroke="#101820" stroke-width="2"/>
+    </g>
+
+    <!-- Directional Flow Arrow (Pipeline & Apache Arrow) -->
+    <g transform="translate(382, 180) rotate(105) scale(0.9)" fill="#20303d" stroke="#101a22" stroke-width="1.5" opacity="0.95">
+      <path d="M-20,-7 L8,-7 L8,-16 L26,0 L8,16 L8,7 L-20,7 Z"/>
+      <path d="M-20,-4 L6,-4 L6,-11 L20,0 L6,11 L6,4 L-20,4 Z" fill="#6f8ea6" opacity="0.4"/>
+    </g>
+
+    <!-- D. RUST TEXTURES & CORROSION PATCHES -->
+    <!-- Rust along bottom vertical stem -->
+    <path d="M136,322 Q148,308 158,326 Q174,302 166,342 Q182,355 170,380 Q154,392 136,386 Z" fill="url(#rust-patch-a)" opacity="0.92"/>
+    <path d="M136,338 Q152,330 148,360 Q140,375 136,368 Z" fill="#471802" opacity="0.88"/>
+    
+    <!-- Rust along top elbow curve -->
+    <path d="M140,135 Q160,125 154,150 Q170,156 155,174 Q142,164 140,135 Z" fill="url(#rust-patch-b)" opacity="0.88"/>
+    
+    <!-- Rust on top loop outer curve -->
+    <path d="M338,82 Q366,86 372,105 Q388,116 376,134 Q354,122 338,82 Z" fill="url(#rust-patch-a)" opacity="0.9"/>
+    
+    <!-- Rust near lower loop curve -->
+    <path d="M338,296 Q360,308 348,326 Q320,332 314,308 Z" fill="url(#rust-patch-b)" opacity="0.9"/>
+
+    <!-- E. FLANGES & BOLTED COLLARS -->
+    
+    <!-- Top Flange / Collar on Stem (Y: 110) -->
+    <g id="flange-stem-top">
+      <rect x="127" y="104" width="96" height="24" rx="6" fill="#182633"/>
+      <rect x="129" y="106" width="92" height="20" rx="5" fill="url(#flange-vert)"/>
+      <line x1="131" y1="108" x2="219" y2="108" stroke="#ffffff" stroke-width="1.8" opacity="0.9"/>
+      <circle cx="144" cy="116" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="175" cy="116" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="206" cy="116" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+    </g>
+
+    <!-- Mid Flange on Stem (Y: 275) -->
+    <g id="flange-stem-mid">
+      <rect x="127" y="270" width="96" height="26" rx="6" fill="#182633"/>
+      <rect x="129" y="272" width="92" height="22" rx="5" fill="url(#flange-vert)"/>
+      <line x1="131" y1="274" x2="219" y2="274" stroke="#ffffff" stroke-width="1.8" opacity="0.9"/>
+      <circle cx="144" cy="283" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="175" cy="283" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="206" cy="283" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+    </g>
+
+    <!-- Bottom Flange & Cap on Stem (Y: 395) -->
+    <g id="flange-stem-bottom">
+      <rect x="122" y="392" width="106" height="30" rx="7" fill="#182633"/>
+      <rect x="124" y="394" width="102" height="26" rx="6" fill="url(#flange-vert)"/>
+      <line x1="126" y1="396" x2="224" y2="396" stroke="#ffffff" stroke-width="2.2" opacity="0.9"/>
+      <!-- End cap rounded dome -->
+      <path d="M135,420 C135,434 215,434 215,420 Z" fill="#15212c" stroke="#0d151c" stroke-width="2.5"/>
+      <circle cx="140" cy="407" r="5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="163" cy="407" r="5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="187" cy="407" r="5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="210" cy="407" r="5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+    </g>
+
+    <!-- Top-Right Loop Flange (Angle ~45 deg at X: 374, Y: 124) -->
+    <g id="flange-loop-top-angle" transform="translate(374, 124) rotate(45)">
+      <rect x="-48" y="-13" width="96" height="26" rx="6" fill="#182633"/>
+      <rect x="-46" y="-11" width="92" height="22" rx="5" fill="url(#flange-horiz)"/>
+      <line x1="-44" y1="-9" x2="44" y2="-9" stroke="#ffffff" stroke-width="1.8" opacity="0.85"/>
+      <circle cx="-30" cy="0" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="0" cy="0" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="30" cy="0" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+    </g>
+
+    <!-- F. THE OPEN PIPE OUTLET (Where Ferris emerges!) -->
+    <!-- Positioned at X: 228, Y: 312, Angled ~ -28 deg facing down-left -->
+    <g id="outlet-flange" transform="translate(228, 314) rotate(-28)">
+      <!-- Outer Collar Contour -->
+      <ellipse cx="0" cy="0" rx="52" ry="27" fill="#182633"/>
+      <ellipse cx="0" cy="0" rx="49" ry="24" fill="url(#flange-angle-outlet)"/>
+      <ellipse cx="0" cy="0" rx="46" ry="21" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.85"/>
+      
+      <!-- Rivets around collar -->
+      <circle cx="-36" cy="0" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="-18" cy="-16" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="18" cy="-16" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+      <circle cx="36" cy="0" r="4.5" fill="url(#rivet-metal)" filter="url(#rivet-shadow)"/>
+
+      <!-- Inner Dark Hollow of Pipe -->
+      <ellipse cx="0" cy="2" rx="36" ry="17" fill="url(#pipe-interior)"/>
+      <ellipse cx="0" cy="2" rx="36" ry="17" fill="none" stroke="#080604" stroke-width="3.5"/>
+    </g>
+  </g>
+
+  <!-- ==================== 3. FERRIS THE CRAB (MAKING AN APPEARANCE) ==================== -->
+  <g id="ferris-peeking" filter="url(#ferris-3d-shadow)">
+
+    <!-- Crab Legs Gripping Around the Rim -->
+    <!-- Left Gripping Legs -->
+    <g stroke="#852000" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M192,308 L178,326 L182,342"/>
+      <path d="M206,328 L198,348 L203,360"/>
+    </g>
+    <!-- Right Gripping Legs -->
+    <g stroke="#852000" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M280,318 L296,336 L298,352"/>
+      <path d="M264,334 L278,354 L282,366"/>
+    </g>
+
+    <!-- Ferris Body (Half emerging from pipe opening at X: 240, Y: 264) -->
+    <g transform="translate(240, 264)">
+      <!-- Body Outline Contour -->
+      <path d="M -62,16 
+               L -58,-3  L -48,-12 L -52,-28 L -36,-25 L -32,-42 L -15,-33 
+               L 0,-48 
+               L 15,-33 L 32,-42 L 36,-25 L 52,-28 L 48,-12 L 58,-3 
+               L 62,16 
+               C 54,42 27,52 0,52 
+               C -27,52 -54,42 -62,16 Z" 
+            fill="#6b1700"/>
+      
+      <!-- Body Fill with Rich Orange Gradient -->
+      <path d="M -60,15 
+               L -56,-2  L -46,-10 L -50,-26 L -34,-23 L -30,-40 L -14,-31 
+               L 0,-46 
+               L 14,-31 L 30,-40 L 34,-23 L 50,-26 L 46,-10 L 56,-2 
+               L 60,15 
+               C 52,40 26,50 0,50 
+               C -26,50 -52,40 -60,15 Z" 
+            fill="url(#ferris-skin)"/>
+
+      <!-- Shell Spike Crown Highlight -->
+      <path d="M -44,-12 L -34,-18 L -30,-32 L -14,-25 L 0,-38 L 14,-25 L 30,-32 L 34,-18 L 44,-12" 
+            stroke="#ffbe85" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.9"/>
+
+      <!-- Cute Big Glossy Eyes -->
+      <!-- Left Eye -->
+      <ellipse cx="-20" cy="-2" rx="11" ry="14" fill="#601500"/>
+      <ellipse cx="-20" cy="-2" rx="10" ry="13" fill="url(#eye-shading)"/>
+      <circle cx="-23" cy="-6" r="4.2" fill="#ffffff"/>
+      <circle cx="-16" cy="4" r="1.8" fill="#ffffff" opacity="0.95"/>
+
+      <!-- Right Eye -->
+      <ellipse cx="20" cy="-2" rx="11" ry="14" fill="#601500"/>
+      <ellipse cx="20" cy="-2" rx="10" ry="13" fill="url(#eye-shading)"/>
+      <circle cx="17" cy="-6" r="4.2" fill="#ffffff"/>
+      <circle cx="24" cy="4" r="1.8" fill="#ffffff" opacity="0.95"/>
+
+      <!-- Cute Happy Smile -->
+      <path d="M -10,20 Q 0,30 10,20" fill="none" stroke="#501000" stroke-width="4" stroke-linecap="round"/>
+      <path d="M -7,21 Q 0,28 7,21" fill="none" stroke="#ffa05c" stroke-width="1.8" stroke-linecap="round" opacity="0.75"/>
+
+      <!-- Rosy Cheeks -->
+      <ellipse cx="-34" cy="14" rx="8" ry="5" fill="#ff2200" opacity="0.4"/>
+      <ellipse cx="34" cy="14" rx="8" ry="5" fill="#ff2200" opacity="0.4"/>
+    </g>
+
+    <!-- FERRIS CLAWS & ARMS -->
+
+    <!-- LEFT CLAW (Raised up-left) -->
+    <g id="claw-l">
+      <!-- Arm -->
+      <path d="M 190,276 Q 164,256 152,232" 
+            fill="none" stroke="#6b1700" stroke-width="17" stroke-linecap="round"/>
+      <path d="M 190,276 Q 164,256 152,232" 
+            fill="none" stroke="url(#ferris-claw-skin)" stroke-width="13" stroke-linecap="round"/>
+
+      <!-- Claw Head at (144, 214) -->
+      <g transform="translate(144, 214) rotate(-28)">
+        <!-- Outer Pincer (Big) -->
+        <path d="M 0,20 C -18,20 -30,6 -28,-14 C -26,-28 -12,-36 0,-28 C -8,-16 -8,-2 4,2 Z" 
+              fill="url(#ferris-claw-skin)" stroke="#601500" stroke-width="3"/>
+        <!-- Inner Thumb Pincer (Small) -->
+        <path d="M 3,20 C 14,18 24,8 21,-8 C 18,-20 9,-26 2,-18 C 7,-9 7,0 -3,4 Z" 
+              fill="url(#ferris-claw-skin)" stroke="#601500" stroke-width="3"/>
+        <!-- Base Joint -->
+        <ellipse cx="0" cy="15" rx="12" ry="8" fill="url(#ferris-skin)" stroke="#601500" stroke-width="2.5"/>
+        <!-- Claw Highlight -->
+        <path d="M -20,-10 C -20,-22 -12,-28 0,-20" fill="none" stroke="#ffc594" stroke-width="3" stroke-linecap="round"/>
+      </g>
+    </g>
+
+    <!-- RIGHT CLAW (Raised high in a friendly wave up-right) -->
+    <g id="claw-r">
+      <!-- Arm -->
+      <path d="M 294,276 Q 326,250 342,222" 
+            fill="none" stroke="#6b1700" stroke-width="17" stroke-linecap="round"/>
+      <path d="M 294,276 Q 326,250 342,222" 
+            fill="none" stroke="url(#ferris-claw-skin)" stroke-width="13" stroke-linecap="round"/>
+
+      <!-- Claw Head at (352, 206) -->
+      <g transform="translate(352, 206) rotate(38)">
+        <!-- Outer Pincer (Big) -->
+        <path d="M 0,20 C 18,20 30,6 28,-14 C 26,-28 12,-36 0,-28 C 8,-16 8,-2 -4,2 Z" 
+              fill="url(#ferris-claw-skin)" stroke="#601500" stroke-width="3"/>
+        <!-- Inner Thumb Pincer (Small) -->
+        <path d="M -3,20 C -14,18 -24,8 -21,-8 C -18,-20 -9,-26 -2,-18 C -7,-9 -7,0 3,4 Z" 
+              fill="url(#ferris-claw-skin)" stroke="#601500" stroke-width="3"/>
+        <!-- Base Joint -->
+        <ellipse cx="0" cy="15" rx="12" ry="8" fill="url(#ferris-skin)" stroke="#601500" stroke-width="2.5"/>
+        <!-- Claw Highlight -->
+        <path d="M 20,-10 C 20,-22 12,-28 0,-20" fill="none" stroke="#ffc594" stroke-width="3" stroke-linecap="round"/>
+      </g>
+    </g>
+
+    <!-- Front Paws Resting on Collar Lip -->
+    <g id="paws-front">
+      <ellipse cx="204" cy="301" rx="9" ry="6.5" fill="url(#ferris-skin)" stroke="#601500" stroke-width="2.5" transform="rotate(-15 204 301)"/>
+      <line x1="202" y1="297" x2="200" y2="304" stroke="#400d00" stroke-width="2"/>
+      <line x1="206" y1="297" x2="205" y2="305" stroke="#400d00" stroke-width="2"/>
+
+      <ellipse cx="276" cy="304" rx="9" ry="6.5" fill="url(#ferris-skin)" stroke="#601500" stroke-width="2.5" transform="rotate(15 276 304)"/>
+      <line x1="274" y1="300" x2="275" y2="307" stroke="#400d00" stroke-width="2"/>
+      <line x1="278" y1="299" x2="280" y2="306" stroke="#400d00" stroke-width="2"/>
+    </g>
+
+  </g>
+</svg>

@@ -1,0 +1,13 @@
+/target
+/tmp
+/docs/public
+**/.DS_Store
+
+# Avoid IDE files
+.idea/
+.vscode/
+
+# Local Benchmarks
+performance-improvement.md
+
+**/__pycache__/

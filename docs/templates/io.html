@@ -1,0 +1,843 @@
+{% extends "base.html" %}
+
+{% block title %}Sources &amp; Sinks — PCS{% endblock %}
+{% block description %}Two traits move Arrow rows in and out of a Dataset: Source pulls RecordBatches until EOF, Sink takes one write per cycle. Parquet, CSV, NDJSON, in-memory channels, and DataFusion SQL.{% endblock %}
+{% block og_title %}Sources &amp; Sinks — PCS{% endblock %}
+{% block og_description %}Pull batches in with Source, push one batch out with Sink, and cast between the file's schema and the component's.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Moving data</div>
+<h1>Sources &amp; Sinks</h1>
+
+<p class="page-lede">
+    A <code>Source</code> is pulled for Arrow batches until it says it has none left.
+    A <code>Sink</code> is handed one batch and then closed.
+</p>
+
+<dl class="page-facts">
+    <dt>In one line</dt>
+    <dd>How rows <strong>get into</strong> a Dataset and <strong>back out</strong> again</dd>
+    <dt>You need</dt>
+    <dd>The <code>io</code> feature on <code>pcs-service</code>, which turns on <code>pcs-core/io</code>. Add <code>datafusion</code> for the SQL source</dd>
+    <dt>Read this if</dt>
+    <dd>Your Parquet file has an <code>Int32</code> column where the component declares <code>Int64</code>, or your second run says <em>write called after finish</em></dd>
+</dl>
+
+<h2 id="cycle">The shape of a drain cycle</h2>
+
+<p>
+    Ingestion is <b>pull</b>: something calls <code>next_batch()</code> in a loop and appends
+    each batch. Egress is <b>push</b>: something hands the sink a batch and then finalises it.
+    Between the two sits the constraint that catches people out. A <code>Dataset</code> only
+    accepts a batch whose schema matches the registered one <em>exactly</em>, so a cast
+    usually has to happen first.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 392" role="img" aria-labelledby="io-a-title io-a-desc">
+        <title id="io-a-title">A batch travelling from a Parquet file into a Dataset and out to a sink</title>
+        <desc id="io-a-desc">
+            ParquetSource reads its schema from the file metadata and yields batches whose
+            columns are Int32 and Float32. A CastingSource converts each batch to the Int64
+            and Float64 types the component declares, then append_record_batch compares the
+            batch schema against the SchemaRegistry entry and either accepts the batch whole
+            or returns an error. On the way out, drain_dataset makes a single write_batch call
+            with the whole merged component, and finish writes the Parquet footer.
+        </desc>
+
+        <text class="t-title" x="0" y="14">One drain cycle</text>
+        <text class="t-sm" x="0" y="30">component Trade = { id : Int64, price : Float64 }</text>
+
+        <!-- the file's own schema -->
+        <g class="anim anim-1">
+            <rect class="blk blk-data" x="0" y="44" width="176" height="96" rx="8"/>
+            <rect class="hd hd-data" x="0" y="44" width="176" height="22" rx="8"/>
+            <rect class="hd hd-data" x="0" y="58" width="176" height="8"/>
+            <text class="t-lbl t-data" x="12" y="59">ParquetSource</text>
+
+            <rect class="row" x="8" y="72" width="160" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="85">id      : Int32</text>
+            <rect class="row" x="8" y="94" width="160" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="107">price   : Float32</text>
+
+            <path class="ln" d="M8 120 H168"/>
+            <text class="t-sm" x="16" y="134">schema from file metadata</text>
+
+            <path class="arw arw-data" d="M88 140 V166" marker-end="url(#io-d)"/>
+            <text class="t-sm" x="96" y="158">next_batch</text>
+        </g>
+
+        <!-- the cast: a Source that wraps a Source -->
+        <g class="anim anim-2">
+            <rect class="blk blk-data" x="0" y="172" width="176" height="100" rx="8"/>
+            <rect class="hd hd-data" x="0" y="172" width="176" height="22" rx="8"/>
+            <rect class="hd hd-data" x="0" y="186" width="176" height="8"/>
+            <text class="t-lbl t-data" x="12" y="187">CastingSource</text>
+
+            <rect class="row-w" x="8" y="200" width="160" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="213">id      : Int64</text>
+            <rect class="row-w" x="8" y="222" width="160" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="235">price   : Float64</text>
+
+            <path class="ln" d="M8 248 H168"/>
+            <text class="t-sm" x="16" y="262">cast_with_options</text>
+
+            <path class="arw arw-data" d="M176 222 H248" marker-end="url(#io-d)"/>
+            <text class="t-sm" x="182" y="214">append</text>
+            <text class="t-sm t-ctl" x="182" y="240">or reject</text>
+        </g>
+
+        <!-- the dataset -->
+        <g class="anim anim-3">
+            <rect class="blk blk-data" x="256" y="44" width="192" height="228" rx="8"/>
+            <rect class="hd hd-data" x="256" y="44" width="192" height="22" rx="8"/>
+            <rect class="hd hd-data" x="256" y="58" width="192" height="8"/>
+            <text class="t-lbl t-data" x="268" y="59">Dataset</text>
+
+            <rect class="row" x="264" y="72" width="176" height="18" rx="3"/>
+            <text class="t-sm" x="272" y="85">id      : Int64</text>
+            <rect class="row" x="264" y="94" width="176" height="18" rx="3"/>
+            <text class="t-sm" x="272" y="107">price   : Float64</text>
+
+            <path class="ln" d="M264 120 H440"/>
+            <text class="t-sm" x="272" y="136">1         99.50</text>
+            <text class="t-sm" x="272" y="150">2        240.00</text>
+            <text class="t-sm" x="272" y="164">3         14.99</text>
+            <text class="t-sm t-data" x="272" y="186">row_count = 3</text>
+
+            <path class="ln" d="M264 200 H440"/>
+            <text class="t-sm" x="272" y="216">three appended chunks,</text>
+            <text class="t-sm" x="272" y="230">merged on first read</text>
+            <text class="t-sm" x="272" y="252">systems see columns</text>
+            <text class="t-sm" x="272" y="266">here, never rows</text>
+
+            <path class="arw arw-data" d="M448 150 H530" marker-end="url(#io-d)"/>
+            <text class="t-sm" x="454" y="142">drain_dataset</text>
+            <text class="t-sm" x="454" y="168">1 write_batch</text>
+        </g>
+
+        <!-- the sink -->
+        <g class="anim anim-3">
+            <rect class="blk blk-data" x="538" y="44" width="116" height="228" rx="8"/>
+            <rect class="hd hd-data" x="538" y="44" width="116" height="22" rx="8"/>
+            <rect class="hd hd-data" x="538" y="58" width="116" height="8"/>
+            <text class="t-lbl t-data" x="548" y="59">ParquetSink</text>
+
+            <rect class="row" x="546" y="72" width="100" height="18" rx="3"/>
+            <text class="t-sm" x="554" y="85">id : Int64</text>
+            <rect class="row" x="546" y="94" width="100" height="18" rx="3"/>
+            <text class="t-sm" x="554" y="107">price : F64</text>
+
+            <path class="ln" d="M546 120 H646"/>
+            <text class="t-sm" x="554" y="136">one batch,</text>
+            <text class="t-sm" x="554" y="150">whole column</text>
+            <text class="t-sm t-ctl" x="554" y="172">finish()</text>
+            <text class="t-sm" x="554" y="186">writes the</text>
+            <text class="t-sm" x="554" y="200">Parquet footer</text>
+            <text class="t-sm" x="554" y="222">dead rows are</text>
+            <text class="t-sm" x="554" y="236">written too</text>
+        </g>
+
+        <!-- the registry is what both the cast and the append consult -->
+        <g class="anim anim-4">
+            <rect class="blk blk-ctl" x="256" y="300" width="192" height="80" rx="8"/>
+            <rect class="hd hd-ctl" x="256" y="300" width="192" height="20" rx="8"/>
+            <rect class="hd hd-ctl" x="256" y="312" width="192" height="8"/>
+            <text class="t-lbl t-ctl" x="268" y="314">SchemaRegistry</text>
+            <text class="t-sm" x="268" y="336">Trade   v1</text>
+            <text class="t-sm" x="268" y="350">id      Int64</text>
+            <text class="t-sm" x="268" y="364">price   Float64</text>
+
+            <path class="arw arw-ctl" d="M352 300 V278" marker-end="url(#io-c)"/>
+            <text class="t-sm t-ctl" x="364" y="292">checked on append</text>
+
+            <path class="arw arw-ctl" d="M256 330 H170 V274" marker-end="url(#io-c)"/>
+            <text class="t-sm t-ctl" x="178" y="322">cast target</text>
+
+            <text class="t-sm" x="470" y="322">fields() compared</text>
+            <text class="t-sm" x="470" y="336">exactly: name, type,</text>
+            <text class="t-sm" x="470" y="350">nullability, order</text>
+            <text class="t-sm t-data" x="470" y="372">no match: PcsError</text>
+        </g>
+
+        <defs>
+            <marker id="io-d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--data)"/>
+            </marker>
+            <marker id="io-c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--control)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-data"><i></i> rows, batches, columns</span>
+        <span class="k-control"><i></i> the registered schema</span>
+    </div>
+    <figcaption class="dgm-cap">
+        The cast happens <b>before</b> the Dataset ever sees the batch. There is no in-place
+        retype of a registered column, so <code>append_record_batch</code> takes the batch
+        whole or refuses it whole.
+    </figcaption>
+</div>
+
+<h2 id="traits">The two traits</h2>
+
+<p>
+    Both live in <code>pcs-core</code> behind its <code>io</code> feature, and both are
+    re-exported from <code>pcs_service::io</code> so a service build needs one import path.
+    Each is a schema, a step, and a way to signal <em>done</em>.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>crates/pcs-core/src/io/source.rs</em></div>
+    <pre><code class="language-rust">#[async_trait]
+pub trait Source: Send + Sync {
+    /// Fixed per source instance — must not change between calls.
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
+
+    /// Pull the next batch, or `None` at EOF.
+    async fn next_batch(&amp;mut self) -&gt; Result&lt;Option&lt;RecordBatch&gt;, PcsError&gt;;
+
+    /// Progress reporting only. Callers must not rely on accuracy.
+    fn estimated_rows(&amp;self) -&gt; Option&lt;usize&gt; { None }
+}</code></pre>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>crates/pcs-core/src/io/sink.rs</em></div>
+    <pre><code class="language-rust">#[async_trait]
+pub trait Sink: Send {
+    /// May be called multiple times.
+    async fn write_batch(&amp;mut self, batch: &amp;RecordBatch) -&gt; Result&lt;(), PcsError&gt;;
+
+    /// Flush and finalise. Exactly once, after the last batch.
+    async fn finish(&amp;mut self) -&gt; Result&lt;(), PcsError&gt;;
+
+    /// Batches must conform to this schema.
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
+
+    /// Backpressure probe. `None` if unsupported.
+    fn pending_rows(&amp;self) -&gt; Option&lt;usize&gt; { None }
+}</code></pre>
+</div>
+
+<p>
+    The bounds differ deliberately. <code>Source</code> is <code>Send + Sync</code>;
+    <code>Sink</code> is only <code>Send</code>, because exclusive <code>&amp;mut self</code>
+    access already provides the synchronisation a writer needs. Concurrent writes to one sink
+    are not a supported shape.
+</p>
+
+<p>
+    <code>pending_rows</code> is the only optional method with a real consumer:
+    <code>Pipeline::sink_pending_rows(component)</code> surfaces it, and a
+    <code>BackpressureSpec::Predicate</code> closure can consult it to skip a pipeline whose
+    downstream sink is filling up. Of the built-in sinks, only <code>ChannelSink</code>
+    implements it. A file sink has no meaningful queue depth.
+</p>
+
+<p>Implementing a source is one method plus a schema:</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>yield fixed-size chunks, then None</em></div>
+    <pre><code class="language-rust">use std::sync::Arc;
+use arrow_array::{Array, Float64Array, RecordBatch};
+use arrow_schema::Schema;
+use async_trait::async_trait;
+use pcs_service::PcsError;
+use pcs_service::io::Source;
+
+struct RampSource {
+    schema: Arc&lt;Schema&gt;,
+    remaining: usize,
+    chunk: usize,
+}
+
+#[async_trait]
+impl Source for RampSource {
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt; {
+        self.schema.clone()
+    }
+
+    async fn next_batch(&amp;mut self) -&gt; Result&lt;Option&lt;RecordBatch&gt;, PcsError&gt; {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let n = self.chunk.min(self.remaining);
+        self.remaining -= n;
+
+        let col: Arc&lt;dyn Array&gt; =
+            Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64)));
+        RecordBatch::try_new(self.schema.clone(), vec![col])
+            .map(Some)
+            .map_err(|e| PcsError::generic(format!("RampSource: {e}")))
+    }
+
+    fn estimated_rows(&amp;self) -&gt; Option&lt;usize&gt; {
+        Some(self.remaining)
+    }
+}</code></pre>
+</div>
+
+<p>
+    Aim for moderate batch sizes rather than one giant batch. The trait docs suggest around
+    64k rows. Every file-backed source that ships reads on a dedicated OS thread and hands
+    batches over a <code>tokio::sync::mpsc</code> channel with capacity 4, so
+    <code>next_batch</code> awaits instead of blocking the executor and the file is never
+    fully materialised.
+</p>
+
+<h2 id="batching">The batching contract</h2>
+
+<p>
+    Two free functions do the driving. Note the argument order is <b>not</b> symmetric: the
+    source comes first, the sink comes last.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>both return the row count they moved</em></div>
+    <pre><code class="language-rust">pub async fn drain_into_dataset&lt;S: Source + ?Sized&gt;(
+    source: &amp;mut S,
+    dataset: &amp;mut Dataset,
+    component_name: &amp;'static str,
+) -&gt; Result&lt;usize, PcsError&gt;;
+
+pub async fn drain_dataset&lt;K: Sink + ?Sized&gt;(
+    dataset: &amp;Dataset,
+    component_name: &amp;'static str,
+    sink: &amp;mut K,
+) -&gt; Result&lt;usize, PcsError&gt;;</code></pre>
+</div>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 344" role="img" aria-labelledby="io-b-title io-b-desc">
+        <title id="io-b-title">Call counts across one drain cycle, and who calls finish</title>
+        <desc id="io-b-desc">
+            drain_into_dataset calls next_batch four times to receive three batches and an
+            EOF, appending each batch separately, so the component holds three chunks.
+            drain_dataset then makes exactly one write_batch call with the merged batch and
+            never calls finish. Pipeline::run_with_io calls finish after every cycle, while
+            the standalone service runner calls it only on a one-shot exit or on
+            cancellation.
+        </desc>
+
+        <text class="t-title" x="0" y="14">Counting one cycle</text>
+        <text class="t-sm" x="0" y="30">a source is pulled until it says None; a sink is written once</text>
+
+        <!-- pull side -->
+        <g class="anim anim-1">
+            <text class="t-sm t-data" x="0" y="52">Source</text>
+            <rect class="blk blk-data" x="0" y="60" width="42" height="20" rx="3"/>
+            <text class="t-sm t-mid" x="21" y="74">b0</text>
+            <rect class="blk blk-data" x="47" y="60" width="42" height="20" rx="3"/>
+            <text class="t-sm t-mid" x="68" y="74">b1</text>
+            <rect class="blk blk-data" x="94" y="60" width="42" height="20" rx="3"/>
+            <text class="t-sm t-mid" x="115" y="74">b2</text>
+            <rect class="blk" x="141" y="60" width="42" height="20" rx="3"/>
+            <text class="t-sm t-mid" x="162" y="74">None</text>
+
+            <text class="t-sm" x="0" y="98">4 calls to next_batch</text>
+            <text class="t-sm" x="0" y="112">3 appends, then EOF</text>
+            <text class="t-sm" x="0" y="134">returns rows appended</text>
+
+            <path class="arw arw-data" d="M190 70 H244" marker-end="url(#io-bd)"/>
+            <text class="t-sm" x="196" y="62">append</text>
+        </g>
+
+        <!-- the dataset in the middle -->
+        <g class="anim anim-2">
+            <rect class="blk blk-data" x="252" y="44" width="150" height="104" rx="8"/>
+            <rect class="hd hd-data" x="252" y="44" width="150" height="22" rx="8"/>
+            <rect class="hd hd-data" x="252" y="58" width="150" height="8"/>
+            <text class="t-lbl t-data" x="264" y="59">Dataset</text>
+
+            <rect class="row" x="260" y="72" width="134" height="18" rx="3"/>
+            <text class="t-sm" x="268" y="85">Trade  3 chunks</text>
+            <text class="t-sm" x="268" y="108">row_count = 3</text>
+            <text class="t-sm" x="268" y="126">batch_for merges</text>
+            <text class="t-sm" x="268" y="140">them into one</text>
+
+            <path class="arw arw-data" d="M402 96 H456" marker-end="url(#io-bd)"/>
+            <text class="t-sm" x="408" y="88">1 write</text>
+        </g>
+
+        <!-- push side -->
+        <g class="anim anim-2">
+            <rect class="blk blk-data" x="464" y="44" width="190" height="104" rx="8"/>
+            <rect class="hd hd-data" x="464" y="44" width="190" height="22" rx="8"/>
+            <rect class="hd hd-data" x="464" y="58" width="190" height="8"/>
+            <text class="t-lbl t-data" x="476" y="59">Sink</text>
+
+            <rect class="row-w" x="472" y="72" width="174" height="18" rx="3"/>
+            <text class="t-sm" x="480" y="85">write_batch(&amp;batch)</text>
+            <text class="t-sm" x="480" y="108">zero rows: no call</text>
+            <text class="t-sm t-ctl" x="480" y="126">finish() is not called</text>
+            <text class="t-sm t-ctl" x="480" y="140">by drain_dataset</text>
+        </g>
+
+        <!-- who owns the close -->
+        <g class="anim anim-3">
+            <path class="ln" d="M0 164 H654"/>
+            <text class="t-sm t-ctl" x="0" y="182">who calls finish()</text>
+
+            <rect class="blk blk-ctl" x="0" y="192" width="318" height="92" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="192" width="318" height="20" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="204" width="318" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="206">Pipeline::run_with_io</text>
+            <text class="t-sm" x="12" y="228">after every call, so a file sink is</text>
+            <text class="t-sm" x="12" y="242">one shot: run it twice and</text>
+            <text class="t-sm" x="12" y="256">ParquetSink reports a write</text>
+            <text class="t-sm" x="12" y="270">after finish</text>
+
+            <rect class="blk blk-ctl" x="336" y="192" width="318" height="92" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="192" width="318" height="20" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="204" width="318" height="8"/>
+            <text class="t-lbl t-ctl" x="348" y="206">run_standalone</text>
+            <text class="t-sm" x="348" y="228">only on the OneShot exit or on</text>
+            <text class="t-sm" x="348" y="242">cancellation. Continuous and</text>
+            <text class="t-sm" x="348" y="256">Interval keep the sink open and</text>
+            <text class="t-sm" x="348" y="270">clear() the Dataset each loop</text>
+        </g>
+
+        <!-- the failure case -->
+        <g class="anim anim-4">
+            <path class="ln" d="M0 300 H654"/>
+            <text class="t-sm" x="0" y="318">A source error mid-drain propagates out of drain_into_dataset, but the batches already appended stay.</text>
+            <text class="t-sm t-data" x="0" y="332">row_count has already moved, so that component now leads every other one. Restart the cycle, do not resume it.</text>
+        </g>
+
+        <defs>
+            <marker id="io-bd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--data)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-data"><i></i> rows and batches</span>
+        <span class="k-control"><i></i> who owns the loop</span>
+    </div>
+    <figcaption class="dgm-cap">
+        The counts are asymmetric by design: N pulls in, one push out. Nothing inside
+        <code>drain_dataset</code> closes the sink, so whoever owns the loop owns
+        <code>finish()</code>. Call it once too early and the next write fails; never call it
+        and a Parquet file has no footer at all.
+    </figcaption>
+</div>
+
+<p>
+    Three details matter. <code>drain_dataset</code> pulls the component's whole
+    <code>RecordBatch</code> and issues a <b>single</b> <code>write_batch</code>, so a sink
+    never sees the chunk boundaries the source produced. It returns <code>Ok(0)</code>
+    without calling the sink at all when the component has no rows. And that batch is the
+    <em>raw</em> one: soft-deleted rows are still in it, so call <code>compact()</code>
+    before draining to keep them out of the output file.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>driving both ends by hand</em></div>
+    <pre><code class="language-rust">use std::path::Path;
+use pcs_service::Component;
+use pcs_service::dataset::Dataset;
+use pcs_service::io::{ParquetSink, ParquetSource, Sink, drain_dataset, drain_into_dataset};
+
+let mut data = Dataset::new();
+data.register_component::&lt;Trade&gt;()?;
+
+let mut src  = ParquetSource::from_path_async(Path::new("in.parquet")).await?;
+let mut sink = ParquetSink::from_path(Path::new("out.parquet"), Trade::schema())?;
+
+let rows_in = drain_into_dataset(&amp;mut src, &amp;mut data, "Trade").await?;
+// ... run systems over `data` ...
+let rows_out = drain_dataset(&amp;data, "Trade", &amp;mut sink).await?;
+sink.finish().await?;</code></pre>
+</div>
+
+<p>
+    Or attach them to the pipeline and let it sequence the three phases for you:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>drain sources, run systems, drain sinks, finish</em></div>
+    <pre><code class="language-rust">let mut pipeline = Pipeline::builder("etl")
+    .with::&lt;Trade&gt;()
+    .with_source("Trade", src)
+    .with_sink("Trade", sink)
+    .with_parallel_system(ScaleSystem)
+    .build();
+
+pipeline.run_with_io().await?;</code></pre>
+</div>
+
+<div class="note note-warn">
+    <span class="note-label">Sharp edge</span>
+    <p>
+        <code>run_with_io</code> calls <code>finish()</code> on every registered sink at the
+        end of <b>every</b> call. With a <code>ParquetSink</code> that makes it a one-shot
+        API: the second call fails with <em>ParquetSink: write called after finish</em>. For a
+        long-running loop, drive the drains yourself. That is what
+        <code>run_standalone</code> does, deferring <code>finish()</code> to the final
+        iteration.
+    </p>
+</div>
+
+<p>
+    Sources are also drained <b>one component at a time</b>, each with its own row count. Two
+    sources feeding two components with different numbers of rows will leave the Dataset
+    inconsistent, because <code>append_record_batch</code> extends the shared
+    <code>row_count</code> as it goes. Give every component the same number of rows per cycle,
+    or drain only one.
+</p>
+
+<h2 id="cast">Casting into the component schema</h2>
+
+<p>
+    A component's schema is registered once and enforced on every append: the batch's
+    <code>schema().fields()</code> must equal the registered <code>fields()</code>, compared
+    by name, data type, nullability and order. There is no in-place retype of a registered
+    column, so a cast is a <b>pre-ingestion</b> step. <code>cast_batch</code> is the pure
+    function; <code>CastingSource</code> is that function wrapped as a <code>Source</code>.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>CastOptions comes from the arrow-cast crate</em></div>
+    <pre><code class="language-rust">use std::collections::HashMap;
+use std::path::Path;
+use arrow_cast::CastOptions;
+use arrow_schema::DataType;
+use pcs_service::io::{CsvSource, CastingSource, build_target_schema};
+
+// The file says Int32 / Float32; the component declares Int64 / Float64.
+let file = CsvSource::from_path(Path::new("trades.csv"), file_schema.clone(), true)?;
+
+let mut overrides = HashMap::new();
+overrides.insert("id",    DataType::Int64);
+overrides.insert("price", DataType::Float64);
+let target = build_target_schema(&amp;file_schema, &amp;overrides);
+
+let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
+</div>
+
+<p>The rules <code>cast_batch</code> follows, in the order it applies them:</p>
+
+<ul>
+    <li>It walks the <b>target's</b> fields and looks each one up in the batch <b>by name</b>,
+        so column order in the incoming batch does not matter.</li>
+    <li>A column in the batch that the target does not name is <b>dropped</b>.</li>
+    <li>A column the target names that the batch does not have is an <b>error</b> &mdash;
+        <code>cast_batch: source batch missing column '&lt;name&gt;'</code>. A cast cannot
+        invent data.</li>
+    <li>A column whose type already matches is cloned, not converted. Arrow arrays are
+        reference-counted, so a matching cast costs nothing.</li>
+    <li>The result is rebuilt against the target schema exactly, which is why nullability
+        comes from the target and the output is append-ready by construction.</li>
+</ul>
+
+<p>
+    <code>CastOptions::default()</code> is <code>safe: true</code>: a value that cannot be
+    represented in the target type becomes <code>null</code> rather than an error. Set
+    <code>safe: false</code> to get the error instead. The two settings interact. If safe
+    mode produces a null for a field the target declares non-nullable, the rebuild fails with
+    <code>cast_batch: RecordBatch rebuild error</code>.
+</p>
+
+<p>
+    <code>build_target_schema(source, overrides)</code> covers the common case: clone a
+    source schema and replace the data type of a named subset of fields, keeping every
+    field's nullability as it was.
+</p>
+
+<div class="note">
+    <span class="note-label">Constraint</span>
+    <p>
+        A cast adapts <b>types</b>, never <b>shape</b>. If the component declares a column the
+        file does not contain, no <code>CastingSource</code> configuration will help; write a
+        small wrapping <code>Source</code> that builds the missing array and re-assembles the
+        batch. <code>crates/pcs-service/examples/scheduler_parquet_etl.rs</code> does exactly
+        that to pad a zero-filled output column.
+    </p>
+</div>
+
+<h2 id="builtins">What ships in the box</h2>
+
+<p>
+    The traits, the two drain functions, the cast helpers and the channel transport all live
+    in <code>pcs-core</code>. The file formats live in <code>pcs-service</code>, because they
+    are the ones that pull in <code>parquet</code>, <code>arrow-csv</code> and
+    <code>arrow-json</code>. Everything is re-exported from <code>pcs_service::io</code>, so a
+    service build has a single import path for the lot.
+</p>
+
+<table class="rule-table">
+    <thead>
+        <tr><th>Format</th><th>Source</th><th>Sink</th><th>Cargo feature</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Traits &amp; drains</strong></td>
+            <td colspan="2"><code>Source</code>, <code>Sink</code>, <code>drain_into_dataset</code>, <code>drain_dataset</code></td>
+            <td><code>pcs-core/io</code> (implies <code>runtime</code>)</td>
+        </tr>
+        <tr>
+            <td><strong>Cast helpers</strong></td>
+            <td colspan="2"><code>cast_batch</code>, <code>CastingSource</code>, <code>build_target_schema</code></td>
+            <td><code>pcs-core/io</code></td>
+        </tr>
+        <tr>
+            <td><strong>Channel</strong></td>
+            <td><code>ChannelSource</code></td>
+            <td><code>ChannelSink</code></td>
+            <td><code>pcs-core/io</code></td>
+        </tr>
+        <tr>
+            <td><strong>Parquet</strong></td>
+            <td><code>ParquetSource</code></td>
+            <td><code>ParquetSink</code></td>
+            <td><code>pcs-service/io</code></td>
+        </tr>
+        <tr>
+            <td><strong>CSV</strong></td>
+            <td><code>CsvSource</code></td>
+            <td><code>CsvSink</code></td>
+            <td><code>pcs-service/io</code></td>
+        </tr>
+        <tr>
+            <td><strong>NDJSON</strong></td>
+            <td><code>JsonSource</code></td>
+            <td><code>JsonSink</code></td>
+            <td><code>pcs-service/io</code></td>
+        </tr>
+        <tr>
+            <td><strong>DataFusion SQL</strong></td>
+            <td><code>DataFusionSource</code></td>
+            <td>&mdash;</td>
+            <td><code>pcs-service/datafusion</code></td>
+        </tr>
+        <tr>
+            <td><strong>TOML factories</strong></td>
+            <td colspan="2"><code>ParquetSourceFactory</code> and siblings, <code>register_builtin_factories</code></td>
+            <td><code>pcs-service/service</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <code>pcs-service</code>'s <code>io</code> feature turns on <code>pcs-core/io</code> for
+    you, and <code>datafusion</code> is defined as <code>["io", "dep:datafusion"]</code>, so
+    asking for the SQL source gets you everything above it. The <code>service</code> feature
+    also implies <code>io</code>.
+</p>
+
+<p>Every constructor, since they are not uniform:</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>signatures, not calls</em></div>
+    <pre><code class="language-rust">// Parquet: self-describing, so the source needs no schema.
+ParquetSource::from_path(&amp;Path)                       -&gt; Result&lt;Self&gt;
+ParquetSource::from_path_async(&amp;Path).await           -&gt; Result&lt;Self&gt;   // metadata read off-executor
+ParquetSink::from_path(&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;   // Snappy
+
+// CSV: schema is required. `has_header` skips or writes the name row.
+CsvSource::from_path(&amp;Path, Arc&lt;Schema&gt;, has_header: bool) -&gt; Result&lt;Self&gt;
+CsvSink::from_path  (&amp;Path, Arc&lt;Schema&gt;, has_header: bool) -&gt; Result&lt;Self&gt;
+
+// NDJSON: one JSON object per line.
+JsonSource::from_path (&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
+JsonSource::with_infer(&amp;Path, Option&lt;usize&gt;)          -&gt; Result&lt;Self&gt;   // default 1024 rows
+JsonSource::from_bytes(&amp;[u8], Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
+JsonSink::from_path   (&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
+
+// Channel: returns the paired endpoint alongside the source or sink.
+ChannelSource::new(Arc&lt;Schema&gt;, buffer: usize) -&gt; (mpsc::Sender&lt;RecordBatch&gt;, Self)
+ChannelSink::new  (Arc&lt;Schema&gt;, buffer: usize) -&gt; (Self, mpsc::Receiver&lt;RecordBatch&gt;)</code></pre>
+</div>
+
+<p>
+    Only <code>JsonSource::with_infer</code> infers a schema; <code>CsvSource</code> and
+    <code>JsonSource::from_path</code> both require one, and the schema you pass governs the
+    column types regardless of what the text looks like. <code>estimated_rows</code> is
+    implemented by <code>ParquetSource</code> (summed from row-group metadata, no data read)
+    and forwarded by <code>CastingSource</code>; every other source returns
+    <code>None</code>.
+</p>
+
+<p>
+    <code>finish()</code> means different things per sink, and that matters when you decide
+    where to call it. <code>ParquetSink</code> closes the writer and writes the footer, after
+    which any further write is an error. <code>JsonSink</code> finalises the line-delimited
+    writer. <code>CsvSink</code> and <code>ChannelSink</code> have nothing to flush, so their
+    <code>finish</code> is a no-op. <code>CsvSink</code> relies on its
+    <code>BufWriter</code> flushing when dropped.
+</p>
+
+<h2 id="channel">The in-memory channel</h2>
+
+<p>
+    <code>ChannelSource</code> and <code>ChannelSink</code> are a <code>tokio</code> mpsc
+    pair dressed as IO. They exist for two jobs: testing a pipeline without touching the
+    filesystem, and bridging a pipeline to another async task in the same process.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>the sender and receiver are yours to hold</em></div>
+    <pre><code class="language-rust">use pcs_service::io::{ChannelSink, ChannelSource, Source};
+
+let (tx, mut src)   = ChannelSource::new(schema.clone(), 8);
+let (mut sink, mut rx) = ChannelSink::new(schema.clone(), 8);
+
+tx.send(batch).await.unwrap();
+drop(tx);                                  // EOF: next_batch now returns Ok(None)
+
+assert!(src.next_batch().await?.is_some());
+assert!(src.next_batch().await?.is_none());</code></pre>
+</div>
+
+<p>
+    EOF is <b>the sender being dropped</b>, not a sentinel value, so a source you never drop
+    the sender for will wait forever. <code>ChannelSource</code> validates each received
+    batch against its declared schema and returns an error on mismatch, which makes it a
+    useful place to catch a producer drifting from the component definition.
+    <code>ChannelSink</code> clones each batch into the channel and reports
+    <code>pending_rows</code> as <em>configured capacity minus remaining capacity</em>. Read
+    that number carefully: an mpsc slot holds one <code>RecordBatch</code>, so it counts
+    <b>batches</b> in flight, not rows, despite the method name.
+</p>
+
+<p>
+    One caveat if you reach these through TOML: <code>ChannelSourceFactory</code> and
+    <code>ChannelSinkFactory</code> cannot hand the other endpoint back to you, so they build
+    a pair whose sender is dropped immediately &mdash; an instant-EOF source. For real use,
+    construct the channel yourself and pass the endpoint in programmatically.
+</p>
+
+<h2 id="datafusion">SQL results as a Source</h2>
+
+<p>
+    The <code>datafusion</code> feature adds one adapter, in one direction: a DataFusion
+    query becomes a PCS <code>Source</code>. It streams lazily, pulling from DataFusion's
+    execution stream one batch per <code>next_batch</code>, so a filter or aggregation runs in
+    DataFusion and only the result crosses into the Dataset.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>from crates/pcs-service/examples/datafusion_interop.rs</em></div>
+    <pre><code class="language-rust">use datafusion::prelude::SessionContext;
+use pcs_service::dataset::Dataset;
+use pcs_service::io::{DataFusionSource, drain_into_dataset};
+
+let ctx = SessionContext::new();
+ctx.register_table("sales", Arc::new(mem_table))?;
+
+let mut src = DataFusionSource::from_sql(
+    &amp;ctx,
+    "SELECT product_id, quantity, unit_price FROM sales WHERE region = 'north'",
+).await?;
+
+let mut data = Dataset::new();
+data.register_raw_component("records", src.schema());
+let rows = drain_into_dataset(&amp;mut src, &amp;mut data, "records").await?;</code></pre>
+</div>
+
+<p>
+    <code>register_raw_component(name, schema)</code> is the natural pairing here: the query's
+    projected schema is only known after planning, so take it from the source rather than
+    declaring a <code>Component</code> up front. <code>DataFusionSource::from_stream</code>
+    takes a <code>SendableRecordBatchStream</code> you already hold, and
+    <code>with_estimated_rows(n)</code> supplies the progress hint DataFusion cannot.
+    <code>estimated_rows</code> is <code>None</code> otherwise.
+</p>
+
+<p>
+    There is no adapter in the other direction. A <code>Dataset</code> is not exposed as a
+    DataFusion <code>TableProvider</code>. Run the example with
+    <code>cargo run -p pcs-service --example datafusion_interop --features datafusion</code>.
+</p>
+
+<h2 id="config">Declaring IO in TOML</h2>
+
+<p>
+    The service reads <code>[[sources]]</code> and <code>[[sinks]]</code> tables and looks the
+    <code>type</code> string up in a <code>Registry</code> of factories. That registry starts
+    <b>empty</b>. Nothing is registered implicitly, so a config naming
+    <code>ParquetSource</code> fails with <em>no source factory registered for type</em>
+    until you install the built-ins.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>installs Parquet, JSON, CSV and Channel, both directions</em></div>
+    <pre><code class="language-rust">use pcs_service::service::builder::ServiceBuilder;
+use pcs_service::service::factories::register_builtin_factories;
+
+let builder = register_builtin_factories(ServiceBuilder::new())
+    .with_runtime(Box::new(pipeline));</code></pre>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>target_component and source_component name a component, not a file</em></div>
+    <pre><code class="language-toml">[[sources]]
+name = "input"
+type = "ParquetSource"
+target_component = "Trade"
+
+[sources.config]
+path = "/data/trades.parquet"
+
+[[sinks]]
+name = "output"
+type = "ParquetSink"
+source_component = "Trade"
+
+[sinks.config]
+path = "/data/out.parquet"
+
+[[sinks.config.schema_fields]]
+name = "id"
+type = "Int64"
+nullable = false
+
+[[sinks.config.schema_fields]]
+name = "price"
+type = "Float64"
+nullable = false</code></pre>
+</div>
+
+<p>
+    <code>[sources.config]</code> is an opaque TOML value handed straight to the factory, so
+    the accepted keys are the factory's business. <code>ParquetSource</code> wants only
+    <code>path</code>, because Parquet carries its own schema. Every other built-in also wants
+    <code>schema_fields</code>: a list of <code>{ name, type, nullable }</code>, where
+    <code>type</code> is one of the Arrow primitive names (<code>Int64</code>,
+    <code>Float64</code>, <code>Utf8</code>, <code>Boolean</code>, <code>Date32</code> and so
+    on) and <code>nullable</code> defaults to <code>true</code>. CSV additionally accepts
+    <code>has_headers</code>, and the channel factories accept <code>buffer</code>.
+</p>
+
+<p>
+    Two load-time checks then run before the first iteration.
+    <code>validate_io_coverage</code> confirms every <code>target_component</code> and
+    <code>source_component</code> appears in the runtime's
+    <code>declared_components()</code>, and reports all unresolved references in a single
+    error; a runtime that declares nothing opts out of the check. Separately, cluster mode
+    <b>rejects</b> <code>[[sources]]</code> outright: a cluster ingests through
+    <code>PartitionSource</code>, so declared sources would be silently ignored and the
+    pipeline would sit idle. That is a hard configuration error, not a warning.
+</p>
+
+<h2 id="next">Next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <span class="next-card-label">Concept 05</span>
+        <h3>Distributed Runner</h3>
+        <p>The other way rows arrive: partitions claimed from a shared store instead of pulled from a Source.</p>
+    </a>
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <span class="next-card-label">Running at scale</span>
+        <h3>Service</h3>
+        <p>The binary that owns the drain loop, reads the TOML above, and decides when finish() gets called.</p>
+    </a>
+</div>
+
+{% endblock %}

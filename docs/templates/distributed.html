@@ -1,0 +1,694 @@
+{% extends "base.html" %}
+
+{% block title %}Distributed Runner — PCS{% endblock %}
+{% block description %}How the same Pipeline runs on several nodes at once: each claims a row range under a lease, checkpoints Arrow IPC bytes into redb, and acks. Leases expire, so processing is at-least-once.{% endblock %}
+{% block og_title %}Distributed Runner — PCS{% endblock %}
+{% block og_description %}One pipeline, many nodes, one lease per row range. At-least-once, backed by redb and optionally Raft.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Concept 05</div>
+<h1>Distributed Runner</h1>
+
+<p class="page-lede">
+    The same <code>Pipeline</code>, run by several processes at once against different
+    slices of the same data. Coordination is a lease on a row range; durability is Arrow
+    IPC bytes in an embedded database.
+</p>
+
+<dl class="page-facts">
+    <dt>In one line</dt>
+    <dd>Many nodes, one pipeline, <strong>at-least-once</strong> per row range</dd>
+    <dt>You need</dt>
+    <dd><code>pcs-service</code> with <code>distributed</code>; add <code>distributed-raft</code> for a cluster</dd>
+    <dt>Read this if</dt>
+    <dd>One process is not enough, and you need work to survive a node dying halfway through a batch</dd>
+</dl>
+
+<h2 id="loop">The claim loop</h2>
+
+<p>
+    <code>DistributedRunner</code> holds three things: a store, a
+    <code>Box&lt;dyn PipelineRuntime&gt;</code> used as a <b>template</b>, and a
+    <code>RunnerConfig</code>. Calling <code>run(world_factory)</code> starts a loop that
+    claims work, runs the template against it, persists the result, and acknowledges. Then
+    it goes back for more, until the store says there is nothing pending.
+</p>
+
+<p>
+    The claim is the whole mechanism. <code>PartitionSource::claim_next_batch</code> hands
+    back a <code>BatchClaim</code>: a <code>batch_id</code>, a half-open
+    <code>Range&lt;u32&gt;</code> of rows, a fresh <code>claim_id</code>, and a lease that
+    expires at a wall-clock millisecond. Hold the lease and the range is yours. Lose it and
+    somebody else gets the same rows.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 250" role="img" aria-labelledby="dst-loop-title dst-loop-desc">
+        <title id="dst-loop-title">One claim from grant to ack, and the same claim after a crash</title>
+        <desc id="dst-loop-desc">
+            The happy path runs left to right: claim a row range, build and run the dataset,
+            write one Arrow IPC checkpoint, then acknowledge the claim so the range is marked
+            completed. Below it the same claim after the holding node dies during the run: no
+            acknowledgement is sent, the lease eventually expires, any surviving runner
+            proposes a reclaim sweep that flips the row range back to pending, and another
+            node claims the identical rows under a new claim id. The rows are therefore
+            processed twice, which is what at-least-once means in practice.
+        </desc>
+
+        <text class="t-title" x="0" y="14">One claim, and the same claim after a crash</text>
+
+        <!-- ── happy path ─────────────────────────────────────────────── -->
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="0" y="30" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="30" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="44" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="45">1 &middot; claim</text>
+            <text class="t-sm" x="12" y="64">claim_next_batch()</text>
+            <text class="t-sm" x="12" y="78">the whole uncovered</text>
+            <text class="t-sm" x="12" y="92">span of a batch</text>
+            <text class="t-sm" x="12" y="106">lease: 90 s</text>
+        </g>
+
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="168" y="30" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="168" y="30" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="168" y="44" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="180" y="45">2 &middot; run</text>
+            <text class="t-sm t-data" x="180" y="64">world_factory() &rarr;</text>
+            <text class="t-sm t-data" x="180" y="78">your Dataset</text>
+            <text class="t-sm" x="180" y="92">run_on_with_state()</text>
+            <text class="t-sm" x="180" y="106">renews at TTL/3</text>
+        </g>
+
+        <g class="anim anim-2">
+            <rect class="blk blk-ctl" x="336" y="30" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="30" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="44" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="348" y="45">3 &middot; checkpoint</text>
+            <text class="t-sm" x="348" y="64">save_checkpoint()</text>
+            <text class="t-sm" x="348" y="78">stage_idx = 0</text>
+            <text class="t-sm t-data" x="348" y="92">Arrow IPC bytes</text>
+            <text class="t-sm t-data" x="348" y="106">at most 1 MiB</text>
+        </g>
+
+        <g class="anim anim-2">
+            <rect class="blk blk-ctl" x="504" y="30" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="504" y="30" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="504" y="44" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="516" y="45">4 &middot; ack</text>
+            <text class="t-sm" x="516" y="64">ack_claim()</text>
+            <text class="t-sm" x="516" y="78">range Completed</text>
+            <text class="t-sm" x="516" y="92">and never</text>
+            <text class="t-sm" x="516" y="106">re-issued</text>
+        </g>
+
+        <g class="anim anim-2">
+            <path class="arw arw-ctl" d="M150 74 H166" marker-end="url(#dst-l-c)"/>
+            <path class="arw arw-ctl" d="M318 74 H334" marker-end="url(#dst-l-c)"/>
+            <path class="arw arw-ctl" d="M486 74 H502" marker-end="url(#dst-l-c)"/>
+        </g>
+
+        <!-- ── the fork ───────────────────────────────────────────────── -->
+        <g class="anim anim-3">
+            <path class="arw arw-ctl" d="M243 118 V132 H75 V146" marker-end="url(#dst-l-c)"/>
+            <text class="t-sm t-ctl" x="100" y="128">the node dies here</text>
+        </g>
+
+        <!-- ── crash path ─────────────────────────────────────────────── -->
+        <g class="anim anim-3">
+            <rect class="blk blk-ctl" x="0" y="150" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="150" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="164" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="165">node A dies</text>
+            <text class="t-sm" x="12" y="184">no ack, no release</text>
+            <text class="t-sm" x="12" y="198">the claim row stays</text>
+            <text class="t-sm" x="12" y="212">Claimed until its</text>
+            <text class="t-sm" x="12" y="226">lease runs out</text>
+        </g>
+
+        <g class="anim anim-3">
+            <rect class="blk blk-ctl" x="168" y="150" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="168" y="150" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="168" y="164" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="180" y="165">lease expires</text>
+            <text class="t-sm" x="180" y="184">any live runner</text>
+            <text class="t-sm" x="180" y="198">proposes</text>
+            <text class="t-sm" x="180" y="212">ReclaimExpired</text>
+            <text class="t-sm" x="180" y="226">roughly every 30 s</text>
+        </g>
+
+        <g class="anim anim-4">
+            <rect class="blk blk-ctl" x="336" y="150" width="150" height="88" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="150" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="336" y="164" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="348" y="165">node B claims</text>
+            <text class="t-sm" x="348" y="184">Claimed &rarr; Pending</text>
+            <text class="t-sm" x="348" y="198">same batch, same</text>
+            <text class="t-sm" x="348" y="212">rows, new claim_id</text>
+        </g>
+
+        <g class="anim anim-4">
+            <rect class="blk blk-data" x="504" y="150" width="150" height="88" rx="8"/>
+            <rect class="hd hd-data" x="504" y="150" width="150" height="22" rx="8"/>
+            <rect class="hd hd-data" x="504" y="164" width="150" height="8"/>
+            <text class="t-lbl t-data" x="516" y="165">runs again</text>
+            <text class="t-sm" x="516" y="184">the same rows are</text>
+            <text class="t-sm" x="516" y="198">processed twice</text>
+            <text class="t-sm t-data" x="516" y="212">at-least-once, not</text>
+            <text class="t-sm t-data" x="516" y="226">exactly-once</text>
+        </g>
+
+        <g class="anim anim-4">
+            <path class="arw arw-ctl" d="M150 194 H166" marker-end="url(#dst-l-c)"/>
+            <path class="arw arw-ctl" d="M318 194 H334" marker-end="url(#dst-l-c)"/>
+            <path class="arw arw-data" d="M486 194 H502" marker-end="url(#dst-l-d)"/>
+        </g>
+
+        <defs>
+            <marker id="dst-l-c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--control)"/>
+            </marker>
+            <marker id="dst-l-d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--data)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-control"><i></i> claims, leases, coordination</span>
+        <span class="k-data"><i></i> rows and Arrow IPC bytes</span>
+    </div>
+    <figcaption class="dgm-cap">
+        A claim covers <b>one whole batch</b>, so nodes scale by taking different batches,
+        never by splitting one. The gap between <b>step 3 and step 4</b> is where duplicates
+        come from: work that ran but never acked is handed to somebody else, so every system
+        has to tolerate seeing the same rows twice.
+    </figcaption>
+</div>
+
+<p>
+    Two lease mechanisms keep the window narrow. Before the run,
+    <code>should_renew</code> checks whether less than 30&nbsp;% of the TTL (or ten seconds,
+    whichever is smaller) remains, and renews if so. During the run a renewal task sits
+    beside <code>run_on_with_state</code> in the same <code>tokio::select!</code>, renewing
+    at <code>TTL/3</code>. If a renewal fails the select resolves on the renewal branch, the
+    run is cancelled at its next await point, and the claim is released rather than acked.
+    A runner never keeps working on a lease it has lost.
+</p>
+
+<p>
+    The same is true after the run. If the checkpoint write fails, or the accumulator save
+    fails, or the state blob save fails, the runner calls <code>release_claim</code> and
+    skips the ack. Nothing is acknowledged that could not be made durable.
+</p>
+
+<div class="note note-warn">
+    <span class="note-label">The runner does not load your rows</span>
+    <p>
+        <code>world_factory</code> is called once per claim and whatever it returns is what
+        the pipeline sees. The runner <b>never</b> reads the master batch's Arrow IPC back
+        out of the store. Registering the components and filling in the rows for
+        <code>claim.row_range</code> is your closure's job. See
+        <code>examples/distributed_fulfillment/store.rs</code>, which wraps the store to
+        intercept <code>claim_next_batch</code> and stash the IPC where the factory can
+        reach it.
+    </p>
+</div>
+
+<h2 id="modes">Standalone and clustered</h2>
+
+<p>
+    Both modes use the same two traits and the same runner. Only the store construction
+    differs.
+</p>
+
+<table class="rule-table">
+    <thead><tr><th>Feature</th><th>What it adds</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><code>distributed</code></td>
+            <td><code>PartitionSource</code>, <code>CheckpointStore</code>,
+                <code>DistributedRunner</code>, and <code>RedbSharedStore::single_node</code>
+                &mdash; one redb file, commands applied directly, no quorum.</td>
+        </tr>
+        <tr>
+            <td><code>distributed-raft</code></td>
+            <td>openraft on top: <code>ArrowRedbLogStore</code>,
+                <code>ArrowRedbStateMachine</code>, the snapshot codec, the TCP transport,
+                <code>ArrowRaftDriver</code>, and <code>RedbSharedStore::multi_node</code>.</td>
+        </tr>
+        <tr>
+            <td><code>service-cluster</code></td>
+            <td><code>service</code> plus <code>distributed-raft</code> &mdash; what the
+                <code>pcs-service</code> binary needs to run <code>mode = "cluster"</code>
+                from TOML.</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <code>RedbSharedStore</code> is an enum, not a trait object. The
+    <code>SingleNode</code> variant owns an <code>Arc&lt;Database&gt;</code>; the
+    <code>MultiNode</code> variant deliberately owns no database at all, only the state
+    machine's shared handle for reads and a Raft driver handle for writes. The type system
+    is what stops a clustered node from quietly applying a command to its local file.
+</p>
+
+<h2 id="batches">Publishing work</h2>
+
+<p>
+    A <b>master batch</b> is a registered chunk of Arrow IPC with an id, a component name, a
+    schema version, and a row count. Runners never create batches; they consume them.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>five arguments, in this order</em></div>
+    <pre><code class="language-rust">store
+    .register_master_batch(
+        0,                         // batch_id: u64
+        Order::name().to_string(), // component: String
+        1,                         // schema_id: u32
+        ipc_bytes,                 // Vec&lt;u8&gt;, an Arrow IPC stream
+        900,                       // total_rows: u32
+    )
+    .await?;</code></pre>
+</div>
+
+<p>
+    Claim granularity follows directly from how a pending range is found. The state machine
+    collects every <code>Claimed</code> or <code>Completed</code> range for the batch and
+    returns the first row not covered by one. For a freshly registered batch that is
+    <code>0..total_rows</code>, <b>the whole thing</b>. So a second node does not get half
+    of batch 0; it gets batch 1. Parallelism is a function of how many batches you register,
+    and how big you make them.
+</p>
+
+<p>
+    That is also why the 1&nbsp;MiB cap matters at ingestion time.
+    <code>MAX_LOG_ENTRY_BYTES</code> is <code>1024 * 1024</code>, and
+    <code>register_master_batch</code> rejects anything larger before it can reach Raft.
+    Split the input into several <code>batch_id</code>s and you get durable log entries and
+    cross-node parallelism from the same decision.
+</p>
+
+<h2 id="single">Running one node</h2>
+
+<p>
+    Single-node mode is a real deployment, not a toy: one process, one redb file, every
+    command applied straight to it. It is also the shortest path to seeing the loop work.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>feature = "distributed"</em></div>
+    <pre><code class="language-rust">use std::path::Path;
+
+use pcs_service::PcsResult;
+use pcs_service::component::Component;
+use pcs_service::dataset::Dataset;
+use pcs_service::distributed::RedbSharedStore;
+use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
+use pcs_service::distributed::strategy::CheckpointStrategy;
+use pcs_service::pipeline::Pipeline;
+
+#[tokio::main]
+async fn main() -&gt; PcsResult&lt;()&gt; {
+    // One redb file. No Raft, no second database, no quorum.
+    let store = RedbSharedStore::single_node(Path::new("/var/lib/pcs/pcs.redb"))?;
+
+    let (ipc_bytes, total_rows) = encode_orders_ipc()?;
+    store
+        .register_master_batch(0, Order::name().to_string(), 1, ipc_bytes, total_rows)
+        .await?;
+
+    // A template. Its own dataset, sources and sinks are never used — each
+    // claim runs against whatever `world_factory` hands back.
+    let template = Pipeline::builder("order-processor")
+        .with::&lt;Order&gt;()
+        .with_system(ValidateOrder)
+        .with_system(PriceOrder)
+        .build();
+
+    let runner = DistributedRunner::new(
+        store,
+        Box::new(template),
+        RunnerConfig {
+            checkpoint_strategy: CheckpointStrategy::EveryStage,
+            schema_id: 1,
+            max_batches: None,
+            ..Default::default()
+        },
+    );
+
+    // Called once per claim. Register the components and load the rows here.
+    let processed = runner.run(hydrate_partition).await?;
+    println!("{processed} batches acked");
+    Ok(())
+}</code></pre>
+</div>
+
+<p>
+    <code>run</code> returns the number of batches it acked. It stops when
+    <code>claim_next_batch</code> returns <code>None</code>, or when
+    <code>max_batches</code> is reached. For a long-lived service use
+    <code>run_with_shutdown</code>, which takes a <code>CancellationToken</code> and exits
+    between batches without holding a lease.
+</p>
+
+<h2 id="state">Where state lives</h2>
+
+<p>
+    A clustered node keeps two redb files side by side. Only one of them is agreed on by the
+    cluster; the other is a local consequence of applying it.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 344" role="img" aria-labelledby="dst-state-title dst-state-desc">
+        <title id="dst-state-title">What Raft replicates, and what is only ever local</title>
+        <desc id="dst-state-desc">
+            Each node holds two redb files. The Raft log file holds the vote, the purge
+            watermark, and the committed consensus commands, and it is the only thing that
+            travels between nodes. The application file holds master batches, claims,
+            checkpoints and instance records, and is rebuilt locally by applying the log;
+            every read is served from it without touching the network. The checkpoint table
+            is keyed by claim id and stage index, where stage index zero holds the partition
+            dataset, u32::MAX minus one holds a runtime's own state blob, and u32::MAX holds
+            the window accumulator. Every payload is Arrow IPC and is capped at one mebibyte.
+        </desc>
+
+        <text class="t-title" x="0" y="14">Where a clustered node keeps its state</text>
+
+        <!-- ── node 1 ─────────────────────────────────────────────────── -->
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="0" y="32" width="250" height="122" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="32" width="250" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="46" width="250" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="47">node 1 &middot; leader</text>
+
+            <rect class="row" x="8" y="62" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="16" y="76">raft-log.redb</text>
+            <text class="t-sm t-ctl" x="150" y="76">replicated</text>
+            <text class="t-sm" x="16" y="94">vote &middot; purge mark &middot; log entries</text>
+
+            <rect class="row" x="8" y="102" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="16" y="116">cluster-app.redb</text>
+            <text class="t-sm t-data" x="150" y="116">local</text>
+            <text class="t-sm" x="16" y="134">claims &middot; checkpoints</text>
+            <text class="t-sm" x="16" y="148">arrow_sm_meta: last_applied</text>
+        </g>
+
+        <!-- ── node 2 ─────────────────────────────────────────────────── -->
+        <g class="anim anim-2">
+            <rect class="blk blk-ctl" x="404" y="32" width="250" height="122" rx="8"/>
+            <rect class="hd hd-ctl" x="404" y="32" width="250" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="404" y="46" width="250" height="8"/>
+            <text class="t-lbl t-ctl" x="416" y="47">node 2 &middot; follower</text>
+
+            <rect class="row" x="412" y="62" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="420" y="76">raft-log.redb</text>
+            <text class="t-sm t-ctl" x="554" y="76">replicated</text>
+            <text class="t-sm" x="420" y="94">same entries, same order</text>
+
+            <rect class="row" x="412" y="102" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="420" y="116">cluster-app.redb</text>
+            <text class="t-sm t-data" x="554" y="116">local</text>
+            <text class="t-sm" x="420" y="134">rebuilt, never shipped</text>
+            <text class="t-sm" x="420" y="148">serves this node's reads</text>
+        </g>
+
+        <g class="anim anim-2">
+            <path class="arw arw-ctl" d="M250 72 H400" marker-end="url(#dst-s-c)"/>
+            <text class="t-sm t-ctl" x="262" y="64">committed entries</text>
+            <text class="t-sm" x="262" y="92">leader &rarr; followers</text>
+            <text class="t-sm" x="262" y="112">followers forward</text>
+            <text class="t-sm" x="262" y="126">proposals back</text>
+        </g>
+
+        <g class="anim anim-2">
+            <text class="t-sm t-ctl" x="0" y="174">replicated: raft-log.redb, nothing else</text>
+            <text class="t-sm t-data" x="0" y="188">local: cluster-app.redb, and every read of it</text>
+            <path class="ln" d="M0 204 H654"/>
+        </g>
+
+        <!-- ── the checkpoint table ───────────────────────────────────── -->
+        <g class="anim anim-3">
+            <rect class="blk blk-data" x="0" y="218" width="418" height="112" rx="8"/>
+            <rect class="hd hd-data" x="0" y="218" width="418" height="22" rx="8"/>
+            <rect class="hd hd-data" x="0" y="232" width="418" height="8"/>
+            <text class="t-lbl t-data" x="12" y="233">arrow_checkpoints</text>
+            <text class="t-sm" x="12" y="252">key = (claim_id, stage_idx) &middot; value = Arrow IPC bytes</text>
+
+            <rect class="row" x="8" y="260" width="402" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="273">stage_idx 0</text>
+            <text class="t-sm" x="140" y="273">the partition Dataset</text>
+
+            <rect class="row" x="8" y="282" width="402" height="18" rx="3"/>
+            <text class="t-sm t-bnd" x="16" y="295">u32::MAX - 1</text>
+            <text class="t-sm t-bnd" x="140" y="295">the runtime's own state blob</text>
+
+            <rect class="row" x="8" y="304" width="402" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="317">u32::MAX</text>
+            <text class="t-sm" x="140" y="317">the window accumulator</text>
+        </g>
+
+        <!-- ── the guest boundary ─────────────────────────────────────── -->
+        <g class="anim anim-4">
+            <rect class="blk blk-bnd" x="438" y="218" width="216" height="44" rx="8"/>
+            <rect class="hd hd-bnd" x="438" y="218" width="216" height="22" rx="8"/>
+            <rect class="hd hd-bnd" x="438" y="232" width="216" height="8"/>
+            <text class="t-lbl t-bnd" x="450" y="233">WASM guest</text>
+            <text class="t-sm" x="450" y="252">run-batch returns it</text>
+
+            <path class="arw arw-bnd" d="M546 264 V292 H424" marker-end="url(#dst-s-b)"/>
+
+            <text class="t-sm t-data" x="438" y="306">MAX_LOG_ENTRY_BYTES</text>
+            <text class="t-sm" x="438" y="320">= 1 MiB, enforced</text>
+            <text class="t-sm" x="438" y="334">before Raft sees it</text>
+        </g>
+
+        <defs>
+            <marker id="dst-s-c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--control)"/>
+            </marker>
+            <marker id="dst-s-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--boundary)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-control"><i></i> replicated coordination state</span>
+        <span class="k-data"><i></i> Arrow IPC payloads</span>
+        <span class="k-boundary"><i></i> produced inside the guest</span>
+    </div>
+    <figcaption class="dgm-cap">
+        Every node has the whole picture, but only <code>raft-log.redb</code> is agreed on.
+        <code>cluster-app.redb</code> is <b>derived</b>. That is why handing a node a log
+        file and an application file from different backups has to be a startup error, not
+        a silent divergence.
+    </figcaption>
+</div>
+
+<p>
+    All three checkpoint kinds share one table and one API. They are told apart by
+    <code>stage_idx</code>, and the two reserved values sit far above any real stage index,
+    which numbers from zero and stays in the dozens.
+</p>
+
+<table class="rule-table">
+    <thead><tr><th>Constant</th><th>Value</th><th>Payload</th></tr></thead>
+    <tbody>
+        <tr>
+            <td>&mdash;</td>
+            <td><code>0</code></td>
+            <td>The whole partition <code>Dataset</code>, written by the runner after the run.</td>
+        </tr>
+        <tr>
+            <td><code>GUEST_STATE_STAGE_SENTINEL</code></td>
+            <td><code>u32::MAX - 1</code></td>
+            <td>Whatever <code>run_on_with_state</code> returned. Opaque to the host.</td>
+        </tr>
+        <tr>
+            <td><code>ACCUMULATOR_STAGE_SENTINEL</code></td>
+            <td><code>u32::MAX</code></td>
+            <td>The <code>WindowAccumulator</code> component alone, via
+                <code>write_component_ipc</code>.</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="note note-warn">
+    <span class="note-label">The stage checkpoint is write-only, and there is one of it</span>
+    <p>
+        The runner calls <code>run_on_with_state</code> <b>once</b> per claim, since the
+        runtime runs its own stages internally, then writes a single checkpoint at
+        <code>stage_idx = 0</code>. Nothing reads it back: recovery re-runs the batch from
+        the top rather than resuming mid-pipeline. Two consequences.
+        <code>CheckpointStrategy::EveryNStages(n)</code> only ever fires for
+        <code>n == 1</code>, because the sole call is <code>should_checkpoint(0)</code>. And
+        the checkpoint is an artefact for an operator or an external reader, not a resume
+        point.
+    </p>
+</div>
+
+<h2 id="cluster">Wiring a cluster</h2>
+
+<p>
+    <code>ArrowRaftDriver::start</code> is async, takes the two database paths, and returns
+    the handle plus the driver's task. Keep the task alive for the life of the process.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>feature = "distributed-raft"</em></div>
+    <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::Arc;
+
+use pcs_service::distributed::RedbSharedStore;
+use pcs_service::distributed::consensus::{ArrowRaftDriver, ArrowRaftDriverConfig};
+
+// Opens both redb files and refuses to start if the state machine is behind
+// what the log store has already purged.
+let (handle, _driver_task) = ArrowRaftDriver::start(
+    ArrowRaftDriverConfig {
+        node_id: 1,
+        listen_addr: "0.0.0.0:9001".parse().unwrap(),
+        // "host:port" strings, resolved lazily at connect time, so Docker
+        // service names work. An empty map auto-initialises a single node.
+        peers: HashMap::from([
+            (2, "pcs-2:9001".to_string()),
+            (3, "pcs-3:9001".to_string()),
+        ]),
+        heartbeat_interval_ms: 50,
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 300,
+    },
+    data_dir.join("raft-log.redb"),      // openraft log store
+    data_dir.join("cluster-app.redb"),   // applied state
+)
+.await?;
+
+// `start` wires outbound connections only. Without this listener peers cannot
+// deliver votes or heartbeats and no leader is ever elected.
+let _tcp_server = handle.spawn_tcp_server("0.0.0.0:9001".parse().unwrap());
+
+// Reads lock the very database the state machine writes to — no second file
+// handle. Mutations are proposed through Raft.
+let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clone());</code></pre>
+</div>
+
+<p>
+    From here the runner code is byte-for-byte the single-node code: same template, same
+    <code>RunnerConfig</code>, same <code>runner.run(...)</code>. Only the store changed.
+</p>
+
+<p>
+    One node bootstraps the cluster once, with
+    <code>handle.initialize(members)</code> over a
+    <code>BTreeMap&lt;u64, openraft::BasicNode&gt;</code>; a second call is swallowed as a
+    no-op. Because <code>BasicNode</code> comes from openraft and PCS pins
+    <code>=0.10.0-alpha.17</code>, a crate calling <code>initialize</code> directly has to
+    match that pin. The <code>pcs-service</code> binary does all of this from TOML under
+    <code>mode = "cluster"</code>, so hand-rolling it is only for embedding the runner in
+    your own process.
+</p>
+
+<p>
+    You do not have to route work to the leader. A proposal made on a follower comes back as
+    <code>ForwardToLeader</code>, and the driver forwards it over the same TCP transport
+    using the address from its peers map. Every propose is wrapped in a 30-second timeout, so
+    an unreachable leader surfaces as a retryable
+    <code>cluster propose timeout (30s)</code> rather than a hang.
+</p>
+
+<h3>What refuses to start</h3>
+
+<p>
+    Immediately after opening the log store and the state machine,
+    <code>ArrowRaftDriver::start</code> reads <code>log_state.last_purged_log_id</code> and
+    the state machine's <code>last_applied</code>, and hands both to
+    <code>validate_store_consistency</code>. It returns an error, and the node does not
+    start, in two cases:
+</p>
+
+<ul>
+    <li>The log store has purged up to some index but the state machine reports
+        <code>last_applied = None</code>.</li>
+    <li>The state machine's <code>last_applied.index</code> is behind the log store's purge
+        watermark.</li>
+</ul>
+
+<p>
+    Both mean the log and the application file did not come from the same node at the same
+    moment. The usual cause is restoring the two files from different backups, or wiping
+    <code>raft-log.redb</code> while keeping <code>cluster-app.redb</code>. Failing at
+    startup avoids a replica that diverges quietly.
+</p>
+
+<h2 id="guest-state">State that outlives a batch</h2>
+
+<p>
+    A native <code>Pipeline</code> keeps everything it knows in the <code>Dataset</code>, so
+    the default <code>run_on_with_state</code> ignores <code>prior</code>, delegates to
+    <code>run_on</code>, and returns <code>Ok(None)</code>. Nothing extra is persisted.
+</p>
+
+<p>
+    A WASM guest cannot do that. Every call gets a fresh wasmtime <code>Store</code>, so
+    guest linear memory does not survive a batch. That is deliberate: a trapped instance
+    cannot corrupt anything that outlives it. The one channel left is the return value:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>the host seam, from pcs-core</em></div>
+    <pre><code class="language-rust">async fn run_on_with_state(
+    &amp;self,
+    data: &amp;mut Dataset,
+    prior: Option&lt;&amp;[u8]&gt;,
+) -&gt; PcsResult&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt;;</code></pre>
+</div>
+
+<p>
+    <code>WasmPipelineRuntime</code> passes <code>prior</code> straight into the guest's
+    <code>run-batch</code> export and returns the <code>checkpoint</code> field of the
+    result. The runner stores that blob under
+    <code>GUEST_STATE_STAGE_SENTINEL</code> and hands it back as the next call's
+    <code>prior</code>. On the guest side, one macro form opts in:
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>in the guest crate</em></div>
+    <pre><code class="language-rust">// Stateless: `prior` is ignored, `checkpoint` is always None.
+pcs_guest::export_pipeline!(build);
+
+// Stateful: systems read and write a `GuestState&lt;Counter&gt;` resource, and
+// whatever they leave in it becomes the next batch's `prior`.
+pcs_guest::export_pipeline!(build, state = Counter);</code></pre>
+</div>
+
+<p>
+    The pointer to the newest blob is a chain, not a fixed key: the blob is written under the
+    claim that produced it and read back under the id of the claim that wrote the previous
+    one, because the state machine resolves a checkpoint's <code>batch_id</code> through the
+    claims table and rejects a write whose uuid is not a live claim. Reads survive the ack,
+    so the chain holds for as long as the runner loop does. A runner that restarts hands the
+    runtime <code>None</code>, so the guest starts cold and rebuilds its state.
+</p>
+
+<h2 id="next">Next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
+        <span class="next-card-label">Running at scale</span>
+        <h3>Service</h3>
+        <p>Stop writing <code>main</code>. Describe the same deployment in TOML and let the
+            <code>pcs-service</code> binary build it.</p>
+    </a>
+    <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
+        <span class="next-card-label">Running at scale</span>
+        <h3>Operating pcs-service</h3>
+        <p>Data directories, bootstrap, rolling restarts, and what to watch when a lease
+            starts flapping.</p>
+    </a>
+</div>
+
+{% endblock %}

@@ -1,0 +1,561 @@
+{% extends "base.html" %}
+
+{% block title %}Tracing &amp; metrics — PCS{% endblock %}
+{% block description %}PCS emits structured tracing events behind the tracing feature flag, and pcs-service exposes a Prometheus /metrics endpoint. What exists today, what the TOML keys are, and what is still uninstrumented.{% endblock %}
+{% block og_title %}Tracing &amp; metrics — PCS{% endblock %}
+{% block og_description %}One feature flag decides whether anything is emitted at all. Exactly what comes out, and what does not.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Reference</div>
+<h1>Tracing &amp; metrics</h1>
+
+<p class="page-lede">
+    PCS emits structured <code>tracing</code> events, gated behind one feature flag.
+    <code>pcs-core</code> emits; <code>pcs-service</code> exports.
+</p>
+
+<dl class="page-facts">
+    <dt>In one line</dt>
+    <dd>Events, a <code>fmt</code> subscriber, and a <strong>Prometheus endpoint that carries one series</strong></dd>
+    <dt>You need</dt>
+    <dd>The <code>tracing</code> feature on <code>pcs-core</code> or <code>pcs-service</code>; the <code>service</code> feature turns it on for you</dd>
+    <dt>Read this if</dt>
+    <dd>You are wiring a subscriber, picking a <code>RUST_LOG</code> filter, or scraping <code>/metrics</code> and wondering why it is nearly empty</dd>
+</dl>
+
+<h2 id="where">Where instrumentation comes from</h2>
+
+<p>
+    Two things leave a running PCS process, and they are wired independently.
+    <code>tracing</code> events go to whatever subscriber you installed. Prometheus
+    metrics go to the <code>/metrics</code> route on the service's HTTP control plane.
+    Neither one feeds the other.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 466" role="img" aria-labelledby="trc-title trc-desc">
+        <title id="trc-title">Where PCS instrumentation is produced and where it leaves</title>
+        <desc id="trc-desc">
+            Emission sites live in pcs-core and pcs-service, plus a WebAssembly guest that
+            logs across the component boundary through host-io. Every site sits behind the
+            compile-time cfg(feature = "tracing") gate, and the events that pass it reach
+            one tracing subscriber. Separately, the watchdog task records a single gauge
+            that the GET /metrics route encodes in Prometheus text format. The two exits
+            are not connected to each other, and the data plane itself carries no
+            instrumentation.
+        </desc>
+
+        <text class="t-title" x="0" y="14">Instrumentation</text>
+        <text class="t-sm" x="0" y="30">pcs-core emits, pcs-service exports, one feature decides</text>
+
+        <!-- the data plane: the thing being observed, and it is untouched -->
+        <g class="anim anim-1">
+            <rect class="blk blk-data" x="0" y="44" width="654" height="30" rx="8"/>
+            <text class="t-lbl t-data" x="12" y="63">batch &rarr; run_on &rarr; checkpoint</text>
+            <text class="t-sm t-end" x="642" y="63">no spans on this path, no per-row events</text>
+        </g>
+
+        <!-- emission sites -->
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="0" y="92" width="186" height="72" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="92" width="186" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="106" width="186" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="107">pcs-core</text>
+
+            <rect class="row" x="8" y="120" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="133">retry &mdash; task_attempt</text>
+            <rect class="row" x="8" y="142" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="155">windows::system warn</text>
+        </g>
+
+        <g class="anim anim-2">
+            <rect class="blk blk-ctl" x="0" y="180" width="186" height="152" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="180" width="186" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="0" y="194" width="186" height="8"/>
+            <text class="t-lbl t-ctl" x="12" y="195">pcs-service</text>
+            <text class="t-sm t-end" x="178" y="195">62 events</text>
+
+            <rect class="row" x="8" y="208" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="221">service::standalone</text>
+            <rect class="row" x="8" y="228" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="241">distributed::runner</text>
+            <rect class="row" x="8" y="248" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="261">consensus::transport</text>
+            <rect class="row" x="8" y="268" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="281">wasm::host_impl</text>
+            <rect class="row" x="8" y="288" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="301">wasm::runner</text>
+            <rect class="row" x="8" y="308" width="170" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="321">service::http, shutdown</text>
+        </g>
+
+        <!-- the guest logs across the component boundary -->
+        <g class="anim anim-3">
+            <rect class="blk blk-bnd" x="0" y="352" width="186" height="64" rx="8"/>
+            <rect class="hd hd-bnd" x="0" y="352" width="186" height="20" rx="8"/>
+            <rect class="hd hd-bnd" x="0" y="364" width="186" height="8"/>
+            <text class="t-lbl t-bnd" x="12" y="366">guest .wasm</text>
+            <text class="t-sm" x="12" y="388">host-io::log</text>
+            <text class="t-sm" x="12" y="404">host-io::metric &rarr; trace</text>
+
+            <path class="arw arw-bnd" d="M93 350 V336" marker-end="url(#trc-b)"/>
+            <text class="t-sm t-bnd" x="102" y="346">bridged host-side</text>
+        </g>
+
+        <!-- the compile-time gate -->
+        <g class="anim anim-2">
+            <text class="t-sm t-ctl" x="222" y="158">#[cfg(feature = "tracing")]</text>
+            <rect class="blk blk-ctl" x="222" y="166" width="150" height="76" rx="8"/>
+            <rect class="hd hd-ctl" x="222" y="166" width="150" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="222" y="180" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="234" y="181">feature gate</text>
+
+            <rect class="row" x="230" y="194" width="134" height="18" rx="3"/>
+            <text class="t-sm" x="238" y="207">on: Event emitted</text>
+            <rect class="row-x" x="230" y="216" width="134" height="18" rx="3"/>
+            <text class="t-sm" x="238" y="229">off: not compiled</text>
+
+            <path class="arw arw-ctl" d="M186 128 H202 V196 H214" marker-end="url(#trc-c)"/>
+            <path class="arw arw-ctl" d="M186 256 H202 V212 H214" marker-end="url(#trc-c)"/>
+        </g>
+
+        <!-- the metric writer, which does not go through the gate -->
+        <g class="anim anim-3">
+            <rect class="blk blk-ctl" x="222" y="282" width="150" height="64" rx="8"/>
+            <rect class="hd hd-ctl" x="222" y="282" width="150" height="20" rx="8"/>
+            <rect class="hd hd-ctl" x="222" y="294" width="150" height="8"/>
+            <text class="t-lbl t-ctl" x="234" y="296">watchdog</text>
+            <text class="t-sm" x="234" y="318">1 tick / second</text>
+            <text class="t-sm" x="234" y="334">service::http</text>
+        </g>
+
+        <!-- exit one: a subscriber -->
+        <g class="anim anim-4">
+            <rect class="blk blk-ctl" x="406" y="158" width="248" height="100" rx="8"/>
+            <rect class="hd hd-ctl" x="406" y="158" width="248" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="406" y="172" width="248" height="8"/>
+            <text class="t-lbl t-ctl" x="418" y="173">tracing subscriber</text>
+
+            <rect class="row" x="414" y="186" width="232" height="18" rx="3"/>
+            <text class="t-sm" x="422" y="199">EnvFilter: RUST_LOG / log_level</text>
+            <rect class="row" x="414" y="208" width="232" height="18" rx="3"/>
+            <text class="t-sm" x="422" y="221">fmt layer: pretty | json</text>
+            <text class="t-sm" x="418" y="243">&rarr; stdout</text>
+
+            <path class="arw arw-ctl" d="M372 208 H398" marker-end="url(#trc-c)"/>
+        </g>
+
+        <!-- exit two: the scrape endpoint -->
+        <g class="anim anim-4">
+            <path class="ln" d="M406 272 H654"/>
+            <text class="t-sm" x="406" y="268">nothing crosses between these two</text>
+
+            <rect class="blk blk-ctl" x="406" y="284" width="248" height="100" rx="8"/>
+            <rect class="hd hd-ctl" x="406" y="284" width="248" height="22" rx="8"/>
+            <rect class="hd hd-ctl" x="406" y="298" width="248" height="8"/>
+            <text class="t-lbl t-ctl" x="418" y="299">GET /metrics</text>
+
+            <rect class="row" x="414" y="312" width="232" height="18" rx="3"/>
+            <text class="t-sm t-ctl" x="422" y="325">pcs_liveness_counter</text>
+            <rect class="row-x" x="414" y="334" width="232" height="18" rx="3"/>
+            <text class="t-sm" x="422" y="347">11 descriptors, no writer</text>
+            <text class="t-sm" x="418" y="369">text/plain; version=0.0.4</text>
+
+            <path class="arw arw-ctl" d="M372 314 H398" marker-end="url(#trc-c)"/>
+        </g>
+
+        <g class="anim anim-4">
+            <path class="ln" d="M0 436 H654"/>
+            <text class="t-sm" x="0" y="456">Turn the feature off and the left column vanishes at compile time. <tspan class="t-ctl">/metrics</tspan> still answers, with one series.</text>
+        </g>
+
+        <defs>
+            <marker id="trc-c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--control)"/>
+            </marker>
+            <marker id="trc-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--boundary)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-data"><i></i> the work being observed</span>
+        <span class="k-control"><i></i> emission and export</span>
+        <span class="k-boundary"><i></i> the guest, logging across the seam</span>
+    </div>
+    <figcaption class="dgm-cap">
+        The two exits are not connected. Nothing in the log stream reaches
+        <code>/metrics</code>, and the single series <code>/metrics</code> carries is
+        written by the <b>watchdog</b>, not by anything in your pipeline.
+    </figcaption>
+</div>
+
+<h2 id="feature">The tracing feature</h2>
+
+<p>
+    Both crates declare it, and it is off by default in <code>pcs-core</code>
+    (<code>default = ["runtime"]</code>). In <code>pcs-service</code> the
+    <code>service</code> feature includes <code>tracing</code>, and the
+    <code>pcs-service</code> binary requires <code>service</code>, so the shipped binary
+    always has instrumentation compiled in.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>as declared; the service list is abridged</em></div>
+    <pre><code class="language-toml"># crates/pcs-core/Cargo.toml
+tracing = ["dep:tracing"]
+
+# crates/pcs-service/Cargo.toml
+tracing = ["dep:tracing", "pcs-core/tracing"]
+service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></pre>
+</div>
+
+<div class="note">
+    <span class="note-label">Constraint</span>
+    <p>
+        This is a <b>compile-time</b> switch, not a runtime one. Every emission site sits
+        inside <code>#[cfg(feature = "tracing")]</code>, so with the feature off the call
+        <b>and its field formatting</b> are absent from the binary. There is no
+        disabled-level cost to pay, and emission cannot be turned back on without
+        rebuilding.
+    </p>
+</div>
+
+<p>
+    Two sites keep a fallback for the feature-off build, because losing them silently
+    would be worse than the dependency. <code>HostIo::log</code> falls back to
+    <code>eprintln!</code> so guest log lines are never dropped, and
+    <code>DistributedRunner</code>'s claim-release path prints to stderr so a failed
+    release is always visible.
+</p>
+
+<p>
+    Inside a <code>.wasm</code> guest the feature is never available:
+    <code>pcs-guest</code> pins its dependency as
+    <code>pcs-core = { default-features = false, features = ["guest"] }</code>. A guest
+    reports through the <code>host-io</code> imports instead: <code>log</code> and
+    <code>metric</code>, which the host bridges into its own subscriber.
+</p>
+
+<p>
+    <b>A guest's <code>println!</code> goes nowhere.</b> The host builds each guest's WASI
+    context with <code>WasiCtxBuilder::new().build()</code> and never calls
+    <code>inherit_stderr()</code>. That builder's documented default discards everything
+    written to stdout and stderr, so <code>println!</code> and <code>eprintln!</code>
+    inside a guest vanish. <code>host-io::log</code> is the only channel out.
+</p>
+
+<h2 id="events">The events, module by module</h2>
+
+<p>
+    One span, plus flat events spread across eleven modules. The span is
+    <code>task_attempt</code>, opened once per attempt by the shared retry driver in
+    <code>pcs-core</code>; every attempt of every system in a pipeline stage runs inside
+    one. Field names below are the exact keys the macros record, so they are what you
+    match on in a JSON log pipeline.
+</p>
+
+<table class="rule-table">
+    <thead><tr><th>Target</th><th>Levels</th><th>What it reports, and with which fields</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><code>pcs_core::retry</code></td>
+            <td>info span, warn, error</td>
+            <td>The <code>task_attempt</code> span at <code>info</code>, carrying <code>attempt</code> (1-based) and <code>max_attempts</code>; a <code>warn</code> per failed-but-retryable attempt with <code>error</code>, <code>attempt</code>, <code>max_attempts</code>, <code>delay_ms</code>; and an <code>error</code> on exhaustion with <code>error</code> and <code>attempts</code>. Both the async and the blocking driver emit it, from one shared attempt counter.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_core::windows::system</code></td>
+            <td>warn</td>
+            <td>Rows dropped because their timestamp was null: <code>component</code>, <code>time_field</code>, <code>null_count</code>. Needs the <code>windows</code> feature too.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::service::standalone</code></td>
+            <td>info, warn, error</td>
+            <td>Iteration lifecycle and per-source / per-sink failures: <code>iteration</code>, <code>mode</code>, <code>rows_processed</code>, <code>duration_ms</code>, <code>iteration_errors</code>, <code>source_name</code>, <code>sink_name</code>, <code>error</code>. The busiest module, 15 sites.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::distributed::runner</code></td>
+            <td>info, warn, error</td>
+            <td>Expired-lease sweeps and every release-instead-of-ack path: <code>reclaimed_count</code>, <code>claim_id</code>, <code>error</code>.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::distributed::consensus::transport::server</code></td>
+            <td>info, debug, warn</td>
+            <td>The Raft TCP accept loop: <code>addr</code> on bind, <code>peer</code> per connection, <code>error</code> on frame, decode and encode failures.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::distributed::parquet_checkpoint</code></td>
+            <td>debug</td>
+            <td>A parent-directory <code>fsync</code> that failed after a checkpoint write: <code>error</code>. Needs the <code>io</code> feature.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::wasm::host_impl</code></td>
+            <td>trace&ndash;error</td>
+            <td>The guest's own <code>host-io::log</code> lines, re-emitted at the level the guest asked for and tagged <code>pipeline</code> and <code>target</code>. A guest <code>host-io::metric</code> call arrives here as a <code>trace</code> event with <code>metric</code> and <code>value</code>.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::wasm::runner</code></td>
+            <td>warn</td>
+            <td>Building the template dataset: <code>describe()</code> failed, or one component's schema would not parse (<code>component</code>, <code>error</code>).</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::service::http</code>, <code>::shutdown</code></td>
+            <td>info, debug, warn, error</td>
+            <td>Control-plane bind and clean shutdown, signal receipt, and the 30-second shutdown budget being exceeded.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::commands::serve</code></td>
+            <td>info, error</td>
+            <td>Binary startup (<code>node_id</code>), which of signal-or-runner-exit fired first, and the exit path.</td>
+        </tr>
+        <tr>
+            <td><code>tower_http::trace</code></td>
+            <td>info, debug</td>
+            <td>Not PCS code, but it is in the output: <code>build_router</code> installs <code>TraceLayer::new_for_http()</code>, so each request to <code>/health</code>, <code>/ready</code>, <code>/metrics</code> or <code>/status</code> gets a span and request/response events.</td>
+        </tr>
+    </tbody>
+</table>
+
+<div class="note note-warn">
+    <span class="note-label">One span, not a trace tree</span>
+    <p>
+        <code>task_attempt</code> is the only span PCS opens. There is no
+        <code>pipeline.run</code>, no <code>pipeline.stage</code>, no
+        <code>system.execute</code>. <code>pipeline/execution.rs</code> carries no
+        instrumentation of its own, so stage boundaries and per-system timings are not
+        visible. Anything needing a parent-child trace tree, such as OpenTelemetry span
+        export or span-based sampling, has almost nothing to hang information on.
+    </p>
+</div>
+
+<h2 id="subscriber">Installing a subscriber</h2>
+
+<p>
+    PCS never installs a subscriber for you when you use it as a library. Without one,
+    every event is discarded and you see nothing. The minimum is
+    <code>tracing-subscriber</code> with the <code>fmt</code> and <code>env-filter</code>
+    features.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>path dependencies &mdash; these crates are not published</em></div>
+    <pre><code class="language-toml">[dependencies]
+pcs-core = { path = "../pcs-core", features = ["tracing"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }</code></pre>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>install once, before the first pipeline runs</em></div>
+    <pre><code class="language-rust">use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    // build and run your pipeline; task_attempt spans and any
+    // window / runner events now reach stdout
+}</code></pre>
+</div>
+
+<p>
+    The service binary does this for you. <code>pcs-service serve</code> calls
+    <code>init_logging</code> as step 3, before anything else can emit, and treats a
+    second call as an error because the global subscriber is already installed.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>what the binary calls</em></div>
+    <pre><code class="language-rust">use pcs_service::service::config::ObservabilityConfig;
+use pcs_service::service::logging::init_logging;
+
+let cfg = ObservabilityConfig::default();  // Pretty format, "info" level
+init_logging(&amp;cfg)?;</code></pre>
+</div>
+
+<h2 id="config">Level and format from TOML</h2>
+
+<p>
+    The <code>[observability]</code> table has exactly two keys. There is no exporter
+    configuration, no sampling ratio, and no per-module table. Module filtering is the
+    filter string's job.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>from examples/configs/standalone.toml</em></div>
+    <pre><code class="language-toml">[observability]
+log_format = "pretty"   # use "json" in production log aggregators
+log_level = "info"</code></pre>
+</div>
+
+<table class="rule-table">
+    <thead><tr><th>Key</th><th>Values</th><th>Default</th></tr></thead>
+    <tbody>
+        <tr>
+            <td><code>log_format</code></td>
+            <td><code>"pretty"</code> or <code>"json"</code>. Pretty enables ANSI colour only when stdout is a terminal; JSON emits one object per record.</td>
+            <td><code>"pretty"</code></td>
+        </tr>
+        <tr>
+            <td><code>log_level</code></td>
+            <td>Any <code>EnvFilter</code> directive string, so <code>"debug"</code> and <code>"warn,pcs_service::service::standalone=debug"</code> are both valid here.</td>
+            <td><code>"info"</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <code>init_logging</code> turns <code>log_level</code> into the filter
+    <code>pcs=&lt;log_level&gt;,tower_http=info,warn</code>. Directives match the event
+    target by prefix, so the single <code>pcs</code> directive covers both
+    <code>pcs_core::…</code> and <code>pcs_service::…</code>, and everything else in the
+    dependency tree stays at <code>warn</code>.
+</p>
+
+<p>
+    <code>RUST_LOG</code> wins outright: the environment filter is tried first, and the
+    directive above is only the fallback when <code>RUST_LOG</code> is unset. Both keys
+    can also be overridden per-invocation, by flag or by environment variable.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Bash</span><em>three orders of precedence, and real module paths</em></div>
+    <pre><code class="language-bash"># CLI flag beats the config file
+pcs-service serve --config standalone.toml --log-format json --log-level debug
+
+# ... and so do PCS_LOG_FORMAT / PCS_LOG_LEVEL
+PCS_LOG_LEVEL=debug pcs-service serve --config standalone.toml
+
+# RUST_LOG beats all of them: only the standalone runner, everything else quiet
+RUST_LOG="warn,pcs_service::service::standalone=info" \
+  pcs-service serve --config standalone.toml
+
+# The Raft accept loop, including per-connection debug events
+RUST_LOG="warn,pcs_service::distributed::consensus::transport=debug" \
+  pcs-service serve --config cluster.toml
+
+# Guest log lines and guest metric calls, nothing else
+RUST_LOG="off,pcs_service::wasm::host_impl=trace" \
+  pcs-service serve --config standalone_wasm.toml</code></pre>
+</div>
+
+<h2 id="metrics">The Prometheus endpoint</h2>
+
+<p>
+    The service binary builds a <code>prometheus::Registry</code>, hands it to
+    <code>opentelemetry_prometheus::exporter()</code>, wraps that in an
+    <code>SdkMeterProvider</code>, installs it as the global OpenTelemetry meter provider,
+    and then describes the standard instruments. The <code>/metrics</code> handler gathers
+    that same registry and encodes it with <code>prometheus::TextEncoder</code>, returning
+    <code>text/plain; version=0.0.4</code>.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Bash</span><em>default bind is 0.0.0.0:8080</em></div>
+    <pre><code class="language-bash">curl -s localhost:8080/metrics
+# the only series present is pcs_liveness_counter
+
+curl -s localhost:8080/status | jq .standalone
+# {
+#   "iterations": 7,
+#   "rows_processed": 7000,
+#   "source_batches_drained": 7,
+#   "sink_batches_written": 7,
+#   "iteration_errors": 0
+# }</code></pre>
+</div>
+
+<p>
+    <code>/metrics</code> shares the router with <code>/health</code>,
+    <code>/ready</code> and <code>/status</code>, all four behind a 10-second timeout
+    layer. <code>/metrics</code> carries a single series,
+    <code>pcs_liveness_counter</code>, recorded once a second by the watchdog task; the
+    other eleven descriptors are covered under
+    <a href="#gaps">what is not instrumented yet</a>. The counters an operator wants
+    (iterations, rows, batch and error totals) are on <code>/status</code> instead, read
+    from the runner's own <code>StandaloneStats</code>.
+</p>
+
+<p>
+    Two of the probes mean less than they look. <code>/ready</code> is flipped to ready
+    immediately after the runner task is spawned, so it reports <b>the process started</b>,
+    not that a pipeline iteration succeeded. And in cluster mode <code>/status</code>
+    always answers <code>"cluster": null</code>, because the service passes no cluster
+    probe into the HTTP state. <code>/health</code> is the one to alert on: it is backed by
+    the watchdog counter, so it goes stale if the main loop wedges.
+</p>
+
+<h2 id="gaps">What is not instrumented yet</h2>
+
+<p>
+    A metric name in a table is worth nothing if no code writes to it.
+</p>
+
+<ul>
+    <li>
+        <b>Eleven of the twelve declared metrics are never emitted.</b>
+        <code>register_standard_metrics</code> only describes instruments; its own doc
+        comment says "Runners increment the counters/gauges; this function only registers
+        descriptions". No runner does. Declared but unfed:
+        <code>pcs_pipeline_runs_total</code>, <code>pcs_pipeline_errors_total</code>,
+        <code>pcs_stage_duration_seconds</code>,
+        <code>pcs_source_batches_drained_total</code>,
+        <code>pcs_sink_batches_written_total</code>,
+        <code>pcs_rows_processed_total</code>, <code>pcs_ready</code>,
+        <code>pcs_uptime_seconds</code>, <code>pcs_raft_commit_index</code>,
+        <code>pcs_raft_term</code>, <code>pcs_raft_leader_id</code>. The six counters and
+        the histogram are built and immediately dropped; the observable gauges have no
+        observation callback. Only <code>pcs_liveness_counter</code> is written, by the
+        watchdog.
+    </li>
+    <li>
+        <b>The pipeline execution path emits nothing but retry attempts.</b>
+        <code>task_attempt</code> is the whole story: <code>pipeline/execution.rs</code>
+        has no instrumentation, so there is no event or span at a stage boundary, at a
+        system's start or finish, or on the parallel-stage fan-out.
+    </li>
+    <li>
+        <b>Guest batch metrics are computed and thrown away.</b> The guest fills every
+        field of the WIT <code>run-metrics</code> record (<code>wall-ns</code>,
+        <code>rows-in</code>, <code>rows-out</code>, <code>systems-run</code>,
+        <code>retries</code>), and <code>WasmPipelineRuntime</code> reads only
+        <code>output</code> and <code>checkpoint</code> off the result. Nothing on the host
+        looks at <code>metrics</code>.
+    </li>
+    <li>
+        <b><code>host-io::metric</code> does not reach Prometheus.</b> The WIT comment says
+        "Host routes to prometheus"; the implementation emits a <code>trace</code> event
+        with <code>metric</code> and <code>value</code> and stops there. A guest counter is
+        a log line, not a series.
+    </li>
+    <li>
+        <b>No OTLP or distributed-trace export.</b> The service depends on
+        <code>opentelemetry</code>, <code>opentelemetry_sdk</code> with the
+        <code>metrics</code> feature, and <code>opentelemetry-prometheus</code>.
+        <code>tracing-opentelemetry</code> is not a dependency at all, and
+        <code>init_logging</code> installs exactly one <code>EnvFilter</code> plus one
+        <code>fmt</code> layer. You can stack an OTLP layer in your own
+        <code>main</code> when you embed PCS as a library; the shipped binary offers no
+        configuration knob for it.
+    </li>
+</ul>
+
+<h2 id="next">Next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
+        <span class="next-card-label">Running at scale</span>
+        <h3>Operating pcs-service</h3>
+        <p>The runbook that consumes all of this: probes, scrape config, log aggregation, and what to check when a node stalls.</p>
+    </a>
+    <a href="{{ get_url(path='@/benchmarks/_index.md') }}" class="next-card">
+        <span class="next-card-label">Reference</span>
+        <h3>Benchmarks</h3>
+        <p>Measured throughput, from the Criterion harness rather than from a counter on an endpoint.</p>
+    </a>
+</div>
+
+{% endblock %}

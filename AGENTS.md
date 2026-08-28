@@ -83,9 +83,11 @@ The artifact name is platform specific: `target/debug/libpcs_plugin_smoketest.so
 `pcs-connector-kafka` vendors librdkafka through `librdkafka-sys`'s `cmake-build` feature, so
 `cmake` and a C toolchain (MSVC Build Tools on Windows) must be on `PATH` before `cargo build`
 reaches it. On POSIX targets that build also needs libcurl's development headers
-(`libcurl4-openssl-dev` on Debian/Ubuntu, the equivalent elsewhere; CI installs them in the `test`
-job): the `config.h` cmake generates defines `WITH_OAUTHBEARER_OIDC` as `0` rather than leaving it
-undefined, and `rdkafka_conf.c` gates its `#include <curl/curl.h>` on `#ifdef`, so that header is
+(`libcurl4-openssl-dev` on Debian/Ubuntu, the equivalent elsewhere; CI installs them in the `test`,
+`distributed_chaos`, `wasm_processor` and `polyglot` jobs, every job that compiles a pcs-service
+test or example target): the `config.h` cmake generates defines `WITH_OAUTHBEARER_OIDC` as `0`
+rather than leaving it undefined, and `rdkafka_conf.c` gates its `#include <curl/curl.h>` on
+`#ifdef`, so that header is
 compiled even though the build is configured with `-DWITH_CURL=0`. Windows builds escape it
 because `WITHOUT_WIN32_CONFIG` leaves the macro undefined. No other repository build step needs
 any of these.

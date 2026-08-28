@@ -8,7 +8,9 @@
 //! fallible call returns [`Result`] and the commands `?` on all of them.
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
@@ -306,8 +308,8 @@ impl Ctx {
                 .map_err(|e| self.error(1, &[&format!("reading {}: {e}", path.display())]))?
                 .permissions();
             perms.set_mode(perms.mode() | 0o755);
-            return fs::set_permissions(path, perms)
-                .map_err(|e| self.error(1, &[&format!("chmod +x {}: {e}", path.display())]));
+            fs::set_permissions(path, perms)
+                .map_err(|e| self.error(1, &[&format!("chmod +x {}: {e}", path.display())]))
         }
         #[cfg(windows)]
         {

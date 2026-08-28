@@ -22,8 +22,11 @@ jobs:
         toolchain: 1.95.0  # Rust minimum version
         components: rustfmt, clippy
 
-    # Only this job builds pcs-connector-kafka, which vendors librdkafka via
-    # rdkafka-sys's `cmake-build` feature. That build is configured with
+    # pcs-connector-kafka vendors librdkafka via rdkafka-sys's `cmake-build`
+    # feature, and it compiles in every job that builds a pcs-service test or
+    # example target, because pcs-service's dev-dependencies include the
+    # connector crates; the distributed_chaos, wasm_processor and polyglot
+    # jobs install this same package. That build is configured with
     # -DWITH_CURL=0, but the config.h cmake generates for POSIX targets uses
     # `#cmakedefine01 WITH_OAUTHBEARER_OIDC`, which defines the macro as 0
     # rather than leaving it undefined, and rdkafka_conf.c gates its
@@ -104,6 +107,12 @@ jobs:
       with:
         toolchain: 1.95.0  # Rust minimum version
 
+    # pcs-service's dev-dependencies pull in pcs-connector-kafka, whose
+    # rdkafka-sys cmake build compiles rdkafka_conf.c's `#include
+    # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
     - name: Cache cargo registry
       uses: actions/cache@v5
       with:
@@ -141,6 +150,12 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.95.0  # Rust minimum version
+
+    # pcs-service's dev-dependencies pull in pcs-connector-kafka, whose
+    # rdkafka-sys cmake build compiles rdkafka_conf.c's `#include
+    # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
 
     - name: Cache cargo registry
       uses: actions/cache@v5
@@ -205,6 +220,12 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.95.0  # Rust minimum version
+
+    # pcs-service's dev-dependencies pull in pcs-connector-kafka, whose
+    # rdkafka-sys cmake build compiles rdkafka_conf.c's `#include
+    # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
 
     - name: Cache cargo registry
       uses: actions/cache@v5

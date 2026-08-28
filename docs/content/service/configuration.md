@@ -131,8 +131,10 @@ OK: all declared types resolved in built-in registry
 
 A `type` no registered factory claims is a warning and still exits 0: a config
 aimed at a custom binary names factories the stock binary does not know.
-`--strict` makes those warnings fail. A `FileSink` creates its output file while
-its factory runs, `validate` included, so the parent directory must exist first.
+`--strict` makes those warnings fail. A `FileSink` opens its output file while
+its factory runs, `validate` included, so the parent directory must exist
+first. The file is created when it is missing and appended to when it is not;
+`truncate #true` in the sink's `config` replaces it instead.
 
 ### Chaining processors
 
@@ -292,6 +294,7 @@ arrives with one `connector-*` feature.
 | Sources | Sinks | Feature | Required `config` keys |
 |---|---|---|---|
 | `FileSource` | `FileSink` | `connector-file` | `path`, plus `schema_fields` where the format needs it |
+| `HttpSource` | `HttpSink` | `connector-http` | `url`, plus `schema_fields` where the format needs it |
 | `PostgresSource` | `PostgresSink` | `connector-postgresql` | `name`, `connection`, `schema_fields`, plus `mode` or `table` |
 | `tcp` | `tcp` | `connector-tcp` | `bind` on the source, `connect` on the sink, `schema_fields` on both |
 | `ChannelSource` | `ChannelSink` | `connector-channel` | `schema_fields`. In-process, for tests |

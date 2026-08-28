@@ -81,11 +81,14 @@ workflow "branching" {
     plugin "router_plugin" library="${PCS_PLUGIN_LIB:-target/debug/libbranching_plugin.so}"
 
     // The mirror sink proves the source split: every message is written here
-    // verbatim while the same batch also feeds both routers. FileSink appends;
-    // the CSV header is written once, before the first batch.
+    // verbatim while the same batch also feeds both routers. Within a run
+    // FileSink appends and the CSV header is written once, before the first
+    // batch. Every sink here sets truncate, so each `serve` starts its five
+    // files over rather than adding to the previous run's rows.
     sink "out_mirror" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "${PCS_OUT_DIR:-/tmp/pcs-branching}/out-mirror.csv"
+            truncate #true
             schema_fields "id" type="int64" nullable=#false
             schema_fields "priority" type="utf8" nullable=#false
         }
@@ -94,6 +97,7 @@ workflow "branching" {
     sink "out_wasm_high" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "${PCS_OUT_DIR:-/tmp/pcs-branching}/out-wasm-high.csv"
+            truncate #true
             schema_fields "id" type="int64" nullable=#false
             schema_fields "priority" type="utf8" nullable=#false
         }
@@ -102,6 +106,7 @@ workflow "branching" {
     sink "out_wasm_low" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "${PCS_OUT_DIR:-/tmp/pcs-branching}/out-wasm-low.csv"
+            truncate #true
             schema_fields "id" type="int64" nullable=#false
             schema_fields "priority" type="utf8" nullable=#false
         }
@@ -110,6 +115,7 @@ workflow "branching" {
     sink "out_plugin_premium" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "${PCS_OUT_DIR:-/tmp/pcs-branching}/out-plugin-premium.csv"
+            truncate #true
             schema_fields "id" type="int64" nullable=#false
             schema_fields "priority" type="utf8" nullable=#false
         }
@@ -118,6 +124,7 @@ workflow "branching" {
     sink "out_plugin_standard" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "${PCS_OUT_DIR:-/tmp/pcs-branching}/out-plugin-standard.csv"
+            truncate #true
             schema_fields "id" type="int64" nullable=#false
             schema_fields "priority" type="utf8" nullable=#false
         }

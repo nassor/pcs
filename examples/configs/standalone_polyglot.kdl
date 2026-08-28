@@ -75,9 +75,12 @@ workflow "polyglot" {
         config fx_eur="1.10" fx_gbp="1.30" fx_jpy="0.0068"
     }
 
+    // truncate replaces the file each run. Without it the sink appends, and
+    // csv with has_headers writes a second header line mid-file.
     sink "csv_out" type="FileSink" component="Order" transformer="csv_fmt" {
         config {
             path "/tmp/pcs-polyglot-out.csv"
+            truncate #true
             schema_fields "id" type="Int64" nullable=#false
             schema_fields "region" type="Utf8" nullable=#false
             schema_fields "currency" type="Utf8" nullable=#false

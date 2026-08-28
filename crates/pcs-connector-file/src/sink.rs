@@ -31,19 +31,73 @@ pub struct FileSink {
 }
 
 impl FileSink {
-    /// Create (or truncate) `path` and hand the handle to `transformer`.
+    /// Open `path` for appending and hand the handle to `transformer`.
+    ///
+    /// The file is created when it is missing, and no existing byte is
+    /// removed: every batch lands after what is already there. A container
+    /// format with a footer, `parquet` and `avro`, cannot be appended to a
+    /// non-empty file and stay readable, so those want
+    /// [`FileSink::create_truncating`] or a path of their own.
     ///
     /// # Errors
     ///
-    /// Returns [`PcsError::Generic`] when the file cannot be created, or the
+    /// Returns [`PcsError::Generic`] when the file cannot be opened, or the
     /// transformer's own error when it cannot write this handle.
     pub fn create(
         path: &Path,
         transformer: Arc<dyn Transformer>,
         schema: Arc<Schema>,
     ) -> Result<Self, PcsError> {
-        let file = std::fs::File::create(path)
-            .map_err(|e| PcsError::generic(format!("FileSink: cannot create {path:?}: {e}")))?;
+        Self::open_with(
+            path,
+            std::fs::OpenOptions::new().create(true).append(true),
+            |path, e| PcsError::generic(format!("FileSink: cannot open {path:?} for append: {e}")),
+            transformer,
+            schema,
+        )
+    }
+
+    /// Replace `path`: create it when missing, empty it when it exists, then
+    /// hand the handle to `transformer`.
+    ///
+    /// This is the opt-in mode behind the sink factory's `truncate` key. It is
+    /// what a run whose output must hold this run's rows alone wants, and what
+    /// a footer format writing to a path that may already exist needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcsError::Generic`] when the file cannot be created, or the
+    /// transformer's own error when it cannot write this handle.
+    pub fn create_truncating(
+        path: &Path,
+        transformer: Arc<dyn Transformer>,
+        schema: Arc<Schema>,
+    ) -> Result<Self, PcsError> {
+        Self::open_with(
+            path,
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true),
+            |path, e| PcsError::generic(format!("FileSink: cannot create {path:?}: {e}")),
+            transformer,
+            schema,
+        )
+    }
+
+    /// Open `path` with `options` and wire the handle up: one clone for the
+    /// per-batch sync, the original to the transformer's writer.
+    ///
+    /// `on_open_error` names the open mode, so a failed open says whether it
+    /// was the appending or the replacing one.
+    fn open_with(
+        path: &Path,
+        options: &std::fs::OpenOptions,
+        on_open_error: fn(&Path, &std::io::Error) -> PcsError,
+        transformer: Arc<dyn Transformer>,
+        schema: Arc<Schema>,
+    ) -> Result<Self, PcsError> {
+        let file = options.open(path).map_err(|e| on_open_error(path, &e))?;
         let sync = file.try_clone().map_err(|e| {
             PcsError::generic(format!("FileSink: cannot clone handle for {path:?}: {e}"))
         })?;

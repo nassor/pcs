@@ -18,6 +18,7 @@ feature that registers its factory. Build with:
 | `s3.kdl` | `connector-s3,transformer-csv,wasm` |
 | `cluster.kdl` | `service-cluster,connector-file,transformer-csv,wasm` |
 | `tcp.kdl` | `connector-tcp,wasm` |
+| `http.kdl` | `connector-http,transformer-csv,wasm` |
 
 ## Built-in factories
 
@@ -37,6 +38,7 @@ always names its `transformer` explicitly, there is no implicit default format.
 | config `type`     | Description                              | Required config keys      | Crate | Feature |
 |-------------------|------------------------------------------|---------------------------|-------|---------|
 | `FileSource`      | Reads a local file in whatever format its `transformer` names | `path`       | `pcs-connector-file` | `connector-file` |
+| `HttpSource`      | One GET, decoded in whatever format its `transformer` names | `url`, plus `schema_fields` where the format needs it | `pcs-connector-http` | `connector-http` |
 | `PostgresSource`  | Polling, outbox or `pgoutput` reads      | `name`, `connection`, `mode`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
 | `KafkaSource`     | Consumes a Kafka topic                   | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
 | `S3Source`        | Lists a prefix once and drains every object in key order | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
@@ -47,7 +49,8 @@ always names its `transformer` explicitly, there is no implicit default format.
 
 | config `type`   | Description                               | Required config keys      | Crate | Feature |
 |-----------------|-------------------------------------------|---------------------------|-------|---------|
-| `FileSink`      | Writes a local file in whatever format its `transformer` names | `path`, `schema_fields` | `pcs-connector-file` | `connector-file` |
+| `FileSink`      | Writes a local file in whatever format its `transformer` names | `path`, `schema_fields`, optional `truncate` | `pcs-connector-file` | `connector-file` |
+| `HttpSink`      | One request per batch, body written by its `transformer` | `url`, `schema_fields`, optional `method` | `pcs-connector-http` | `connector-http` |
 | `PostgresSink`  | `COPY FORMAT binary`, optional upsert     | `name`, `connection`, `table`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
 | `KafkaSink`     | Produces to a Kafka topic                 | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
 | `S3Sink`        | Accumulates rows and uploads one object per flush | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
@@ -74,10 +77,12 @@ takes `infer_max` (integer, default `1024`), `avro` takes `compression` (string,
 one of `null`, `deflate`, `snappy`, `zstd`, default `null`) and `schema_id`
 (integer, the Confluent registry id), and the other two take none.
 
-**Important**: `FileSink` opens (creates) the output file immediately when the
-factory is built, including during `pcs-service validate`. The parent directory
-must exist before running `validate` or `serve`. The example configs use `/tmp/`
-directly to avoid this.
+**Important**: `FileSink` opens the output file as soon as the factory is
+built, `pcs-service validate` included, so the parent directory must exist
+before running `validate` or `serve`. The file is created when it is missing
+and its existing bytes are kept: rows land after them. Set `truncate #true` in
+the sink's `config` to replace the file on every build instead, which is what
+the example configs do.
 
 ### Components and systems
 
@@ -136,6 +141,7 @@ declare either.
 | `nats.kdl`                | Runnable config driving NATS at both ends, needs a server |
 | `s3.kdl`                  | Runnable config driving S3 at both ends, needs a bucket |
 | `tcp.kdl`                 | Runnable config driving TCP at both ends, listens and dials |
+| `http.kdl`                | Runnable config driving HTTP at both ends, needs an endpoint |
 
 ---
 

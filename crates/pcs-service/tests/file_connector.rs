@@ -154,3 +154,94 @@ async fn a_csv_source_and_a_parquet_sink_share_one_file_connector() {
         .expect("total is Float64");
     assert_eq!(totals.values(), &[10.5, 20.25, 30.75, 40.0]);
 }
+
+/// The same shape as [`config_kdl`], with an `ndjson` sink: a format without a
+/// footer, so two runs can write one file.
+#[cfg(feature = "transformer-ndjson")]
+fn append_config_kdl(input: &str, output: &str, data_dir: &str) -> String {
+    format!(
+        r#"
+mode "standalone"
+
+node id=1 name="pcs-file-append" data_dir="{data_dir}"
+
+run_mode kind="one_shot"
+
+workflow "file-append-test" {{
+    transformer "csv_fmt" format="csv" {{
+        options has_headers=#true
+    }}
+    transformer "ndjson_fmt" format="ndjson"
+
+    source "orders_in" type="FileSource" component="{COMPONENT}" transformer="csv_fmt" {{
+        config {{
+            path "{input}"
+            schema_fields "id" type="int64" nullable=#false
+            schema_fields "total" type="float64" nullable=#false
+        }}
+    }}
+
+    wasm "transform" name="Transform"
+
+    sink "orders_out" type="FileSink" component="{COMPONENT}" transformer="ndjson_fmt" {{
+        config {{
+            path "{output}"
+            schema_fields "id" type="int64" nullable=#false
+            schema_fields "total" type="float64" nullable=#false
+        }}
+    }}
+
+    link from="orders_in" to="transform"
+    link from="transform" to="orders_out"
+}}
+
+http disabled=#true
+
+observability log_level="warn"
+"#
+    )
+}
+
+/// No `truncate` key, so each run's sink opens the same path for appending and
+/// the second run's rows land after the first run's.
+#[cfg(feature = "transformer-ndjson")]
+#[tokio::test]
+async fn two_runs_against_one_path_keep_both_runs_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input_path = dir.path().join("orders.csv");
+    let output_path = dir.path().join("orders.ndjson");
+
+    std::fs::write(&input_path, "id,total\n1,10.5\n2,20.25\n").expect("write the csv fixture");
+
+    let config_path = dir.path().join("service.kdl");
+    std::fs::write(
+        &config_path,
+        append_config_kdl(
+            &config_path_text(&input_path),
+            &config_path_text(&output_path),
+            &config_path_text(dir.path()),
+        ),
+    )
+    .expect("write config");
+
+    for run in 1..=2 {
+        let config = ServiceConfig::load(&config_path).expect("config loads");
+        let built = register_builtin_factories(ServiceBuilder::new())
+            .with_runtime("transform", Box::new(build_pipeline()))
+            .build_all(&config)
+            .expect("the ndjson sink resolves")
+            .remove(0);
+
+        let stats = run_standalone(built, &config, CancellationToken::new(), None)
+            .await
+            .expect("one-shot run");
+        assert_eq!(stats.rows_processed, 2, "run {run} drained the fixture");
+    }
+
+    let written = std::fs::read_to_string(&output_path).expect("the sink wrote the file");
+    assert_eq!(
+        written.lines().count(),
+        4,
+        "both runs' rows are in the file: {written}"
+    );
+}

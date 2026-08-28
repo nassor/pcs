@@ -29,14 +29,15 @@ materialised in full and the executor never blocks on the disk.
 ## In Rust
 
 <div class="code">
-<div class="code-cap"><span>Rust</span><em>open_async is the async twin: it moves the open and the metadata read off the executor</em></div>
+<div class="code-cap"><span>Rust</span><em>open_async moves the open and the metadata read off the executor; create appends, create_truncating replaces</em></div>
 
 ```rust
 use pcs_connector_file::{FileSink, FileSource};
 
-FileSource::open      (&Path, Arc<dyn Transformer>, Option<Arc<Schema>>) -> Result<Self>
-FileSource::open_async(&Path, Arc<dyn Transformer>, Option<Arc<Schema>>) -> Result<Self>
-FileSink::create      (&Path, Arc<dyn Transformer>, Arc<Schema>)         -> Result<Self>
+FileSource::open           (&Path, Arc<dyn Transformer>, Option<Arc<Schema>>) -> Result<Self>
+FileSource::open_async     (&Path, Arc<dyn Transformer>, Option<Arc<Schema>>) -> Result<Self>
+FileSink::create           (&Path, Arc<dyn Transformer>, Arc<Schema>)         -> Result<Self>
+FileSink::create_truncating(&Path, Arc<dyn Transformer>, Arc<Schema>)         -> Result<Self>
 ```
 
 </div>
@@ -75,10 +76,12 @@ sink "orders_out" type="FileSink" component="Order" transformer="orders_csv" {
 |---|---|---|
 | `path` | string | yes, on both halves |
 | `schema_fields` | list of fields | optional on a source, required on a sink |
+| `truncate` | bool | optional on a sink, default `#false` |
 
-The byte format is not a `config` key: `transformer` is a property of the `source` or `sink` node
-itself, and the host resolves it before the factory runs. Both factories hand-parse `ConfigValue`
-with no `deny_unknown_fields`, so an unrecognised key is ignored rather than rejected.
+`truncate #true` makes the sink replace the file instead of appending to it. The byte format is not
+a `config` key: `transformer` is a property of the `source` or `sink` node itself, and the host
+resolves it before the factory runs. Both factories hand-parse `ConfigValue` with no
+`deny_unknown_fields`, so an unrecognised key is ignored rather than rejected.
 
 ## Schema and format
 
@@ -91,16 +94,18 @@ is the schema the rows are written with.
 `parquet` is the only format that reports `estimated_rows`, summed from row-group metadata without
 reading any data.
 
-## Sharp edge: the sink opens its file when the factory runs
+## Sharp edge: the sink appends, and a footer format cannot
 
 <div class="note note-warn">
 <span class="note-label">Sharp edge</span>
 <p>
-<code>FileSink::create</code> runs during <code>build</code>, and it creates and truncates the
-output path. That happens under <code>pcs-service validate</code> too, so validating a config
-empties the file it names and the parent directory has to exist already.
-<code>examples/configs/standalone.kdl</code> says so where it declares its
-sink.
+<code>FileSink::create</code> runs during <code>build</code>, <code>pcs-service validate</code>
+included, so the parent directory has to exist already. It creates the file when it is missing and
+keeps every byte already in it, while <code>truncate #true</code> empties it at build instead.
+<code>parquet</code> and <code>avro</code> are container formats with a footer, so a second
+writer's output appended to an existing file does not read back. Those configs want
+<code>truncate #true</code> or a path of their own; <code>ndjson</code>, and <code>csv</code>
+without headers, append cleanly.
 </p>
 </div>
 
@@ -113,7 +118,8 @@ sink.
 | `FileSource: cannot open {path:?}: {e}` | opening the input |
 | `FileSource: spawn_blocking panic: {e}` | open_async when the blocking task panics |
 | `FileSink config requires a 'path' string field` | the factory, before construction |
-| `FileSink: cannot create {path:?}: {e}` | creating the output |
+| `FileSink: cannot create {path:?}: {e}` | creating the output under `truncate #true` |
+| `FileSink: cannot open {path:?} for append: {e}` | opening the output in the default appending mode |
 | `FileSink: cannot clone handle for {path:?}: {e}` | creating the output handle |
 | `FileSink: write_batch called after finish` | writing to a finished sink |
 | `FileSink: sync failed: {e}` | syncing the file after a batch, or at finish |

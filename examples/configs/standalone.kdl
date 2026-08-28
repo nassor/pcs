@@ -52,12 +52,15 @@ workflow "orders" {
     // Sinks drain rows from component columns after the pipeline finishes.
     // FileSink requires path and schema_fields.
     //
-    // FileSink creates the output file as soon as the factory is built,
-    // including during `validate`, so the parent directory must already
-    // exist.
+    // FileSink appends by default, so a rerun would grow the file and csv
+    // with has_headers would put a second header line in the middle of it.
+    // `truncate #true` keeps this example's replace-each-run output. The
+    // parent directory still has to exist: the file is created as soon as the
+    // factory is built, `validate` included.
     sink "csv_out" type="FileSink" component="orders" transformer="csv_fmt" {
         config {
             path "/tmp/pcs-standalone-orders-out.csv"
+            truncate #true
             schema_fields "id" type="Int64" nullable=#false
             schema_fields "amount" type="Float64" nullable=#true
             schema_fields "status" type="Utf8" nullable=#true

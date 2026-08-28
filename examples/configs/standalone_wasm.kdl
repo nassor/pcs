@@ -55,9 +55,12 @@ workflow "order-processing" {
         config fx_eur="1.08" fx_gbp="1.27" fx_jpy="0.0067" fx_cad="0.74"
     }
 
+    // truncate replaces the file each run. Without it the sink appends, and
+    // csv with has_headers writes a second header line mid-file.
     sink "csv_out" type="FileSink" component="Transaction" transformer="csv_fmt" {
         config {
             path "/tmp/pcs-order-processing-out.csv"
+            truncate #true
             schema_fields "id" type="UInt64" nullable=#false
             schema_fields "amount" type="Float64" nullable=#false
             schema_fields "currency" type="Utf8" nullable=#false

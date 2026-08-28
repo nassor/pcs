@@ -56,6 +56,8 @@ impl SourceFactory for FileSourceFactory {
 /// Config fields:
 /// - `path` (string, required): the file to write.
 /// - `schema_fields` (list, required): the Arrow schema for the output file.
+/// - `truncate` (bool, optional, default `false`): replace the file rather
+///   than append to it.
 ///
 /// The byte format is whatever transformer the `sink` node's `transformer`
 /// key names; see [`ConnectorContext::transformer`].
@@ -76,11 +78,17 @@ impl SinkFactory for FileSinkFactory {
         })?;
         let transformer = ctx.transformer("FileSink")?;
         let schema = parse_schema_fields(config, "FileSink")?;
-        Ok(Box::new(FileSink::create(
-            Path::new(path),
-            transformer,
-            schema,
-        )?))
+        let truncate = config
+            .get("truncate")
+            .and_then(ConfigValue::as_bool)
+            .unwrap_or(false);
+        let path = Path::new(path);
+        let sink = if truncate {
+            FileSink::create_truncating(path, transformer, schema)?
+        } else {
+            FileSink::create(path, transformer, schema)?
+        };
+        Ok(Box::new(sink))
     }
 }
 
@@ -88,9 +96,11 @@ impl SinkFactory for FileSinkFactory {
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::{Int64Array, RecordBatch};
     use pcs_connector::{ConfigMap, from_kdl_str};
     use pcs_transformer::{Transformer, TransformerFactory};
     use pcs_transformer_csv::CsvTransformerFactory;
+    use pcs_transformer_ndjson::NdjsonTransformerFactory;
     use pcs_transformer_parquet::ParquetTransformerFactory;
     use tempfile::TempDir;
 
@@ -106,6 +116,12 @@ mod tests {
         ParquetTransformerFactory
             .build(&ConfigValue::Object(ConfigMap::new()))
             .expect("parquet transformer builds")
+    }
+
+    fn ndjson_transformer() -> Arc<dyn Transformer> {
+        NdjsonTransformerFactory
+            .build(&ConfigValue::Object(ConfigMap::new()))
+            .expect("ndjson transformer builds")
     }
 
     fn empty_config() -> ConfigValue {
@@ -215,5 +231,48 @@ schema_fields "id" type="Int64" nullable=#false
             .expect("source builds");
         assert_eq!(source.schema().fields().len(), 1);
         assert_eq!(source.schema().field(0).name(), "id");
+    }
+
+    /// Build a sink through the factory and write one row holding `id`.
+    /// `extra` carries the config lines under test.
+    async fn write_one_row(dir: &TempDir, name: &str, extra: &str, id: i64) {
+        let ctx = ConnectorContext::new(Some(ndjson_transformer()));
+        let raw = format!("path \"{}\"\n{CSV_SCHEMA}{extra}", config_path(dir, name));
+        let mut sink = FileSinkFactory
+            .build(&config(&raw), &ctx)
+            .expect("sink builds");
+
+        let batch = RecordBatch::try_new(sink.schema(), vec![Arc::new(Int64Array::from(vec![id]))])
+            .expect("batch");
+        sink.write_batch(&batch).await.expect("write");
+        sink.finish().await.expect("finish");
+    }
+
+    fn lines(dir: &TempDir, name: &str) -> Vec<String> {
+        std::fs::read_to_string(dir.path().join(name))
+            .expect("output file")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_truncate_key_picks_the_sink_open_mode() {
+        let dir = TempDir::new().expect("temp dir");
+
+        // Absent: the second sink appends, so both runs' rows survive.
+        write_one_row(&dir, "append.ndjson", "", 1).await;
+        write_one_row(&dir, "append.ndjson", "", 2).await;
+        let appended = lines(&dir, "append.ndjson");
+        assert_eq!(appended.len(), 2, "got: {appended:?}");
+        assert!(appended[0].contains('1'), "got: {appended:?}");
+        assert!(appended[1].contains('2'), "got: {appended:?}");
+
+        // Set: the second sink replaces the file, so only its row is left.
+        write_one_row(&dir, "replace.ndjson", "truncate #true\n", 1).await;
+        write_one_row(&dir, "replace.ndjson", "truncate #true\n", 2).await;
+        let replaced = lines(&dir, "replace.ndjson");
+        assert_eq!(replaced.len(), 1, "got: {replaced:?}");
+        assert!(replaced[0].contains('2'), "got: {replaced:?}");
     }
 }

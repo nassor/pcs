@@ -452,7 +452,7 @@ data.register_component::&lt;Trade&gt;()?;
 
 let parquet  = Arc::new(ParquetTransformer::new());
 let mut src  = FileSource::open_async(Path::new("in.parquet"), parquet.clone(), None).await?;
-let mut sink = FileSink::create(Path::new("out.parquet"), parquet, Trade::schema())?;
+let mut sink = FileSink::create_truncating(Path::new("out.parquet"), parquet, Trade::schema())?;
 
 let rows_in = drain_into_dataset(&amp;mut src, &amp;mut data, "Trade").await?;
 // ... run systems over `data` ...
@@ -641,6 +641,12 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
             <td><code>pcs-connector-tcp</code></td>
         </tr>
         <tr>
+            <td><strong>HTTP</strong></td>
+            <td><code>HttpSource</code></td>
+            <td><code>HttpSink</code></td>
+            <td><code>pcs-connector-http</code></td>
+        </tr>
+        <tr>
             <td><strong>DataFusion SQL</strong></td>
             <td><code>DataFusionSource</code></td>
             <td>&mdash;</td>
@@ -703,7 +709,7 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
 <p>
     On the host side one <code>pcs-service</code> feature per crate decides what reaches
     the registry: <code>connector-channel</code>, <code>connector-file</code>,
-    <code>connector-kafka</code>, <code>connector-nats</code>,
+    <code>connector-http</code>, <code>connector-kafka</code>, <code>connector-nats</code>,
     <code>connector-postgresql</code>,
     <code>connector-tcp</code>, <code>transformer-arrow-ipc</code>,
     <code>transformer-avro</code>, <code>transformer-csv</code>,
@@ -713,8 +719,8 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
     <code>connector-kafka</code> and <code>connector-nats</code> pull in
     <code>transformer-ndjson</code> and
     <code>connector-tcp</code> pulls in <code>transformer-arrow-ipc</code>, their default
-    formats. <code>connector-file</code> pulls in none: <code>format</code> is required
-    there, so you pick.
+    formats. <code>connector-file</code> and <code>connector-http</code> pull in none:
+    <code>format</code> is required there, so you pick.
 </p>
 
 <p>
@@ -727,9 +733,16 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>signatures, not calls</em></div>
     <pre><code class="language-rust">// pcs-connector-file. open_async moves the open and the metadata read off the executor.
-FileSource::open      (&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
-FileSource::open_async(&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
-FileSink::create      (&amp;Path, Arc&lt;dyn Transformer&gt;, Arc&lt;Schema&gt;)         -&gt; Result&lt;Self&gt;
+// create appends to an existing file, create_truncating replaces it.
+FileSource::open           (&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
+FileSource::open_async     (&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
+FileSink::create           (&amp;Path, Arc&lt;dyn Transformer&gt;, Arc&lt;Schema&gt;)         -&gt; Result&lt;Self&gt;
+FileSink::create_truncating(&amp;Path, Arc&lt;dyn Transformer&gt;, Arc&lt;Schema&gt;)         -&gt; Result&lt;Self&gt;
+
+// pcs-connector-http. Neither makes a request: the source GETs and the sink
+// sends on the first batch, so validate needs no reachable endpoint.
+HttpSource::new(&amp;str, Option&lt;Arc&lt;Schema&gt;&gt;, Arc&lt;dyn Transformer&gt;, Vec&lt;(String, String)&gt;, Duration) -&gt; Result&lt;Self&gt;
+HttpSink::new  (&amp;str, Arc&lt;Schema&gt;, Arc&lt;dyn Transformer&gt;, method: &amp;str, Vec&lt;(String, String)&gt;, Duration) -&gt; Result&lt;Self&gt;
 
 // The transformer each of those takes, one crate per format.
 CsvTransformer::new(has_headers: bool)   -&gt; Self   // csv

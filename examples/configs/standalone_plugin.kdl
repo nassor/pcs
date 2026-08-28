@@ -47,9 +47,12 @@ workflow "counter" {
         config "smoketest.multiplier"="1"
     }
 
+    // truncate replaces the file each run. Without it the sink appends, and
+    // csv with has_headers writes a second header line mid-file.
     sink "csv_out" type="FileSink" component="Counter" transformer="csv_fmt" {
         config {
             path "/tmp/pcs-counter-out.csv"
+            truncate #true
             schema_fields "id" type="Int64" nullable=#false
             schema_fields "seen" type="Int64" nullable=#false
         }

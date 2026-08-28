@@ -1,195 +1,113 @@
-// Implements the `pcs:pipeline/pipeline` export for stage 4 of the polyglot
-// example, the Kotlin guest.
+// Stage 4 of the polyglot example, the Kotlin processor: the whole thing.
 //
 // It reads `valid`, `region` and `usd_amount` and writes `fee`. It is the only
 // stage that reads a `Utf8` column to drive a decision: the fee rate comes from
 // the config key `fee_<region>`, so a region string in the data selects a value
 // the host injected.
 //
-// The object name and the package are not a choice. `wit-bindgen kotlin` was
-// run with `--kotlin-imports 'impl.*'`, so the generated export trampoline in
-// `bindings/InternalPcsPipeline.kt` resolves `PipelineImpl` from this package
-// and calls exactly `describe` and `runBatch`.
+// # Where the rest of it went
 //
-// # Why there is no Arrow dependency
+// There is no `describe`, no Arrow IPC handling, no schema constant, no
+// fingerprint constant, no `PipelineImpl`, and no error mapping. `packages/
+// pcs-sdk-kt-ksp` is a KSP symbol processor: it reads the three annotations
+// below at compile time and generates `impl.OrderCodec`, the typed row accessor,
+// and `impl.PipelineImpl`, the `pcs:pipeline/pipeline` export that folds every
+// failure into `run-error::permanent`. `packages/pcs-sdk-kt` is the runtime it
+// calls: decode the batch, run the transforms, re-encode, report.
 //
-// Writing `fee` means overwriting eight bytes per row in a fixed-width value
-// buffer, so this stage mutates the input Arrow IPC bytes in place and hands the
-// same buffer back. The codec is `io.github.nassor:pcs-arrow-ipc`, an ordinary
-// Gradle dependency, which documents the format and what in-place mutation
-// cannot do. Everything else in the stream, including the trailing `__alive`
-// bitmap, passes through untouched.
+// Generated rather than reflected because Kotlin/Wasm has no reflection at all.
+// `kotlin-reflect` is JVM only, so a property name only exists in this component
+// if the build wrote it there.
 //
-// # Why nothing here throws past the boundary
+// The generated glue lands in package `impl` because `cargo xtask polyglot` runs
+// `wit-bindgen kotlin --kotlin-imports 'impl.*'`, and the export trampoline in
+// `bindings/InternalPcsPipeline.kt` resolves `PipelineImpl.describe()` and
+// `PipelineImpl.runBatch()` from there by those exact names. So this file is in
+// `impl` too, which is what the SDK's processor checks for.
 //
-// An exception escaping into the generated trampoline traps the instance, and
-// the host then sees an opaque wasm trap instead of a reason. Every failure path
-// is folded into `run-error::permanent`, which the WIT contract designates for
-// bad input shape and guest bugs; `schema-mismatch` must never come out of
-// `run-batch`.
+// # What the SDK does that in-place mutation cannot
+//
+// The other byte-mutating stages hand back the input buffer with some fixed-width
+// values overwritten. This one decodes rows, mutates them and writes a fresh
+// stream, which costs a re-encode and buys the two things the mutating pattern
+// rules out: a `Utf8` output column, and a row count that may shrink. `Order`
+// carries `usd_amount_display`, a `Utf8` output, so that matters here.
 //
 // # Why `wall-ns` is zero
 //
-// Kotlin/Wasm's `wasmWasi` target reaches the outside world through WASI
-// preview 1 imports, and `wasm-tools component new --adapt` routes those through
-// the preview 1 adapter. Every such call traps inside the finished component:
-// `kotlin.time.TimeSource.Monotonic`, `kotlin.random.Random` and `println` are
-// all unusable here. A Kotlin guest may call exactly the imports the WIT world
-// declares, which is `host-io` and nothing else, so this stage reports no
-// timing. The Go, Python and TypeScript stages do report real values.
+// Kotlin/Wasm's `wasmWasi` target reaches the outside world through WASI preview
+// 1 imports, and `wasm-tools component new --adapt` routes those through the
+// preview 1 adapter, where every one of them traps: `kotlin.time.TimeSource.
+// Monotonic`, `kotlin.random.Random` and `println` are all unusable here. A
+// Kotlin processor may call exactly the imports the WIT world declares, which is
+// `host-io` and nothing else, so the SDK reports no timing. The Go, Python and
+// TypeScript stages do report real values.
 
 package impl
 
-import bindings.HostIo
-import bindings.Pipeline
-import bindings.Types
-import bindings.runtime.ComponentException
-import io.github.nassor.pcs.arrowipc.PcsStream
-import io.github.nassor.pcs.arrowipc.decodeBase64
-
-private const val STAGE_NAME = "polyglot-fee-kt"
-private const val STAGE_VERSION = "0.1.0"
-private const val COMPONENT_NAME = "Order"
-private const val LOG_TARGET = "polyglot::fee_kt"
-
-private const val FIELD_VALID = "valid"
-private const val FIELD_REGION = "region"
-private const val FIELD_USD_AMOUNT = "usd_amount"
-private const val FIELD_FEE = "fee"
-
-/** Config keys are `fee_` plus the region string the row carries. */
-private const val FEE_KEY_PREFIX = "fee_"
+import io.github.nassor.pcs.sdk.PcsComponent
+import io.github.nassor.pcs.sdk.PcsConfig
+import io.github.nassor.pcs.sdk.PcsPipeline
+import io.github.nassor.pcs.sdk.PcsProcessor
+import io.github.nassor.pcs.sdk.PcsTransform
 
 /**
- * The canonical `Order` schema-only Arrow IPC stream the host parses out of
- * `component-descriptor.arrow-schema-ipc`.
+ * The `Order` component, as the chain's other five processors see it.
  *
- * Decoded once from the generated constant rather than on every `describe` call,
- * and shared, so callers must not mutate it.
+ * Property order is schema order, and schema order feeds the buffer walk and the
+ * schema fingerprint, so this list is the cross-language contract and reordering
+ * it is a wire change. A `val` is an input the earlier stages wrote; a `var` is
+ * an output some stage in the chain may write. Wire names are the snake_case of
+ * these names, so `usdAmount` is `usd_amount`.
  */
-private val orderSchemaIpc: ByteArray by lazy(LazyThreadSafetyMode.NONE) {
-    decodeBase64(ORDER_SCHEMA_IPC_BASE64)
-}
+@PcsComponent
+data class Order(
+    val id: Long,
+    val region: String,
+    val currency: String,
+    val amount: Double,
+    var valid: Boolean = false,
+    var usdAmount: Double = 0.0,
+    var usdAmountDisplay: String = "",
+    var riskScore: Double = 0.0,
+    var flagged: Boolean = false,
+    var fee: Double = 0.0,
+    var reviewTier: Long = 0,
+    var settlement: String = "",
+)
 
-@OptIn(ExperimentalUnsignedTypes::class)
-object PipelineImpl : Pipeline {
-    /**
-     * Reports the stage identity and the one component it operates on.
-     *
-     * The schema bytes and the fingerprint are generated constants rather than
-     * values computed here: encoding an Arrow schema flatbuffer would mean
-     * shipping a writer, and the fingerprint is derived from the canonical Rust
-     * `Order` definition. The driver and the integration test both fail loudly
-     * if either constant drifts from that definition.
-     *
-     * `describe` has no error arm in the WIT world. A corrupt generated constant
-     * is reported here and then surfaces as a load-time failure when the host
-     * tries to parse an empty schema.
-     */
-    override fun describe(): Types.PipelineDescriptor {
-        val schema = try {
-            orderSchemaIpc.asUByteArray().asList()
-        } catch (e: Throwable) {
-            HostIo.log(
-                HostIo.LogLevel.ERROR,
-                LOG_TARGET,
-                "decode the embedded Order schema: ${e.message}",
-            )
-            emptyList()
-        }
-        return Types.PipelineDescriptor(
-            STAGE_NAME,
-            STAGE_VERSION,
-            listOf(Types.ComponentDescriptor(COMPONENT_NAME, schema)),
-            false,
-            ORDER_FINGERPRINT,
-        )
-    }
-
-    /**
-     * Charges every valid row its region's fee rate.
-     *
-     * `prior` is ignored and `checkpoint` is null: this stage keeps no state
-     * across batches, which is what `stateful: false` in [describe] promises the
-     * host.
-     */
-    override fun runBatch(
-        input: List<UByte>,
-        prior: List<UByte>?,
-    ): Result<Types.RunResult> {
-        try {
-            val stream = PcsStream.parse(input)
-            val batch = stream.component(COMPONENT_NAME)
-            val valid = batch.bools(FIELD_VALID)
-            val regions = batch.strings(FIELD_REGION)
-            val usdAmounts = batch.float64s(FIELD_USD_AMOUNT)
-
-            // One host call per distinct region rather than per row: get-config
-            // crosses the component boundary and the region set is tiny.
-            val rates = HashMap<String, Double>()
-            var charged = 0
-            var total = 0.0
-            for (row in 0 until batch.rows) {
-                var fee = 0.0
-                if (valid[row]) {
-                    val region = regions[row]
-                    val rate = rates.getOrPut(region) { feeRate(region) }
-                    fee = usdAmounts[row] * rate
-                    charged++
-                    total += fee
-                }
-                batch.setFloat64(FIELD_FEE, row, fee)
-            }
-
-            HostIo.metric("fee.charged_rows", charged.toDouble())
-            HostIo.metric("fee.total_usd", total)
-            HostIo.log(
-                HostIo.LogLevel.INFO,
-                LOG_TARGET,
-                "$STAGE_NAME: charged $charged of ${batch.rows} rows " +
-                    "across ${rates.size} regions, total fee $total",
-            )
-
-            val rows = batch.rows.toULong()
-            return Result.success(
-                Types.RunResult(
-                    stream.toWit(),
-                    null,
-                    // wall-ns is 0: no clock is reachable from a Kotlin guest.
-                    Types.RunMetrics(0uL, rows, rows, 1u, 0u),
-                )
-            )
-        } catch (e: Throwable) {
-            return failure(e.message ?: e.toString())
-        }
+/**
+ * Charges every valid row its region's fee rate.
+ *
+ * [PcsConfig.double] memoises each key it resolves for the length of the batch,
+ * so a per-row lookup here is one `get-config` call per distinct region rather
+ * than one per row. An absent or unparseable rate folds into the `0.0` default:
+ * the WIT contract hands config over as strings and gives the host no way to see
+ * why a batch failed, so a misconfigured region charges nothing and shows up in
+ * `fee.charged_rows` instead of taking the batch down.
+ *
+ * [PcsConfig.metric] accumulates, and the runtime reports each counter once when
+ * the batch ends, so these two lines are two host calls per batch however many
+ * rows contributed.
+ */
+@PcsTransform
+fun fee(row: Order, config: PcsConfig) {
+    row.fee = if (row.valid) row.usdAmount * config.double("fee_${row.region}", 0.0) else 0.0
+    if (row.valid) {
+        config.metric("fee.charged_rows", 1.0)
+        config.metric("fee.total_usd", row.fee)
     }
 }
 
 /**
- * Reads a host-injected fee rate.
+ * The pipeline: one transform, stateless, no checkpoint.
  *
- * The WIT contract hands config over as strings and leaves numeric parsing to
- * the guest, so an absent or unparseable value is a misconfiguration worth
- * failing on rather than silently defaulting. An unknown region reaching this
- * point means the data and the config disagree, which no retry fixes.
+ * The name and version become `pipeline-descriptor.name` and `.version`, and the
+ * third argument is the `tracing` target the runtime's per-batch summary line is
+ * bridged to.
  */
-private fun feeRate(region: String): Double {
-    val key = FEE_KEY_PREFIX + region
-    val raw = HostIo.getConfig(key)
-        ?: error("no config key \"$key\" for region \"$region\"")
-    return raw.toDoubleOrNull() ?: error("config \"$key\" is \"$raw\", which is not a number")
-}
-
-/**
- * Logs and returns the permanent error arm.
- *
- * Nothing this stage can hit is worth a host retry: the same bytes and the same
- * config would fail again.
- */
-private fun failure(message: String): Result<Types.RunResult> {
-    HostIo.log(HostIo.LogLevel.ERROR, LOG_TARGET, "$STAGE_NAME: $message")
-    return Result.failure(ComponentException(Types.RunError.Permanent(message)))
-}
+@PcsProcessor("polyglot-fee-kt", "0.1.0", "polyglot::fee_kt")
+fun build(): PcsPipeline = PcsPipeline.of(::fee)
 
 /**
  * Required by `binaries.executable()`, and never called.

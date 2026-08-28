@@ -1,7 +1,9 @@
 //! Factory registry for the PCS service layer.
 //!
-//! The registry maps string type names (from TOML config) to factory objects
-//! that can construct concrete [`Source`] and [`Sink`] instances.
+//! The registry maps string type names (from the config file) to factory
+//! objects that construct concrete [`Source`](pcs_core::io::source::Source)
+//! and [`Sink`](pcs_core::io::sink::Sink) instances, and format names to the
+//! [`TransformerFactory`] that decodes the bytes those connectors move.
 //!
 //! The runtime itself is supplied directly as a `Box<dyn PipelineRuntime>` or
 //! loaded from a WASM module via
@@ -15,57 +17,21 @@
 //! use pcs_service::service::registry::Registry;
 //!
 //! let mut registry = Registry::new();
-//! // register_source / register_sink go here
+//! // register_source / register_sink / register_transformer go here
 //! assert_eq!(registry.source_count(), 0);
+//! assert_eq!(registry.transformer_count(), 0);
 //! # }
 //! ```
 
 use std::collections::HashMap;
 
-use crate::error::PcsError;
-use crate::io::sink::Sink;
-use crate::io::source::Source;
-
-/// Factory for building a [`Source`] from config.
-///
-/// Implement this trait for each source type you want to expose to the
-/// TOML configuration. The `type_name` must match the `type` field in
-/// [`SourceSpec`](crate::service::config::SourceSpec).
-pub trait SourceFactory: Send + Sync + 'static {
-    /// The type name that appears in TOML as `type = "<name>"`.
-    fn type_name(&self) -> &'static str;
-
-    /// Build a source instance from the user-supplied TOML config value.
-    ///
-    /// # Errors
-    ///
-    /// Return [`PcsError::Configuration`] if required config fields are
-    /// missing or have invalid values.
-    fn build(&self, config: &toml::Value) -> Result<Box<dyn Source>, PcsError>;
-}
-
-/// Factory for building a [`Sink`] from config.
-///
-/// Implement this trait for each sink type you want to expose to the
-/// TOML configuration. The `type_name` must match the `type` field in
-/// [`SinkSpec`](crate::service::config::SinkSpec).
-pub trait SinkFactory: Send + Sync + 'static {
-    /// The type name that appears in TOML as `type = "<name>"`.
-    fn type_name(&self) -> &'static str;
-
-    /// Build a sink instance from the user-supplied TOML config value.
-    ///
-    /// # Errors
-    ///
-    /// Return [`PcsError::Configuration`] if required config fields are
-    /// missing or have invalid values.
-    fn build(&self, config: &toml::Value) -> Result<Box<dyn Sink>, PcsError>;
-}
+pub use pcs_connector::{SinkFactory, SourceFactory};
+pub use pcs_transformer::{Transformer, TransformerFactory, TransformerRegistry};
 
 /// Central registry mapping type names to their IO factories.
 ///
 /// Factories are registered at startup, before any config is loaded, and
-/// looked up by the `type_name` string from the TOML config. The runtime is
+/// looked up by the `type_name` string from the config. The runtime is
 /// supplied separately through [`ServiceBuilder::with_runtime`] or loaded from
 /// a WASM module.
 ///
@@ -79,12 +45,14 @@ pub trait SinkFactory: Send + Sync + 'static {
 /// let registry = Registry::new();
 /// assert_eq!(registry.source_count(), 0);
 /// assert_eq!(registry.sink_count(), 0);
+/// assert_eq!(registry.transformer_count(), 0);
 /// # }
 /// ```
 #[derive(Default)]
 pub struct Registry {
     sources: HashMap<String, Box<dyn SourceFactory>>,
     sinks: HashMap<String, Box<dyn SinkFactory>>,
+    transformers: TransformerRegistry,
 }
 
 impl Registry {
@@ -113,6 +81,15 @@ impl Registry {
         self
     }
 
+    /// Register a transformer factory.
+    ///
+    /// If a factory with the same `format_name` is already registered, it is
+    /// silently replaced.
+    pub fn register_transformer<F: TransformerFactory>(&mut self, factory: F) -> &mut Self {
+        self.transformers.register(factory);
+        self
+    }
+
     /// Look up a source factory by type name.
     pub fn source(&self, type_name: &str) -> Option<&dyn SourceFactory> {
         self.sources.get(type_name).map(|f| f.as_ref())
@@ -121,6 +98,13 @@ impl Registry {
     /// Look up a sink factory by type name.
     pub fn sink(&self, type_name: &str) -> Option<&dyn SinkFactory> {
         self.sinks.get(type_name).map(|f| f.as_ref())
+    }
+
+    /// The transformer registry a [`ConnectorContext`] is built from.
+    ///
+    /// [`ConnectorContext`]: pcs_connector::ConnectorContext
+    pub fn transformers(&self) -> &TransformerRegistry {
+        &self.transformers
     }
 
     /// Returns the number of registered source factories.
@@ -132,12 +116,21 @@ impl Registry {
     pub fn sink_count(&self) -> usize {
         self.sinks.len()
     }
+
+    /// Returns the number of registered transformer factories.
+    pub fn transformer_count(&self) -> usize {
+        self.transformers.count()
+    }
 }
 
 #[cfg(all(test, feature = "service"))]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use pcs_connector::{ConfigMap, ConfigValue, ConnectorContext};
+    use pcs_core::error::PcsError;
+    use pcs_core::io::sink::Sink;
+    use pcs_core::io::source::Source;
     use std::sync::Arc;
 
     struct TestSourceFactory;
@@ -145,11 +138,32 @@ mod tests {
         fn type_name(&self) -> &'static str {
             "TestSource"
         }
-        fn build(&self, _config: &toml::Value) -> Result<Box<dyn Source>, PcsError> {
-            use crate::io::channel_source::ChannelSource;
+        fn build(
+            &self,
+            _config: &ConfigValue,
+            _ctx: &ConnectorContext,
+        ) -> Result<Box<dyn Source>, PcsError> {
+            use pcs_connector_channel::ChannelSource;
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
             let (_tx, src) = ChannelSource::new(schema, 1);
             Ok(Box::new(src))
+        }
+    }
+
+    struct TestTransformer;
+    impl Transformer for TestTransformer {
+        fn format(&self) -> &'static str {
+            "test-format"
+        }
+    }
+
+    struct TestTransformerFactory;
+    impl TransformerFactory for TestTransformerFactory {
+        fn format_name(&self) -> &'static str {
+            "test-format"
+        }
+        fn build(&self, _options: &ConfigValue) -> Result<Arc<dyn Transformer>, PcsError> {
+            Ok(Arc::new(TestTransformer))
         }
     }
 
@@ -158,8 +172,12 @@ mod tests {
         fn type_name(&self) -> &'static str {
             "TestSink"
         }
-        fn build(&self, _config: &toml::Value) -> Result<Box<dyn Sink>, PcsError> {
-            use crate::io::channel_sink::ChannelSink;
+        fn build(
+            &self,
+            _config: &ConfigValue,
+            _ctx: &ConnectorContext,
+        ) -> Result<Box<dyn Sink>, PcsError> {
+            use pcs_connector_channel::ChannelSink;
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
             let (sink, _rx) = ChannelSink::new(schema, 1);
             Ok(Box::new(sink))
@@ -183,14 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn test_register_and_lookup_transformer_factory() {
+        let mut reg = Registry::new();
+        reg.register_transformer(TestTransformerFactory);
+        assert!(reg.transformers().get("test-format").is_some());
+        assert!(reg.transformers().get("missing").is_none());
+    }
+
+    #[test]
     fn test_registry_counts() {
         let mut reg = Registry::new();
         assert_eq!(reg.source_count(), 0);
         assert_eq!(reg.sink_count(), 0);
+        assert_eq!(reg.transformer_count(), 0);
         reg.register_source(TestSourceFactory);
         assert_eq!(reg.source_count(), 1);
         reg.register_sink(TestSinkFactory);
         assert_eq!(reg.sink_count(), 1);
+        reg.register_transformer(TestTransformerFactory);
+        assert_eq!(reg.transformer_count(), 1);
     }
 
     #[test]
@@ -203,18 +232,22 @@ mod tests {
 
     #[test]
     fn test_source_factory_builds_source() {
-        let factory = TestSourceFactory;
-        let src = factory
-            .build(&toml::Value::Table(toml::Table::new()))
+        let src = TestSourceFactory
+            .build(
+                &ConfigValue::Object(ConfigMap::new()),
+                &ConnectorContext::new(None),
+            )
             .unwrap();
         assert_eq!(src.schema().fields().len(), 1);
     }
 
     #[test]
     fn test_sink_factory_builds_sink() {
-        let factory = TestSinkFactory;
-        let sink = factory
-            .build(&toml::Value::Table(toml::Table::new()))
+        let sink = TestSinkFactory
+            .build(
+                &ConfigValue::Object(ConfigMap::new()),
+                &ConnectorContext::new(None),
+            )
             .unwrap();
         assert_eq!(sink.schema().fields().len(), 1);
     }
@@ -224,5 +257,6 @@ mod tests {
         let reg = Registry::default();
         assert_eq!(reg.source_count(), 0);
         assert_eq!(reg.sink_count(), 0);
+        assert_eq!(reg.transformer_count(), 0);
     }
 }

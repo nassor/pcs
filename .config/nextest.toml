@@ -1,0 +1,53 @@
+# cargo-nextest configuration. Reference: https://nexte.st/docs/configuration/reference/.
+#
+# Two profiles:
+# - `default`: the everyday-iteration profile. Skips every test that needs a
+#   Docker daemon (the testcontainers-backed connector and Raft-chaos
+#   suites), so `cargo nextest run --workspace --all-features` finishes in
+#   seconds and is safe to run constantly.
+# - `ci`: the full profile. Runs every test nextest discovers, including the
+#   ones `default` skips and any `#[ignore]`d test, via
+#   `cargo nextest run --workspace --all-features --profile ci --run-ignored all`.
+#   Reserved for CI and for the final verification step of a plan, not for
+#   routine local runs.
+#
+# `cargo test --workspace --all-features --doc` still runs on its own:
+# nextest does not execute doctests.
+
+[profile.default]
+# Excluded whole binaries are entirely testcontainers-driven: every test in
+# the file starts a container (see docs/content/connectors/kafka.md and
+# nats.md, and crates/pcs-connector-postgresql/tests/common/mod.rs). Excluded
+# test() clauses pick out the one Docker-backed test inside an otherwise-fast
+# file (kafka_service.rs, nats_service.rs, postgres_service.rs and
+# s3_service.rs each pair a real-container test with a pure-config test), or
+# the Docker-gated `cluster` module inside raft_consensus_chaos.rs (its `unit`
+# module is Docker-free and stays fast). The one chaos test with no cheap
+# counterpart, distributed_integration_chaos.rs's
+# full_stack_chaos_monkey_60s, opts out via `#[ignore]` instead, so it is
+# skipped here without a filter entry and reachable through `--run-ignored`.
+default-filter = '''
+not (
+    binary_id(=pcs-connector-kafka::kafka_roundtrip)
+    or binary_id(=pcs-connector-nats::nats_roundtrip)
+    or binary_id(=pcs-connector-postgresql::sink)
+    or binary_id(=pcs-connector-postgresql::source_cursor)
+    or binary_id(=pcs-connector-postgresql::source_logical)
+    or binary_id(=pcs-connector-s3::round_trip)
+    or binary_id(=pcs-service::transport_chaos)
+    or binary_id(=pcs-service::distributed_harness_smoke)
+    or (binary_id(=pcs-service::kafka_service) and test(=a_kafka_source_and_sink_move_rows_through_the_standalone_runner))
+    or (binary_id(=pcs-service::nats_service) and test(=a_nats_source_and_sink_move_rows_through_the_standalone_runner))
+    or (binary_id(=pcs-service::postgres_service) and test(=a_postgres_source_and_sink_move_rows_through_the_standalone_runner))
+    or (binary_id(=pcs-service::s3_service) and test(=an_s3_source_and_sink_move_rows_through_the_standalone_runner))
+    or (binary_id(=pcs-service::raft_consensus_chaos) and test(/^cluster::/))
+)
+'''
+
+[profile.ci]
+default-filter = "all()"
+# The heaviest Docker chaos tests run past nextest's default 60s slow
+# threshold (transport_chaos's bandwidth test takes up to ~120s, and
+# full_stack_chaos_monkey_60s ~70-100s), so raise it to keep CI output from
+# being spuriously flagged SLOW. Nothing here terminates a test early.
+slow-timeout = "180s"

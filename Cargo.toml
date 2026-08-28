@@ -1,23 +1,60 @@
 [workspace]
 members = [
     "crates/pcs-core",
-    "crates/pcs-guest",
-    "crates/pcs-guest-smoketest",
+    "crates/pcs-config",
+    "crates/pcs-connector",
+    "crates/pcs-connector-channel",
+    "crates/pcs-connector-datafusion",
+    "crates/pcs-connector-file",
+    "crates/pcs-connector-kafka",
+    "crates/pcs-connector-nats",
+    "crates/pcs-connector-postgresql",
+    "crates/pcs-connector-s3",
+    "crates/pcs-connector-tcp",
+    "crates/pcs-transformer",
+    "crates/pcs-transformer-arrow-ipc",
+    "crates/pcs-transformer-avro",
+    "crates/pcs-transformer-csv",
+    "crates/pcs-transformer-ndjson",
+    "crates/pcs-transformer-parquet",
+    "crates/pcs-macros",
+    "crates/pcs-processor",
+    "crates/pcs-processor-smoketest",
     "crates/pcs-plugin",
     "crates/pcs-plugin-abi",
     "crates/pcs-plugin-smoketest",
+    "crates/pcs-inspector-wire",
     "crates/pcs-service",
     "examples/wasm/order_processing",
-    "examples/polyglot/order-schema",
     "examples/polyglot/stages/rust-settle",
+    "examples/branching/wasm",
+    "examples/branching/plugin",
+    "examples/windowing/wasm",
+    "examples/windowing/plugin",
+    "examples/multi_workflow/wasm",
+    # The task runner: `cargo xtask <command>`. A member so it shares the lock
+    # file and the target directory, and so `cargo clippy --all-targets` and
+    # `cargo fmt --all` cover it.
+    "xtask",
 ]
+# Not a member: `pcs-service-ui` only compiles for wasm32-unknown-unknown, so a
+# workspace-wide host build would fail on it. It carries its own lock file and
+# `cargo xtask ui` runs its fmt and clippy gates.
+exclude = ["crates/pcs-service-ui"]
 resolver = "2"
 
 [workspace.package]
 rust-version = "1.95.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-publish = false
+# Flipped from the historical `false`: every crate below is meant to publish
+# to crates.io. The handful that are CI fixtures or samples, not libraries an
+# external consumer would add as a dependency, override this back to `false`
+# in their own manifest: pcs-processor-smoketest, pcs-plugin-smoketest,
+# xtask, and the seven example-workspace crates under examples/.
+publish = true
+repository = "https://github.com/nassor/pcs"
+homepage = "https://nassor.github.io/pcs/"
 
 [workspace.dependencies]
 # Arrow core sub-crates, exact-pinned at workspace level. `arrow-ipc` defines the
@@ -34,6 +71,11 @@ arrow-ord     = { version = "=59.2.0" }
 arrow-ipc     = { version = "=59.2.0" }
 arrow-json    = { version = "59.2.0" }
 arrow-csv     = { version = "59.2.0" }
+# The Avro codec. Caret-ranged like the other format-specific arrow sub-crates:
+# it is neither the checkpoint wire format nor coupled to arrow's memory layout.
+# bzip2 and xz stay off: they link C libraries nothing else in the graph needs,
+# and arrow-avro rejects an OCF in either codec by naming the missing feature.
+arrow-avro    = { version = "59.2.0", default-features = false, features = ["deflate", "snappy", "zstd"] }
 parquet       = { version = "=59.2.0", default-features = false, features = ["arrow", "snap"] }
 serde_arrow   = { version = "0.15.0", features = ["arrow-59"] }
 
@@ -46,25 +88,39 @@ futures-util  = { version = "0.3.34" }
 serde         = { version = "1.0.229", features = ["derive"] }
 serde_json    = { version = "1.0.151" }
 serde_bytes   = { version = "0.11.19" }
+# The service configuration language. KDL text is parsed here and mapped into
+# the self-describing `ConfigValue` tree the factory signatures carry. `span`
+# positions every diagnostic as `line:column`; the default `serde` feature is
+# off because it is the crate's experimental KDL-to-serde mapping, which
+# `pcs-config` deliberately does not use.
+kdl           = { version = "6.7", default-features = false, features = ["span"] }
 tracing       = { version = "0.1.44" }
 rayon         = { version = "1.12.0" }
 num_cpus      = { version = "1.17.0" }
 fnv           = { version = "1.0.7" }
 rand          = { version = "0.10.2" }
-uuid          = { version = "1.24.1", features = ["v4", "serde"] }
+uuid          = { version = "1.26.0", features = ["v7", "serde"] }
 
 # WASM component model host
-wasmtime      = { version = "47.0.3", features = ["component-model"] }
-wasmtime-wasi = { version = "47.0.3" }
+wasmtime      = { version = "48.0.1", features = ["component-model"] }
+wasmtime-wasi = { version = "48.0.1" }
 sha3          = { version = "0.12.0" }
+
+# WASM component model guest. Every Rust processor component invokes
+# `wit_bindgen::generate!` against `crates/pcs-processor/wit`, so the generator
+# and its runtime support are one dependency pinned in one place. The five
+# processor crates take it as a `cfg(target_arch = "wasm32")` dependency: the
+# generated module is gated on wasm32, so a host build needs neither the crate
+# nor its proc-macro tree.
+wit-bindgen   = { version = "0.61.1" }
 
 # Native plugin host. `libloading` is the dlopen/LoadLibrary wrapper the plugin
 # runtime loads a shared library with. `base64` decodes the schema bytes a
 # plugin's `describe` manifest carries; the encoding matches the generated
-# constants the polyglot guests already embed, and an audited decoder beats
+# constants the polyglot processors already embed, and an audited decoder beats
 # hand-rolling alphabet and padding validation over plugin-supplied input.
-libloading    = { version = "0.8.9" }
-base64        = { version = "0.22.1" }
+libloading    = { version = "0.9.0" }
+base64        = { version = "0.23.1" }
 
 # Dev / bench deps shared across crates
 criterion     = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
@@ -73,7 +129,7 @@ tempfile      = { version = "3.27.0" }
 anyhow        = { version = "1.0.104" }
 libc          = { version = "0.2.189" }
 
-# Link-time optimisation. `codegen-units=1` (supplied by `scripts/bench.sh` via
+# Link-time optimisation. `codegen-units=1` (supplied by `cargo xtask bench` via
 # RUSTFLAGS) optimises each crate whole but stops at every crate boundary:
 # without LTO cargo passes `-C embed-bitcode=no`, so the arrow rlibs carry no
 # bitcode and any accessor that is neither generic nor `#[inline]` stays an
@@ -94,4 +150,10 @@ lto = "thin"
 
 [profile.bench]
 lto = "thin"
+# Dependencies carry no symbols worth debugging from this repo, so build them
+# without debuginfo: less codegen work per dep crate and smaller artifacts.
+# The workspace's own crates keep their full debug data. (The MSVC PDB module
+# cap, LNK1140, is handled in `.cargo/config.toml` with `/PDB:NONE`.)
+[profile.dev.package."*"]
+debug = 0
 

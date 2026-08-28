@@ -24,6 +24,9 @@ impl OwnedFieldAccess {
 
 #[derive(Debug, Clone)]
 pub(super) struct ExpandedMeta {
+    /// The system's declared name, used as the `system.execute` span field.
+    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+    pub(super) name: &'static str,
     pub(super) reads: Vec<OwnedFieldAccess>,
     pub(super) writes: Vec<OwnedFieldAccess>,
     pub(super) reads_resources: Vec<std::any::TypeId>,
@@ -83,6 +86,7 @@ impl ExpandedMeta {
         }
 
         Ok(Self {
+            name: meta.name,
             reads,
             writes,
             reads_resources: meta.reads_resources.clone(),

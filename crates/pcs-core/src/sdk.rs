@@ -1,7 +1,7 @@
 //! Glue for SDKs that drive a [`Pipeline`] across a foreign function boundary.
 //!
-//! Two SDKs sit on top of this module. `pcs-guest` wires a pipeline to the
-//! `pcs:pipeline@0.2.0` WIT world for a WebAssembly component, and `pcs-plugin`
+//! Two SDKs sit on top of this module. `pcs-processor` wires a pipeline to the
+//! `pcs:pipeline@0.3.0` WIT world for a WebAssembly component, and `pcs-plugin`
 //! wires the same pipeline to the C ABI of a native shared library. Both face
 //! the same four problems: hold the pipeline behind a sync entry point, move
 //! state across a batch boundary that resets memory, classify a [`PcsError`]
@@ -49,7 +49,7 @@ impl PipelineSlot {
     /// # Panics
     ///
     /// Panics if the inner `Mutex` is poisoned, which needs a panic while the
-    /// lock is held. A WebAssembly guest traps before reaching this path; a
+    /// lock is held. A WebAssembly processor traps before reaching this path; a
     /// native plugin catches the unwind at its boundary and reports a permanent
     /// error, so the poisoned lock surfaces on the next call instead.
     pub fn pipeline<F>(&self, build: F) -> MutexGuard<'_, Pipeline>
@@ -63,20 +63,20 @@ impl PipelineSlot {
     }
 }
 
-/// How an SDK moves guest state across a batch boundary.
+/// How an SDK moves processor state across a batch boundary.
 ///
 /// An SDK picks an impl from its macro's invocation form: [`NoState`] for a
 /// stateless pipeline, [`Stateful<C>`] for one that carries rows. Keeping the
 /// branch in the type system rather than in `macro_rules!` keeps the large
 /// expansion body to one copy.
-pub trait GuestStateSpec {
+pub trait ProcessorStateSpec {
     /// Value the SDK reports as the descriptor's `stateful` flag.
     const STATEFUL: bool;
 
     /// Make the previous batch's state available to the pipeline's systems.
     ///
     /// Called before the pipeline runs, with `prior` exactly as the host passed
-    /// it. [`Stateful`] decodes it into a [`GuestState<C>`] resource on `data`;
+    /// it. [`Stateful`] decodes it into a [`ProcessorState<C>`] resource on `data`;
     /// [`NoState`] does nothing.
     fn restore(data: &mut Dataset, prior: Option<&[u8]>) -> PcsResult<()>;
 
@@ -87,10 +87,10 @@ pub trait GuestStateSpec {
     fn capture(data: &Dataset) -> PcsResult<Option<Vec<u8>>>;
 }
 
-/// [`GuestStateSpec`] for a stateless pipeline: both hooks are no-ops.
+/// [`ProcessorStateSpec`] for a stateless pipeline: both hooks are no-ops.
 pub struct NoState;
 
-impl GuestStateSpec for NoState {
+impl ProcessorStateSpec for NoState {
     const STATEFUL: bool = false;
 
     fn restore(_data: &mut Dataset, _prior: Option<&[u8]>) -> PcsResult<()> {
@@ -102,9 +102,9 @@ impl GuestStateSpec for NoState {
     }
 }
 
-/// [`GuestStateSpec`] backed by one Arrow component `C`.
+/// [`ProcessorStateSpec`] backed by one Arrow component `C`.
 ///
-/// The state lives in the batch dataset as a [`GuestState<C>`] resource, not as
+/// The state lives in the batch dataset as a [`ProcessorState<C>`] resource, not as
 /// a registered component: [`Dataset`]'s IPC format requires every component to
 /// hold exactly the dataset's row count, while state rows are independent of
 /// batch rows. Resources are invisible to [`Dataset::write_ipc`], so state never
@@ -115,7 +115,7 @@ impl GuestStateSpec for NoState {
 /// schema.
 pub struct Stateful<C>(PhantomData<C>);
 
-impl<C> GuestStateSpec for Stateful<C>
+impl<C> ProcessorStateSpec for Stateful<C>
 where
     C: Component + serde::Serialize + for<'de> serde::Deserialize<'de>,
 {
@@ -139,14 +139,14 @@ where
                 }
             }
         };
-        data.insert_resource(GuestState::<C>::new(rows));
+        data.insert_resource(ProcessorState::<C>::new(rows));
         Ok(())
     }
 
     fn capture(data: &Dataset) -> PcsResult<Option<Vec<u8>>> {
-        let state = data.get_resource::<GuestState<C>>().ok_or_else(|| {
+        let state = data.get_resource::<ProcessorState<C>>().ok_or_else(|| {
             PcsError::generic(format!(
-                "pcs sdk: GuestState<{}> resource is missing after the run; \
+                "pcs sdk: ProcessorState<{}> resource is missing after the run; \
                      a system must have replaced the dataset wholesale",
                 C::name()
             ))
@@ -215,24 +215,30 @@ pub fn fingerprint_hex(fp: u32) -> String {
 /// count, while state rows are independent of batch rows. Resources are not
 /// serialised by [`Dataset::write_ipc`], so state never leaks into the output.
 ///
+/// A single-row state component is the common case, and
+/// [`get_or_insert_default`](Self::get_or_insert_default) covers it:
+///
 /// ```ignore
-/// fn count_batches(data: &mut Dataset) -> Result<(), PcsError> {
-///     let state = data
-///         .get_resource_mut::<GuestState<Counter>>()
-///         .ok_or_else(|| PcsError::generic("guest state missing"))?;
-///     match state.rows.first_mut() {
-///         Some(counter) => counter.count += 1,
-///         None => state.rows.push(Counter { count: 1 }),
-///     }
+/// fn count_batches(data: &mut Dataset) -> PcsResult<()> {
+///     ProcessorState::<Counter>::get_or_insert_default(data)?.count += 1;
 ///     Ok(())
 /// }
 /// ```
-pub struct GuestState<C> {
+pub struct ProcessorState<C> {
     /// The state rows. Systems mutate this in place.
     pub rows: Vec<C>,
 }
 
-impl<C> GuestState<C> {
+/// The branch names this batch's output is delivered to.
+///
+/// A pipeline's systems insert one of these into the batch dataset to route
+/// its output; the SDK export macros read it after the systems run. Absent =
+/// legacy behaviour: the host multicasts the output to every downstream link.
+/// `Some(vec![])` sends the output nowhere.
+#[derive(Debug, Clone)]
+pub struct RouteDecision(pub Vec<String>);
+
+impl<C> ProcessorState<C> {
     /// Wrap the rows restored from the previous batch.
     pub fn new(rows: Vec<C>) -> Self {
         Self { rows }
@@ -244,7 +250,39 @@ impl<C> GuestState<C> {
     }
 }
 
-impl<C> Default for GuestState<C> {
+impl<C: Default + 'static> ProcessorState<C> {
+    /// Borrow the single state row, creating `C::default()` on a cold start.
+    ///
+    /// The shape almost every stateful processor wants: one row of running
+    /// totals that starts at zero. It replaces the
+    /// `match state.rows.first_mut() { Some(x) => .., None => rows.push(..) }`
+    /// idiom each such system would otherwise hand-roll, and is what the
+    /// `#[fold]` expansion calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcsError::ResourceNotFound`] when no `ProcessorState<C>`
+    /// resource is on the dataset. That means the SDK export macro was not
+    /// given `state = C`, so nothing restored the previous batch's rows and
+    /// nothing will capture these; inserting the resource here would silently
+    /// drop every update at the batch boundary.
+    pub fn get_or_insert_default(data: &mut Dataset) -> PcsResult<&mut C> {
+        let state = data
+            .get_resource_mut::<ProcessorState<C>>()
+            .ok_or_else(|| {
+                PcsError::resource_not_found(format!(
+                    "ProcessorState<{}>: the SDK export macro was not given `state = <Type>`",
+                    std::any::type_name::<C>()
+                ))
+            })?;
+        if state.rows.is_empty() {
+            state.rows.push(C::default());
+        }
+        Ok(&mut state.rows[0])
+    }
+}
+
+impl<C> Default for ProcessorState<C> {
     fn default() -> Self {
         Self::new(Vec::new())
     }
@@ -296,5 +334,49 @@ mod tests {
         // survives even though this closure would produce a different one.
         let pipeline = SLOT.pipeline(|| Pipeline::new("second"));
         assert_eq!(pipeline.name(), "first");
+    }
+
+    /// A single-row state component, as `#[fold]` expects.
+    #[derive(Default, Debug, PartialEq)]
+    struct Ledger {
+        settled_count: i64,
+    }
+
+    #[test]
+    fn get_or_insert_default_creates_the_row_on_a_cold_start() {
+        let mut data = Dataset::new();
+        data.insert_resource(ProcessorState::<Ledger>::default());
+
+        ProcessorState::<Ledger>::get_or_insert_default(&mut data)
+            .expect("state resource present")
+            .settled_count += 7;
+
+        assert_eq!(
+            data.get_resource::<ProcessorState<Ledger>>().unwrap().rows,
+            vec![Ledger { settled_count: 7 }]
+        );
+    }
+
+    #[test]
+    fn get_or_insert_default_reuses_the_restored_row() {
+        let mut data = Dataset::new();
+        data.insert_resource(ProcessorState::new(vec![Ledger { settled_count: 41 }]));
+
+        ProcessorState::<Ledger>::get_or_insert_default(&mut data)
+            .expect("state resource present")
+            .settled_count += 1;
+
+        let rows = &data.get_resource::<ProcessorState<Ledger>>().unwrap().rows;
+        assert_eq!(rows.len(), 1, "a second row would be a lost update");
+        assert_eq!(rows[0].settled_count, 42);
+    }
+
+    #[test]
+    fn get_or_insert_default_without_the_resource_is_an_error() {
+        let mut data = Dataset::new();
+        let err = ProcessorState::<Ledger>::get_or_insert_default(&mut data)
+            .expect_err("a stateless processor must not silently accumulate state");
+        assert_eq!(err.category(), "resource_not_found");
+        assert!(err.message().contains("Ledger"), "got: {err}");
     }
 }

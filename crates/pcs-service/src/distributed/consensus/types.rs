@@ -305,8 +305,8 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_claim_row_range() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::ClaimRowRange {
             batch_id: 42,
             row_range_start: 0,
@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_renew_claim() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::RenewClaim {
             claim_id,
             instance_id,
@@ -370,8 +370,8 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_ack_claim() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::AckClaim {
             claim_id,
             instance_id,
@@ -385,8 +385,8 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_release_claim() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::ReleaseClaim {
             claim_id,
             instance_id,
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_checkpoint() {
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let ipc = vec![1u8, 2, 3, 4];
         let cmd = ConsensusCommand::Checkpoint {
             claim_id,
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_heartbeat() {
-        let instance_id = Uuid::new_v4();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::Heartbeat {
             instance_id,
             at: 54321,
@@ -480,8 +480,8 @@ mod tests {
 
     #[test]
     fn postcard_round_trip_response_batch_claimed() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let r = ConsensusResponse::BatchClaimed {
             batch_id: 5,
             component: "items".to_string(),
@@ -589,8 +589,8 @@ mod tests {
 
     #[test]
     fn test_consensus_command_serde_round_trip_claim_row_range() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let cmd = ConsensusCommand::ClaimRowRange {
             batch_id: 42,
             row_range_start: 0,
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_consensus_command_serde_round_trip_checkpoint() {
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let ipc = vec![1u8, 2, 3, 4];
         let cmd = ConsensusCommand::Checkpoint {
             claim_id,
@@ -691,16 +691,16 @@ mod tests {
         assert_eq!(cmd.ipc_bytes(), Some(vec![0xFF].as_slice()));
 
         let cmd2 = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
         };
         assert_eq!(cmd2.ipc_bytes(), None);
     }
 
     #[test]
     fn test_consensus_response_serde_round_trip() {
-        let claim_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
+        let instance_id = Uuid::now_v7();
         let resp = ConsensusResponse::BatchClaimed {
             batch_id: 5,
             component: "items".to_string(),

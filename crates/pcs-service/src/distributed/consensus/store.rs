@@ -442,7 +442,7 @@ impl PartitionSource for RedbSharedStore {
                 Some(r) => r,
             };
 
-            let claim_id = Uuid::new_v4();
+            let claim_id = Uuid::now_v7();
             let cmd = ConsensusCommand::ClaimRowRange {
                 batch_id,
                 row_range_start: row_start,
@@ -619,7 +619,7 @@ mod tests {
 
     fn temp_path() -> PathBuf {
         let dir = std::env::temp_dir();
-        dir.join(format!("pcs_arrow_store_test_{}.db", Uuid::new_v4()))
+        dir.join(format!("pcs_arrow_store_test_{}.db", Uuid::now_v7()))
     }
 
     fn make_store(path: &Path) -> RedbSharedStore {
@@ -661,7 +661,7 @@ mod tests {
         let store = make_store(&path);
         seed_batch(&store, 0, 100);
 
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store
             .claim_next_batch(instance)
             .await
@@ -684,7 +684,7 @@ mod tests {
         let store = make_store(&path);
         seed_batch(&store, 0, 50);
 
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store.claim_next_batch(instance).await.unwrap().unwrap();
 
         store
@@ -704,7 +704,7 @@ mod tests {
         let store = make_store(&path);
         seed_batch(&store, 0, 100);
 
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store.claim_next_batch(instance).await.unwrap().unwrap();
 
         store
@@ -753,7 +753,7 @@ mod tests {
             }
         });
 
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store
             .claim_next_batch(instance)
             .await
@@ -790,7 +790,7 @@ mod tests {
         let path = temp_path();
         let store = make_store(&path);
         seed_batch(&store, 0, 10);
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store.claim_next_batch(instance).await.unwrap().unwrap();
 
         // One byte over the limit must be rejected.
@@ -858,7 +858,7 @@ mod tests {
             }
         });
 
-        let instance = Uuid::new_v4();
+        let instance = Uuid::now_v7();
         let claim = store
             .claim_next_batch(instance)
             .await

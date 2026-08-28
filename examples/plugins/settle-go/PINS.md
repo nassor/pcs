@@ -3,7 +3,7 @@
 One plugin, one language, no WebAssembly. `settle-go` is a C shared library the
 host loads with dlopen, built from Go with cgo, exporting the ABI in
 `crates/pcs-plugin-abi/include/pcs_plugin.h`. `examples/polyglot/PINS.md` covers
-the six WASM guests; this file covers what the native path needs.
+the six WASM processors; this file covers what the native path needs.
 
 ## Required tools
 
@@ -13,10 +13,10 @@ the six WASM guests; this file covers what the native path needs.
 | A C compiler for cgo | any gcc or clang cgo supports | Linux `apt install build-essential`, macOS `xcode-select --install`, Windows mingw-w64 |
 | cargo | workspace Rust toolchain | <https://rustup.rs> |
 
-Build with `bash scripts/build-plugins.sh`, which fails with a distinct exit
-code per missing tool: 2 cargo, 3 Go, 4 a C compiler, 5 no artifact. Build this
-plugin alone with `--only=go`, which still needs cargo because it regenerates
-the schema constants.
+Build with `cargo xtask plugins`, which fails with a distinct exit code per
+missing tool: 2 cargo, 3 Go, 4 a C compiler, 5 no artifact. Build this plugin
+alone with `--only=go`, which still needs cargo because it regenerates the
+schema constants.
 
 cargo is on that list because the plugin compiles in the `Order` schema as
 generated constants, and the same emit that feeds the WASM stages produces
@@ -27,39 +27,40 @@ them.
 cgo shells out to the compiler `go env CC` names, so the plugin cannot build
 without one. On Windows that compiler must be mingw-w64 gcc or clang; cgo does
 not support MSVC, so a machine with only Visual Studio has no usable C
-compiler. `scripts/build-plugins.sh` checks `go env CC` before it does any
-work, because the raw failure is
-`cgo: C compiler "gcc" not found` filed under a `# runtime/cgo` heading, which
-reads like a Go toolchain fault rather than a missing dependency.
+compiler. `cargo xtask plugins` checks `go env CC` before it does any work,
+because the raw failure is `cgo: C compiler "gcc" not found` filed under a
+`# runtime/cgo` heading, which reads like a Go toolchain fault rather than a
+missing dependency.
 
 With cgo disabled the implicit build constraint drops `main.go` from the package
 and the build fails with `function main is undeclared in the main package`.
 
 ## The codec
 
-The plugin depends on `packages/arrow-ipc-go`, the Arrow IPC codec that reads
-and mutates the PCS wire format with nothing but the Go standard library. It
-resolves through a `require` plus a filesystem `replace` in `go.mod`:
+The plugin depends on `packages/pcs-sdk-go`, the Go SDK whose `arrowipc`
+subpackage reads and mutates the PCS wire format with nothing but the Go
+standard library. It resolves through a `require` plus a filesystem `replace`
+in `go.mod`:
 
 ```
-require github.com/nassor/pcs/packages/arrow-ipc-go v0.0.0
-replace github.com/nassor/pcs/packages/arrow-ipc-go => ../../../packages/arrow-ipc-go
+require github.com/nassor/pcs/packages/pcs-sdk-go v0.0.0
+replace github.com/nassor/pcs/packages/pcs-sdk-go => ../../../packages/pcs-sdk-go
 ```
 
 That is the same pattern `examples/polyglot/stages/go-validate/go.mod` uses. The
 difference is that nothing rewrites this file: `componentize-go bindings` owns
 the WASM stage's `go.mod` and drops its dependencies on every run, which is why
 that stage's build re-applies them with `go mod edit`. A cgo build never touches
-`go.mod`, so the two lines above stay put.
+`go.mod`, so the line above stays put.
 
-The codec has no dependencies of its own, and a filesystem replacement needs no
+The SDK has no dependencies of its own, and a filesystem replacement needs no
 checksum, so there is no `go.sum`.
 
 ## Load-bearing crate pin
 
 `arrow-ipc = "=59.2.0"` in the workspace `Cargo.toml` is the host's Arrow IPC
 implementation and the byte layout this plugin walks. A patch bump there can
-move the buffers the codec resolves by offset. `crates/pcs-guest/PINS.md` holds
+move the buffers the codec resolves by offset. `crates/pcs-processor/PINS.md` holds
 the upgrade policy. The plugin ABI version is independent of it:
 `PCS_ABI_VERSION` is `0x00010000` and covers the struct layout, not the wire
 format inside the buffers.
@@ -157,13 +158,13 @@ handlers, and its `GOMAXPROCS` competes with the host's tokio and rayon pools.
 
 `examples/polyglot/generated/schema_gen.go` is emitted as
 `package export_pcs_pipeline_pipeline`, the name the WASM stage's binding
-directory needs. A `c-shared` plugin is `package main`, so the build script
+directory needs. A `c-shared` plugin is `package main`, so `cargo xtask plugins`
 rewrites the clause on the way in and changes nothing else.
 
 ## Smoke check
 
 ```
-bash scripts/build-plugins.sh --only=go
+cargo xtask plugins --only=go
 ```
 
 Produces `libsettle_go.so`, `libsettle_go.dylib` or `settle_go.dll` in this

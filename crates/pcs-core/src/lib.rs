@@ -38,9 +38,11 @@ pub use system::{
 };
 
 #[cfg(feature = "runtime")]
-pub use runtime::PipelineRuntime;
+pub use runtime::{PipelineRuntime, RuntimeDescriptorInfo, RuntimeOutput};
 
 pub mod prelude {
+    #[cfg(feature = "runtime")]
+    pub use crate::runtime::RuntimeOutput;
     pub use crate::{
         BackpressureSpec, Component, Dataset, DependencyKind, FieldAccess, KeyPartition,
         ParallelSystem, PcsError, PcsResult, Pipeline, PipelineBuilder, PipelineConfig,
@@ -55,5 +57,5 @@ pub mod prelude {
     pub use async_trait::async_trait;
 
     #[cfg(feature = "windows")]
-    pub use crate::windows::{CURRENT_ACCUMULATOR_VERSION, WindowAccumulator};
+    pub use crate::windows::{CURRENT_ACCUMULATOR_VERSION, WindowAccumulator, WindowWatermark};
 }

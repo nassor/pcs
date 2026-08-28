@@ -6,10 +6,10 @@
 //! ## Usage
 //!
 //! ```text
-//! pcs-service serve --config service.toml
-//! pcs-service validate --config service.toml
+//! pcs-service serve --config service.kdl
+//! pcs-service validate --config service.kdl
 //! pcs-service status --addr http://localhost:8080
-//! pcs-service cluster init --config service.toml
+//! pcs-service cluster init --config service.kdl
 //! pcs-service cluster status --addr http://localhost:8080
 //! ```
 
@@ -31,6 +31,9 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let parsed = cli::Cli::parse();
+    // `status`/`cluster status` build a reqwest client; reqwest 0.13's
+    // `rustls-no-provider` needs the crypto provider installed first.
+    pcs_service::service::install_ring_provider();
     let result = match &parsed.cmd {
         cli::Command::Serve(args) => commands::serve::run(&parsed.global, args).await,
         cli::Command::Validate(args) => commands::validate::run(&parsed.global, args).await,

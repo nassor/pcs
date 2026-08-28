@@ -3,7 +3,7 @@
 //! This half of the loader touches no FFI, so every rule it enforces is unit
 //! testable against a byte string. The manifest mirrors the WIT
 //! `pipeline-descriptor` field for field, with each component's Arrow IPC
-//! schema base64 encoded because base64 is what every non-Rust guest can emit
+//! schema base64 encoded because base64 is what every non-Rust processor can emit
 //! from a generated constant without linking Arrow.
 
 use base64::Engine as _;
@@ -105,7 +105,7 @@ impl PluginManifest {
     /// Base64 decode every component's Arrow IPC schema.
     ///
     /// An empty decode result is an error rather than a skipped component. The
-    /// Rust guest SDK writes empty bytes when a schema fails to serialise, so
+    /// Rust processor SDK writes empty bytes when a schema fails to serialise, so
     /// this is where that failure becomes a clean load-time message instead of
     /// a component silently missing from the template dataset.
     pub(crate) fn decode_components(&self) -> PcsResult<Vec<(String, Vec<u8>)>> {

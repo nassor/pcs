@@ -52,7 +52,7 @@ as a library, you own `main`, and you call `pipeline.run().await`. There is no
     <figcaption class="dgm-cap">
         One process, one address space. The <code>Pipeline</code> derives its own stage plan
         from the field declarations and retries what fails, exactly as it does inside a
-        WebAssembly guest.
+        WebAssembly processor.
     </figcaption>
 </div>
 
@@ -65,17 +65,17 @@ Reach for native when:
 - You need Rust types and `Resource` singletons that never cross an IPC
   boundary.
 
-Reach for a [WebAssembly guest](@/guests/_index.md) when:
+Reach for a [WebAssembly processor](@/processors/_index.md) when:
 
 - You want to change the pipeline without rebuilding the host.
 - You need the sandbox: no filesystem, no network, no clock unless the host
   grants it.
 - The pipeline is not Rust.
 
-Reach for a [native plugin](@/native/plugins.md) when the transform must load at
-runtime like a guest, and the sandbox is what stands in the way. It is a shared
-library the service opens with `dlopen`: native threads and native extensions,
-and none of the isolation.
+Reach for a [native plugin](@/native/plugins.md) when the transform must load
+at runtime like a processor, and the sandbox is what stands in the way. It is
+a shared library the service opens with `dlopen`: native threads and native
+extensions, and none of the isolation.
 
 <div class="note">
 <span class="note-label">Depending on PCS</span>
@@ -83,15 +83,16 @@ and none of the isolation.
 The crates are **not published to crates.io**. Inside a clone of the repository,
 use a path dependency. Outside one, point cargo at the repository:
 
-```toml
+```toml,name=Depending on PCS from outside a clone
 pcs-service = { git = "https://github.com/nassor/pcs" }
 ```
 
 `pcs-service` re-exports `pcs-core`, so `pcs_service::pipeline::Pipeline` and
-`pcs_core::pipeline::Pipeline` are the same type. Depend on `pcs-core` alone
-when you want no IO formats, no wasmtime and no HTTP.
+`pcs_core::pipeline::Pipeline` are the same type. Depend on `pcs-core` alone when
+you want no wasmtime and no HTTP, and add `pcs-connector-file` plus a
+`pcs-transformer-*` crate for each format you read or write.
 
 </div>
 
-The [core concepts](@/dataset.md) apply to both modes: a guest runs the same
+The [core concepts](@/dataset.md) apply to both modes: a processor runs the same
 `Pipeline` DAG, just inside a component.

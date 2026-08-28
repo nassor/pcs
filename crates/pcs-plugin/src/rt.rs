@@ -11,12 +11,11 @@ use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use base64::Engine as _;
-use pcs_core::sdk::{
-    GuestStateSpec, PipelineSlot, classify_run_error, fingerprint_hex, schema_to_ipc_bytes,
-};
+use pcs_core::sdk::{PipelineSlot, classify_run_error, fingerprint_hex, schema_to_ipc_bytes};
 use pcs_core::{Dataset, Pipeline};
 
-pub use pcs_core::sdk::{GuestState, NoState, Stateful};
+pub use pcs_core::sdk::RouteDecision;
+pub use pcs_core::sdk::{NoState, ProcessorState, ProcessorStateSpec, Stateful};
 pub use pcs_plugin_abi::{
     PCS_ABI_VERSION, PcsBuffer, PcsHostV1, PcsPluginV1, PcsRunMetrics, PcsRunResult, PcsSlice,
     PcsStatus, log_level,
@@ -240,7 +239,7 @@ struct Manifest<'a> {
 /// fails to serialise gets empty bytes rather than aborting the whole
 /// descriptor: the host rejects a zero-length schema with a message naming the
 /// component, which beats a load failure that names nothing.
-pub fn manifest_json<S: GuestStateSpec>(
+pub fn manifest_json<S: ProcessorStateSpec>(
     pipeline: &Pipeline,
     version: &str,
 ) -> Result<String, String> {
@@ -279,7 +278,7 @@ pub fn manifest_json<S: GuestStateSpec>(
 ///
 /// `instance` must come from [`PluginInstance::into_raw`]. `manifest_json` and
 /// `err` must be writable or null.
-pub unsafe fn describe_impl<S: GuestStateSpec>(
+pub unsafe fn describe_impl<S: ProcessorStateSpec>(
     instance: *mut core::ffi::c_void,
     build: fn() -> Pipeline,
     version: &str,
@@ -320,7 +319,7 @@ pub unsafe fn describe_impl<S: GuestStateSpec>(
 /// must describe readable bytes for the duration of the call. `out` and `err`
 /// must be writable or null.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn run_batch_impl<S: GuestStateSpec>(
+pub unsafe fn run_batch_impl<S: ProcessorStateSpec>(
     instance: *mut core::ffi::c_void,
     build: fn() -> Pipeline,
     input: PcsSlice,
@@ -404,6 +403,22 @@ pub unsafe fn run_batch_impl<S: GuestStateSpec>(
             Some(blob) => (vec_into_buffer(blob), 1),
             None => (PcsBuffer::null(), 0),
         };
+        let routes: Option<Vec<String>> = dataset
+            .get_resource::<RouteDecision>()
+            .map(|decision| decision.0.clone());
+        let (routes_buffer, has_routes) = match routes {
+            Some(list) => {
+                let json = match serde_json::to_string(&list) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        write_err(err, &format!("routes encode: {e}"));
+                        return PcsStatus::PERMANENT;
+                    }
+                };
+                (vec_into_buffer(json.into_bytes()), 1)
+            }
+            None => (PcsBuffer::null(), 0),
+        };
 
         unsafe {
             *out = PcsRunResult {
@@ -417,6 +432,8 @@ pub unsafe fn run_batch_impl<S: GuestStateSpec>(
                     systems_run: stats.systems_run as u32,
                     retries: stats.retries_this_batch,
                 },
+                routes: routes_buffer,
+                has_routes,
             };
         }
         PcsStatus::OK

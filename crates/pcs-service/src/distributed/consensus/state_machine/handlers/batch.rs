@@ -495,7 +495,7 @@ mod tests {
     fn test_n_releases_accumulate_release_attempts() {
         let (db, _path) = temp_db();
         let batch_id = 77u64;
-        let instance_id = uuid::Uuid::new_v4();
+        let instance_id = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::RegisterMasterBatch {
@@ -510,7 +510,7 @@ mod tests {
         .unwrap();
 
         for i in 0..5 {
-            let claim_id = uuid::Uuid::new_v4();
+            let claim_id = uuid::Uuid::now_v7();
             apply(
                 &db,
                 ConsensusCommand::ClaimRowRange {
@@ -550,7 +550,7 @@ mod tests {
     fn test_reset_on_ack_then_new_failure_starts_from_one() {
         let (db, _path) = temp_db();
         let batch_id = 88u64;
-        let instance_id = uuid::Uuid::new_v4();
+        let instance_id = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::RegisterMasterBatch {
@@ -566,7 +566,7 @@ mod tests {
 
         // Three failures: claim → release × 3.
         for _ in 0..3 {
-            let claim_id = uuid::Uuid::new_v4();
+            let claim_id = uuid::Uuid::now_v7();
             apply(
                 &db,
                 ConsensusCommand::ClaimRowRange {
@@ -598,7 +598,7 @@ mod tests {
         );
 
         // One success: claim → ack.
-        let ok_claim = uuid::Uuid::new_v4();
+        let ok_claim = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -645,7 +645,7 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {

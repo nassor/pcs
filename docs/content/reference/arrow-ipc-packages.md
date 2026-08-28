@@ -1,75 +1,82 @@
 +++
-title = "The Arrow codec packages"
-description = "pcs-arrow-ipc for Go, Python, TypeScript, Kotlin and C#: one wire format, five standard-library-only decoders, install lines, the shared API, and what they refuse to write."
+title = "The SDK packages"
+description = "pcs-sdk for Go, Python, TypeScript, Kotlin and C#: one package per language, the codec inside each, install lines, the shared codec API, and what the codecs refuse to write."
 template = "page.html"
 weight = 2
 +++
 
-# The Arrow codec packages
+# The SDK packages
 
-A WebAssembly guest has to decode the batch the host hands it. Five of the six
-languages in [the polyglot example](@/guests/six-languages.md) have no Arrow
-library that survives their componentizer, so they share one codec, published per
-language as `pcs-arrow-ipc`.
+A WebAssembly processor has to decode the batch the host hands it. Five of the six
+languages in [the polyglot example](@/processors/_index.md#six-languages-one-pipeline) have no Arrow
+library that survives their componentizer, so each language's zero-ceremony
+authoring SDK carries a standard-library-only codec internally: one package per
+language resolves both the authoring API and the wire format. The codec keeps
+its original package/module/namespace name inside its SDK.
 
-Each is a decoder plus in-place setters, written against
+Each codec is a decoder plus in-place setters, written against
 [the wire format](@/reference/wire-format.md) and nothing else. No transitive
-dependencies in any of the five.
+dependencies in any of the five packages.
 
 ## Coordinates
 
-All five release in lockstep. One wire format, one version.
+All five SDKs release in lockstep. One wire format, one version. The Kotlin KSP
+symbol processor and the C# source generator are build-time companions packed
+with their runtime; they are not additional runtime packages.
 
-| Language | Coordinate | Import |
+| Language | Coordinate | Codec import |
 |---|---|---|
-| Go | `github.com/nassor/pcs/packages/arrow-ipc-go` | `arrowipc` |
-| Python | `pcs-arrow-ipc` | `pcs_arrow_ipc` |
-| TypeScript | `@nassor/pcs-arrow-ipc` | `@nassor/pcs-arrow-ipc` |
-| Kotlin | `io.github.nassor:pcs-arrow-ipc` | `io.github.nassor.pcs.arrowipc` |
-| C# | `Pcs.ArrowIpc` | `Pcs.ArrowIpc` |
+| Go | `github.com/nassor/pcs/packages/pcs-sdk-go` | subpackage `arrowipc` |
+| Python | `pcs-sdk` | `pcs_sdk.arrow_ipc` |
+| TypeScript | `@nassor/pcs-sdk` | internal `./arrow_ipc.ts`, re-exported |
+| Kotlin | `io.github.nassor:pcs-sdk-kt` (+ KSP `pcs-sdk-kt-ksp`) | `io.github.nassor.pcs.arrowipc` |
+| C# | `Pcs.Sdk` (+ generator `Pcs.Sdk.Generators`) | `Pcs.ArrowIpc` |
 
 The Python wheel, the npm tarball, the NuGet package and a tarball of the Maven
-repository are assets of the `arrow-ipc-v0.1.0` GitHub release. Go resolves
-through the module proxy from the `packages/arrow-ipc-go/v0.1.0` tag, and Kotlin
-resolves from the Maven repository this site serves.
+repository are assets of the `sdk-v0.1.0` GitHub release. Go resolves through
+the module proxy from the `packages/pcs-sdk-go/v0.1.0` tag, and Kotlin resolves
+from the Maven repository this site serves.
 
 ## Install
 
-Go. The import path's last element is `arrow-ipc-go`, so name the package
-identifier:
+Go. The import path's last element is `pcs-sdk-go`; the codec is the `arrowipc`
+subpackage:
 
-```go
-// go get github.com/nassor/pcs/packages/arrow-ipc-go@v0.1.0
-import arrowipc "github.com/nassor/pcs/packages/arrow-ipc-go"
+```go,name=Install the Go SDK
+// go get github.com/nassor/pcs/packages/pcs-sdk-go@v0.1.0
+import pcs "github.com/nassor/pcs/packages/pcs-sdk-go"
+import arrowipc "github.com/nassor/pcs/packages/pcs-sdk-go/arrowipc"
 ```
 
 Python. `componentize-py` resolves imports once, during its pre-init snapshot,
 from the directories named by `-p`, and the flag defaults to `.`:
 
-```bash
-pip install pcs_arrow_ipc-0.1.0-py3-none-any.whl
+```bash,name=Install the Python SDK then build
+pip install pcs_sdk-0.1.0-py3-none-any.whl
 componentize-py -d <wit-dir> -w pcs-pipeline componentize app \
-    -p . -p <site-packages> -o guest.wasm
+    -p . -p <site-packages> -o processor.wasm
 ```
 
 TypeScript. `jco componentize` bundles with Rolldown under
 `platform: "neutral"`, where `resolve.mainFields` is empty; the package ships an
 `exports` map and compiled JavaScript so a bare specifier resolves anyway:
 
-```bash
-npm install @nassor/pcs-arrow-ipc
+```bash,name=Install the TypeScript SDK
+npm install @nassor/pcs-sdk
 ```
 
-Kotlin, from the Maven repository served by this site:
+Kotlin, from the Maven repository served by this site, with the KSP processor
+alongside the runtime:
 
-```kotlin
+```kotlin,name=Install the Kotlin SDK and the KSP processor
 repositories {
     maven("https://nassor.github.io/pcs/maven")
     mavenCentral()
 }
 
 dependencies {
-    implementation("io.github.nassor:pcs-arrow-ipc:0.1.0")
+    implementation("io.github.nassor:pcs-sdk-kt:0.1.0")
+    add("kspWasmWasi", "io.github.nassor:pcs-sdk-kt-ksp:0.1.0")
 }
 ```
 
@@ -77,12 +84,12 @@ C#. A plain `net10.0` assembly: only the component project carries
 `RuntimeIdentifier=wasi-wasm`, `SelfContained` and `PublishTrimmed`, and the
 codec uses no reflection, so it needs no trimmer root:
 
-```bash
+```bash,name=Install the C# SDK
 dotnet nuget add source <download-dir> -n pcs-local
-dotnet add package Pcs.ArrowIpc --version 0.1.0
+dotnet add package Pcs.Sdk --version 0.1.0
 ```
 
-## API
+## Codec API
 
 One shape, five spellings. Parse takes ownership of a mutable copy of the input;
 the setters write into it; the output accessor hands the same bytes back as
@@ -103,24 +110,25 @@ the setters write into it; the output accessor hands the same bytes back as
 | Output bytes | `s.Buf` | `s.to_bytes()` | `s.toBytes()` | `s.toWit()` | `s.Buffer` |
 | Base64 decode | `arrowipc.DecodeBase64(t)` | `decode_base64(t)` | `decodeBase64(t)` | `decodeBase64(t)` | `ArrowIpc.DecodeBase64(t)` |
 
-`decodeBase64` is there because a guest embeds its component's Arrow schema as a
-generated base64 constant. It means the guest imports one library, not two.
+`decodeBase64` is there because a processor embeds its component's Arrow
+schema as a generated base64 constant. It means the processor imports one
+package, not two.
 
 Int64 values are the language's widest integer: `bigint` in TypeScript, `Long` in
 Kotlin, `long` in C#.
 
 Malformed input is an error, never a trap. Go returns an `error`, Python raises
 `ValueError`, TypeScript throws `Error`, Kotlin throws `ArrowIpcException` and C#
-throws `ArrowIpcException`. A guest that traps gives the host an opaque wasm
+throws `ArrowIpcException`. A processor that traps gives the host an opaque wasm
 failure instead of the `run-error::permanent` message it can report.
 
 ## What the codecs refuse
 
-None of the five writes a flatbuffer, so each one refuses four things:
+None of the five codecs writes a flatbuffer, so each one refuses four things:
 
 - **No `Utf8` write.** Changing a string resizes the values buffer and
   invalidates the offsets buffer and the RecordBatch flatbuffer that describes
-  both. A guest that needs to write a string column needs a real Arrow writer,
+  both. A processor that needs to write a string column needs a real Arrow writer,
   which is why the Rust stage owns `settlement` in the polyglot chain.
 - **No dictionary batches.** A segment holds exactly one Schema message then one
   RecordBatch message. A DictionaryBatch in between is rejected during framing.
@@ -128,18 +136,19 @@ None of the five writes a flatbuffer, so each one refuses four things:
 - **No validity writes.** A non-nullable field carries an all-ones validity
   bitmap from arrow-rs, and an in-place value write never has to touch it.
 
-Everything a guest does not touch is returned byte-identical: the framing words,
-both flatbuffers per segment, and the trailing `__alive` bitmap.
+Everything a processor does not touch is returned byte-identical: the
+framing words, both flatbuffers per segment, and the trailing `__alive`
+bitmap.
 
 ## Compatibility
 
-The five target the byte layout of `arrow-ipc = "=59.2.0"`, which the PCS
-workspace exact-pins as the host to guest wire format, and the
-`pcs:pipeline@0.2.0` WIT world that carries it. A guest built against these
+The five codecs target the byte layout of `arrow-ipc = "=59.2.0"`, which the PCS
+workspace exact-pins as the host to processor wire format, and the
+`pcs:pipeline@0.3.0` WIT world that carries it. A processor built against these
 packages talks to a host built from the same pin.
 
 Version 0.1.0 of all five decodes what
-`cargo run -p pcs-service --features wasm --example polyglot_orders -- emit`
+`cargo run -p pcs-service --features wasm --example polyglot_schema_emit -- emit`
 writes to `examples/polyglot/generated/fixture_input.pcs`. Each package's test
 suite asserts exactly that, column by column, against the JSON the same command
 emits.
@@ -152,5 +161,5 @@ The `packages/` subtree is Apache-2.0. The engine crates are AGPL-3.0-only.
 
 - [The wire format](@/reference/wire-format.md): what a sixth language
   implements.
-- [Six languages, one pipeline](@/guests/six-languages.md): the chain that
-  consumes all five.
+- [Six languages, one pipeline](@/processors/_index.md#six-languages-one-pipeline): the chain that
+  consumes all five packages.

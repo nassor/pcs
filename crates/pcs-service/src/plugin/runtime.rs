@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use pcs_core::runtime::RuntimeOutput;
 use pcs_core::{Dataset, PcsError, PcsResult};
 use pcs_plugin_abi::{PcsBuffer, PcsRunMetrics, PcsRunResult, PcsSlice, PcsStatus};
 
@@ -72,6 +73,13 @@ pub struct NativePluginRuntime {
     components: Vec<(String, Vec<u8>)>,
     /// Metrics from the most recent batch, for callers that report them.
     last_metrics: Mutex<Option<PluginBatchMetrics>>,
+    /// The workflow this plugin belongs to, and this node's declared id. Set
+    /// by [`with_identity`](Self::with_identity); empty for a runtime built
+    /// directly and never given an identity. This attributes the
+    /// `pcs_processor_*` series recorded by `report_metrics` and the
+    /// `processor.batch` span.
+    workflow_id: String,
+    processor_id: String,
 }
 
 /// Reports what the plugin declared about itself, not the pointers behind it.
@@ -161,7 +169,22 @@ impl NativePluginRuntime {
             manifest,
             components,
             last_metrics: Mutex::new(None),
+            workflow_id: String::new(),
+            processor_id: String::new(),
         })
+    }
+
+    /// Declare this runtime's workflow and node id.
+    ///
+    /// Consuming rather than a setter because a runtime's identity never
+    /// changes once built, and the service builder assigns it immediately
+    /// after loading. Left unset, the `processor.batch` span carries empty
+    /// `workflow`/`processor` fields.
+    #[must_use]
+    pub fn with_identity(mut self, workflow_id: String, processor_id: String) -> Self {
+        self.workflow_id = workflow_id;
+        self.processor_id = processor_id;
+        self
     }
 
     /// What the plugin reported about its most recent batch.
@@ -177,7 +200,8 @@ impl NativePluginRuntime {
         }
     }
 
-    /// Store the batch metrics and emit them through the host metric sink.
+    /// Store the batch metrics, emit them through the host metric sink, and
+    /// record the `pcs_processor_*` series exactly like the wasm host does.
     fn report_metrics(&self, metrics: PluginBatchMetrics) {
         let target = self.host_ctx.target.as_str();
         host_impl::record_metric(target, "plugin.wall_ns", metrics.wall_ns as f64);
@@ -186,28 +210,45 @@ impl NativePluginRuntime {
         host_impl::record_metric(target, "plugin.systems_run", f64::from(metrics.systems_run));
         host_impl::record_metric(target, "plugin.retries", f64::from(metrics.retries));
 
+        crate::metrics::instruments().processor_batch(
+            &self.processor_id,
+            metrics.wall_ns,
+            metrics.rows_in,
+            metrics.rows_out,
+            metrics.systems_run,
+            metrics.retries,
+        );
+
         match self.last_metrics.lock() {
             Ok(mut guard) => *guard = Some(metrics),
             Err(poisoned) => *poisoned.into_inner() = Some(metrics),
         }
     }
-}
 
-#[async_trait(?Send)]
-impl pcs_core::runtime::PipelineRuntime for NativePluginRuntime {
-    fn name(&self) -> &str {
-        &self.manifest.name
-    }
-
-    async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
-        self.run_on_with_state(data, None).await.map(|_| ())
-    }
-
-    async fn run_on_with_state(
+    /// Serialise, call the plugin, and read the result back, carrying the
+    /// batch's routing decision alongside the state blob.
+    async fn run_batch(
         &self,
         data: &mut Dataset,
         prior: Option<&[u8]>,
-    ) -> PcsResult<Option<Vec<u8>>> {
+    ) -> PcsResult<RuntimeOutput> {
+        // The processor's span in the host-side trace. The body has no
+        // `.await`, so a plain guard is correct and the plugin's own
+        // `log`/`metric` callbacks land inside it.
+        #[cfg(feature = "tracing")]
+        let batch_span = tracing::info_span!(
+            "processor.batch",
+            workflow = %self.workflow_id,
+            processor = %self.processor_id,
+            rows_in = data.rows() as u64,
+            rows_out = tracing::field::Empty,
+            systems_run = tracing::field::Empty,
+            retries = tracing::field::Empty,
+            plugin_wall_us = tracing::field::Empty
+        );
+        #[cfg(feature = "tracing")]
+        let _batch_guard = batch_span.enter();
+
         let mut input: Vec<u8> = Vec::new();
         data.write_ipc(&mut input)?;
 
@@ -254,12 +295,14 @@ impl pcs_core::runtime::PipelineRuntime for NativePluginRuntime {
             // other two costs a null check and closes the leak if it did.
             drop(self.plugin.take_buffer(result.output));
             drop(self.plugin.take_buffer(result.checkpoint));
+            drop(self.plugin.take_buffer(result.routes));
             let message = self.plugin.take_buffer(err);
             return Err(run_batch_error(status, &message));
         }
 
         if result.output.is_null() {
             drop(self.plugin.take_buffer(result.checkpoint));
+            drop(self.plugin.take_buffer(result.routes));
             drop(self.plugin.take_buffer(err));
             return Err(PcsError::SystemExecution(format!(
                 "plugin permanent: `{}` returned OK from run_batch without an output buffer",
@@ -276,12 +319,65 @@ impl pcs_core::runtime::PipelineRuntime for NativePluginRuntime {
         } else {
             Some(self.plugin.take_buffer(result.checkpoint))
         };
+        let routes = if result.has_routes == 0 {
+            // Not flagged, so there is no routing decision. A plugin that
+            // allocated a buffer anyway must still not leak it.
+            drop(self.plugin.take_buffer(result.routes));
+            None
+        } else {
+            let buf = self.plugin.take_buffer(result.routes);
+            let list: Vec<String> = serde_json::from_slice(&buf).map_err(|e| {
+                PcsError::system_execution(format!(
+                    "plugin `{}` returned malformed routes JSON: {e}",
+                    self.manifest.name
+                ))
+            })?;
+            Some(list)
+        };
         drop(self.plugin.take_buffer(err));
 
         *data = Dataset::read_ipc(&mut output.as_slice())?;
-        self.report_metrics(result.metrics.into());
+        let metrics: PluginBatchMetrics = result.metrics.into();
+        #[cfg(feature = "tracing")]
+        {
+            batch_span.record("rows_out", metrics.rows_out);
+            batch_span.record("systems_run", metrics.systems_run);
+            batch_span.record("retries", metrics.retries);
+            batch_span.record("plugin_wall_us", metrics.wall_ns / 1_000);
+        }
+        self.report_metrics(metrics);
 
-        Ok(checkpoint)
+        Ok(RuntimeOutput {
+            state: checkpoint,
+            routes,
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl pcs_core::runtime::PipelineRuntime for NativePluginRuntime {
+    fn name(&self) -> &str {
+        &self.manifest.name
+    }
+
+    async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+        self.run_batch(data, None).await.map(|_| ())
+    }
+
+    async fn run_on_with_state(
+        &self,
+        data: &mut Dataset,
+        prior: Option<&[u8]>,
+    ) -> PcsResult<Option<Vec<u8>>> {
+        self.run_batch(data, prior).await.map(|out| out.state)
+    }
+
+    async fn run_on_with_state_and_routes(
+        &self,
+        data: &mut Dataset,
+        prior: Option<&[u8]>,
+    ) -> PcsResult<RuntimeOutput> {
+        self.run_batch(data, prior).await
     }
 
     fn declared_components(&self) -> Vec<&str> {
@@ -289,6 +385,19 @@ impl pcs_core::runtime::PipelineRuntime for NativePluginRuntime {
             .iter()
             .map(|(name, _)| name.as_str())
             .collect()
+    }
+
+    /// Report the validated manifest's self-description.
+    ///
+    /// `open` already parsed and validated the manifest, so every field here is
+    /// what the plugin declared, never a default.
+    fn descriptor_info(&self) -> pcs_core::runtime::RuntimeDescriptorInfo {
+        pcs_core::runtime::RuntimeDescriptorInfo {
+            name: self.manifest.name.clone(),
+            version: self.manifest.version.clone(),
+            stateful: self.manifest.stateful,
+            schema_fingerprint: self.manifest.schema_fingerprint.clone(),
+        }
     }
 
     fn template_dataset(&self) -> Dataset {

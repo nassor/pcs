@@ -14,6 +14,12 @@
 //! failure the runner calls [`PartitionSource::release_claim`] so the next runner retries
 //! it, and a dataset larger than [`MAX_LOG_ENTRY_BYTES`] fails with
 //! [`PcsError::configuration`] rather than being acked with partial state.
+//!
+//! Each claimed batch opens a `workflow.batch` root span holding one
+//! `runtime.run`, so one claim is one trace in the dashboard. `runtime.run` is
+//! the contextual parent of whatever the runtime opens: `pipeline.run` for a
+//! native pipeline, `processor.batch` for a processor component or a native
+//! plugin.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +52,13 @@ pub struct RunnerConfig {
     pub max_batches: Option<usize>,
     /// How frequently to check lease renewal (in milliseconds).
     pub lease_renewal_check_interval_millis: u64,
+    /// The workflow this runner drives, for the `workflow.batch` root span.
+    /// Defaults to an empty string so existing library tests keep compiling.
+    pub workflow_id: String,
+    /// The declared id of the one processor node cluster mode runs, for
+    /// `runtime.run`'s `processor` field. Defaults to an empty string so
+    /// existing library tests keep compiling.
+    pub processor_id: String,
     /// Optional key-based partition mask for multi-instance window accumulation.
     ///
     /// When `Some`, the runner injects a [`KeyPartition`] resource that `WindowedSystem`
@@ -58,11 +71,13 @@ pub struct RunnerConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            instance_id: Uuid::new_v4(),
+            instance_id: Uuid::now_v7(),
             checkpoint_strategy: CheckpointStrategy::EveryStage,
             schema_id: 1,
             max_batches: None,
             lease_renewal_check_interval_millis: 5_000,
+            workflow_id: String::new(),
+            processor_id: String::new(),
             #[cfg(feature = "windows")]
             partition_mask: None,
         }
@@ -137,7 +152,7 @@ where
         let mut next_sweep = std::time::Instant::now() + sweep_interval;
 
         // Claim id under which this runner last persisted the runtime's state blob. See
-        // `guest_state_store` for why the pointer is chained rather than derived from a
+        // `processor_state_store` for why the pointer is chained rather than derived from a
         // stable partition key.
         let mut state_claim_id: Option<Uuid> = None;
 
@@ -179,6 +194,18 @@ where
                 Some(c) => c,
             };
 
+            // One root span per claimed batch, which is one trace in the
+            // dashboard. Children name it as their explicit parent: this body
+            // awaits, and an entered guard held across an await would adopt
+            // every span the runtime opens on this thread meanwhile.
+            #[cfg(feature = "tracing")]
+            let batch_span = tracing::info_span!(
+                "workflow.batch",
+                workflow = %self.config.workflow_id,
+                claim = %claim.claim_id,
+                rows = tracing::field::Empty
+            );
+
             let mut partition_data = world_factory();
 
             #[cfg(all(feature = "windows", feature = "distributed"))]
@@ -216,6 +243,7 @@ where
                     Err(_e) => {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
+                            parent: &batch_span,
                             claim_id = %claim.claim_id,
                             error = %_e,
                             "accumulator load failed; releasing claim for retry"
@@ -231,7 +259,7 @@ where
             let prior_state = match state_claim_id {
                 None => None,
                 Some(prior_id) => {
-                    match crate::distributed::guest_state_store::load_guest_state(
+                    match crate::distributed::processor_state_store::load_processor_state(
                         &self.store,
                         prior_id,
                     )
@@ -241,9 +269,10 @@ where
                         Err(_e) => {
                             #[cfg(feature = "tracing")]
                             tracing::error!(
+                                parent: &batch_span,
                                 claim_id = %claim.claim_id,
                                 error = %_e,
-                                "guest state load failed; releasing claim for retry"
+                                "processor state load failed; releasing claim for retry"
                             );
                             Self::release_with_log(&self.store, &claim).await;
                             continue;
@@ -282,6 +311,7 @@ where
                     if let Err(e) = store_ref.renew_claim(claim_id, claim_instance_id).await {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
+                            parent: &batch_span,
                             %claim_id,
                             error = %e,
                             "mid-execution lease renewal failed; cancelling run_on"
@@ -293,21 +323,53 @@ where
                 }
             };
 
+            crate::metrics::instruments().source_batch(&self.config.processor_id);
+            crate::metrics::instruments()
+                .rows(&self.config.processor_id, partition_data.rows() as u64);
+
+            #[cfg(feature = "tracing")]
+            batch_span.record("rows", partition_data.rows() as u64);
+
             enum RunOutcome {
                 Ran(PcsResult<Option<Vec<u8>>>),
                 RenewalFailed,
             }
             let runtime = &*self.runtime;
+            // The contextual parent of whatever the runtime opens: `pipeline.run`
+            // for a native pipeline, `processor.batch` for a processor component
+            // or a native plugin.
+            #[cfg(feature = "tracing")]
+            let run_span = tracing::info_span!(
+                parent: &batch_span,
+                "runtime.run",
+                workflow = %self.config.workflow_id,
+                processor = %self.config.processor_id,
+                runtime = runtime.name(),
+                rows_in = partition_data.rows() as u64,
+                rows_out = tracing::field::Empty
+            );
+            let run = runtime.run_on_with_state(&mut partition_data, prior_state.as_deref());
+            #[cfg(feature = "tracing")]
+            let run = tracing::Instrument::instrument(run, run_span.clone());
             let outcome = tokio::select! {
                 biased;
-                result = runtime.run_on_with_state(&mut partition_data, prior_state.as_deref())
-                    => RunOutcome::Ran(result),
+                result = run => RunOutcome::Ran(result),
                 () = renewal_branch => RunOutcome::RenewalFailed,
             };
+
+            #[cfg(feature = "tracing")]
+            run_span.record("rows_out", partition_data.rows() as u64);
+
+            // A span closes when its last handle drops, so `runtime.run` has to
+            // go before the checkpoint and state writes or it would time those
+            // too.
+            #[cfg(feature = "tracing")]
+            drop(run_span);
 
             let run_result: PcsResult<Option<Vec<u8>>> = match outcome {
                 RunOutcome::Ran(r) => r,
                 RunOutcome::RenewalFailed => {
+                    crate::metrics::instruments().workflow_error(&self.config.workflow_id);
                     Self::release_with_log(&self.store, &claim).await;
                     continue;
                 }
@@ -327,6 +389,7 @@ where
             {
                 #[cfg(feature = "tracing")]
                 tracing::error!(
+                    parent: &batch_span,
                     claim_id = %claim.claim_id,
                     error = %e,
                     "checkpoint save failed; releasing claim for retry"
@@ -342,6 +405,7 @@ where
                 if let Err(e) = save_accumulator_state(&self.store, &claim, &partition_data).await {
                     #[cfg(feature = "tracing")]
                     tracing::error!(
+                        parent: &batch_span,
                         claim_id = %claim.claim_id,
                         error = %e,
                         "accumulator save failed; releasing claim for retry"
@@ -356,7 +420,7 @@ where
                 && !claim_released
                 && let Some(blob) = next_state.as_deref()
             {
-                match crate::distributed::guest_state_store::save_guest_state(
+                match crate::distributed::processor_state_store::save_processor_state(
                     &self.store,
                     claim.claim_id,
                     blob,
@@ -370,9 +434,10 @@ where
                     Err(e) => {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
+                            parent: &batch_span,
                             claim_id = %claim.claim_id,
                             error = %e,
-                            "guest state save failed; releasing claim for retry"
+                            "processor state save failed; releasing claim for retry"
                         );
                         Self::release_with_log(&self.store, &claim).await;
                         claim_released = true;
@@ -385,15 +450,18 @@ where
                 (Some(e), true) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
+                        parent: &batch_span,
                         claim_id = %claim.claim_id,
                         error = %e,
                         "skipping ack: claim was released on a post-run persist failure"
                     );
+                    crate::metrics::instruments().workflow_error(&self.config.workflow_id);
                     let _ = e;
                     continue;
                 }
                 (Some(e), false) => {
                     Self::release_with_log(&self.store, &claim).await;
+                    crate::metrics::instruments().workflow_error(&self.config.workflow_id);
                     return Err(e);
                 }
                 (None, _) => {
@@ -401,6 +469,7 @@ where
                         .ack_claim(claim.claim_id, claim.instance_id)
                         .await?;
                     processed += 1;
+                    crate::metrics::instruments().workflow_run(&self.config.workflow_id);
                 }
             }
         }
@@ -475,7 +544,7 @@ mod tests {
 
     fn temp_path() -> PathBuf {
         let dir = std::env::temp_dir();
-        dir.join(format!("pcs_runner_test_{}.db", Uuid::new_v4()))
+        dir.join(format!("pcs_runner_test_{}.db", Uuid::now_v7()))
     }
 
     fn empty_data() -> Dataset {

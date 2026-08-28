@@ -1,0 +1,19 @@
+[package]
+name = "pcs-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "The PCS configuration language: KDL text into a self-describing value tree every connector, transformer and the host deserialize from."
+
+[dependencies]
+# `PcsError`/`PcsResult` only, so the base error variants are all this crate
+# needs and the async runtime stays out of the graph.
+pcs-core   = { path = "../pcs-core", version = "0.1.0", default-features = false }
+
+kdl        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }

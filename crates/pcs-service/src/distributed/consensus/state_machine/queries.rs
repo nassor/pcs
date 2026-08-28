@@ -91,7 +91,7 @@ pub fn read_checkpoint(
 /// The scan stops at the first match. Every data checkpoint on a node shares one
 /// fingerprint, because a fingerprint change means a redeployed pipeline.
 pub fn find_data_checkpoint_schema_id(db: &Database) -> PcsResult<Option<u32>> {
-    use crate::distributed::checkpoint::GUEST_STATE_STAGE_SENTINEL;
+    use crate::distributed::checkpoint::PROCESSOR_STATE_STAGE_SENTINEL;
 
     let txn = db
         .begin_read()
@@ -107,7 +107,7 @@ pub fn find_data_checkpoint_schema_id(db: &Database) -> PcsResult<Option<u32>> {
     for item in iter {
         let (_k, v) = item.map_err(|e| PcsError::generic(format!("checkpoint item: {e}")))?;
         let record: CheckpointRecord = dec(v.value())?;
-        if record.stage_idx < GUEST_STATE_STAGE_SENTINEL {
+        if record.stage_idx < PROCESSOR_STATE_STAGE_SENTINEL {
             return Ok(Some(record.schema_id));
         }
     }
@@ -267,8 +267,8 @@ mod tests {
         )
         .unwrap();
 
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -303,7 +303,7 @@ mod tests {
         );
 
         // A fresh claim on the same range must be rejected as overlapping.
-        let c2 = uuid::Uuid::new_v4();
+        let c2 = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -334,7 +334,7 @@ mod tests {
     fn test_pending_batches_index_skips_completed() {
         const N: u64 = 10;
         let (db, _path) = temp_db();
-        let inst = uuid::Uuid::new_v4();
+        let inst = uuid::Uuid::now_v7();
         let mut claim_ids = Vec::new();
 
         // Register N batches and claim+ack N-1.
@@ -352,7 +352,7 @@ mod tests {
             )
             .unwrap();
 
-            let claim_id = uuid::Uuid::new_v4();
+            let claim_id = uuid::Uuid::now_v7();
             claim_ids.push((batch_id, claim_id));
             apply(
                 &db,

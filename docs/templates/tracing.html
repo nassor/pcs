@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Tracing &amp; metrics — PCS{% endblock %}
-{% block description %}PCS emits structured tracing events behind the tracing feature flag, and pcs-service exposes a Prometheus /metrics endpoint. What exists today, what the TOML keys are, and what is still uninstrumented.{% endblock %}
+{% block description %}PCS emits a three-level span tree behind the tracing feature flag, and pcs-service exposes a Prometheus /metrics endpoint carrying nineteen series. The spans, the config keys, OTLP span export, and what is still missing.{% endblock %}
 {% block og_title %}Tracing &amp; metrics — PCS{% endblock %}
 {% block og_description %}One feature flag decides whether anything is emitted at all. Exactly what comes out, and what does not.{% endblock %}
 
@@ -17,33 +17,36 @@
 
 <dl class="page-facts">
     <dt>In one line</dt>
-    <dd>Events, a <code>fmt</code> subscriber, and a <strong>Prometheus endpoint that carries one series</strong></dd>
+    <dd>A nested span tree, a <code>fmt</code> subscriber, optional OTLP span export, and a <strong>Prometheus endpoint carrying nineteen series</strong></dd>
     <dt>You need</dt>
     <dd>The <code>tracing</code> feature on <code>pcs-core</code> or <code>pcs-service</code>; the <code>service</code> feature turns it on for you</dd>
     <dt>Read this if</dt>
-    <dd>You are wiring a subscriber, picking a <code>RUST_LOG</code> filter, or scraping <code>/metrics</code> and wondering why it is nearly empty</dd>
+    <dd>You are wiring a subscriber, picking a <code>RUST_LOG</code> filter, pointing spans at a collector, or scraping <code>/metrics</code></dd>
 </dl>
 
 <h2 id="where">Where instrumentation comes from</h2>
 
 <p>
-    Two things leave a running PCS process, and they are wired independently.
-    <code>tracing</code> events go to whatever subscriber you installed. Prometheus
-    metrics go to the <code>/metrics</code> route on the service's HTTP control plane.
-    Neither one feeds the other.
+    Two things leave a running PCS process. <code>tracing</code> events and spans go to
+    whatever subscriber you installed, and on to an OTLP collector when one is configured.
+    Prometheus metrics go to the <code>/metrics</code> route on the service's HTTP control
+    plane. One value crosses between them: <code>pcs_stage_duration_seconds</code> is
+    measured from the lifetime of the <code>pipeline.stage</code> span.
 </p>
 
 <div class="dgm animate-in">
     <div class="dgm-scroll"><svg viewBox="0 0 660 466" role="img" aria-labelledby="trc-title trc-desc">
         <title id="trc-title">Where PCS instrumentation is produced and where it leaves</title>
         <desc id="trc-desc">
-            Emission sites live in pcs-core and pcs-service, plus a WebAssembly guest that
-            logs across the component boundary through host-io. Every site sits behind the
-            compile-time cfg(feature = "tracing") gate, and the events that pass it reach
-            one tracing subscriber. Separately, the watchdog task records a single gauge
-            that the GET /metrics route encodes in Prometheus text format. The two exits
-            are not connected to each other, and the data plane itself carries no
-            instrumentation.
+            Emission sites live in pcs-core and pcs-service, plus a WebAssembly processor
+            that logs and reports metrics across the component boundary through host-io.
+            Every site sits behind the compile-time cfg(feature = "tracing") gate, and what
+            passes it reaches one tracing subscriber, which forwards spans to an OTLP
+            collector when one is configured. Separately, the watchdog and the runners
+            record nineteen series that the GET /metrics route encodes in Prometheus text
+            format. One value crosses between the two exits: a layer on the subscriber
+            times each pipeline.stage span and records it as a stage duration sample. The
+            data plane carries no per-row instrumentation.
         </desc>
 
         <text class="t-title" x="0" y="14">Instrumentation</text>
@@ -53,7 +56,7 @@
         <g class="anim anim-1">
             <rect class="blk blk-data" x="0" y="44" width="654" height="30" rx="8"/>
             <text class="t-lbl t-data" x="12" y="63">batch &rarr; run_on &rarr; checkpoint</text>
-            <text class="t-sm t-end" x="642" y="63">no spans on this path, no per-row events</text>
+            <text class="t-sm t-end" x="642" y="63">spans per run and per stage, no per-row events</text>
         </g>
 
         <!-- emission sites -->
@@ -90,14 +93,14 @@
             <text class="t-sm" x="16" y="321">service::http, shutdown</text>
         </g>
 
-        <!-- the guest logs across the component boundary -->
+        <!-- the processor logs across the component boundary -->
         <g class="anim anim-3">
             <rect class="blk blk-bnd" x="0" y="352" width="186" height="64" rx="8"/>
             <rect class="hd hd-bnd" x="0" y="352" width="186" height="20" rx="8"/>
             <rect class="hd hd-bnd" x="0" y="364" width="186" height="8"/>
-            <text class="t-lbl t-bnd" x="12" y="366">guest .wasm</text>
+            <text class="t-lbl t-bnd" x="12" y="366">processor .wasm</text>
             <text class="t-sm" x="12" y="388">host-io::log</text>
-            <text class="t-sm" x="12" y="404">host-io::metric &rarr; trace</text>
+            <text class="t-sm" x="12" y="404">host-io::metric &rarr; series</text>
 
             <path class="arw arw-bnd" d="M93 350 V336" marker-end="url(#trc-b)"/>
             <text class="t-sm t-bnd" x="102" y="346">bridged host-side</text>
@@ -141,7 +144,7 @@
             <text class="t-sm" x="422" y="199">EnvFilter: RUST_LOG / log_level</text>
             <rect class="row" x="414" y="208" width="232" height="18" rx="3"/>
             <text class="t-sm" x="422" y="221">fmt layer: pretty | json</text>
-            <text class="t-sm" x="418" y="243">&rarr; stdout</text>
+            <text class="t-sm" x="418" y="243">&rarr; stdout, OTLP spans</text>
 
             <path class="arw arw-ctl" d="M372 208 H398" marker-end="url(#trc-c)"/>
         </g>
@@ -149,7 +152,7 @@
         <!-- exit two: the scrape endpoint -->
         <g class="anim anim-4">
             <path class="ln" d="M406 272 H654"/>
-            <text class="t-sm" x="406" y="268">nothing crosses between these two</text>
+            <text class="t-sm" x="406" y="268">one value crosses: the stage histogram</text>
 
             <rect class="blk blk-ctl" x="406" y="284" width="248" height="100" rx="8"/>
             <rect class="hd hd-ctl" x="406" y="284" width="248" height="22" rx="8"/>
@@ -157,9 +160,9 @@
             <text class="t-lbl t-ctl" x="418" y="299">GET /metrics</text>
 
             <rect class="row" x="414" y="312" width="232" height="18" rx="3"/>
-            <text class="t-sm t-ctl" x="422" y="325">pcs_liveness_counter</text>
-            <rect class="row-x" x="414" y="334" width="232" height="18" rx="3"/>
-            <text class="t-sm" x="422" y="347">11 descriptors, no writer</text>
+            <text class="t-sm t-ctl" x="422" y="325">12 service series</text>
+            <rect class="row" x="414" y="334" width="232" height="18" rx="3"/>
+            <text class="t-sm t-ctl" x="422" y="347">6 pcs_processor_* series</text>
             <text class="t-sm" x="418" y="369">text/plain; version=0.0.4</text>
 
             <path class="arw arw-ctl" d="M372 314 H398" marker-end="url(#trc-c)"/>
@@ -167,7 +170,7 @@
 
         <g class="anim anim-4">
             <path class="ln" d="M0 436 H654"/>
-            <text class="t-sm" x="0" y="456">Turn the feature off and the left column vanishes at compile time. <tspan class="t-ctl">/metrics</tspan> still answers, with one series.</text>
+            <text class="t-sm" x="0" y="456">Turn the feature off and the left column vanishes at compile time. <tspan class="t-ctl">/metrics</tspan> keeps every series except the stage histogram.</text>
         </g>
 
         <defs>
@@ -183,12 +186,13 @@
     <div class="dgm-key">
         <span class="k-data"><i></i> the work being observed</span>
         <span class="k-control"><i></i> emission and export</span>
-        <span class="k-boundary"><i></i> the guest, logging across the seam</span>
+        <span class="k-boundary"><i></i> the processor, logging across the seam</span>
     </div>
     <figcaption class="dgm-cap">
-        The two exits are not connected. Nothing in the log stream reaches
-        <code>/metrics</code>, and the single series <code>/metrics</code> carries is
-        written by the <b>watchdog</b>, not by anything in your pipeline.
+        The log stream and <code>/metrics</code> are separate exits with one link: a
+        subscriber layer times each <code>pipeline.stage</code> span and records
+        <code>pcs_stage_duration_seconds</code>. Every other series is written directly by
+        a runner, the watchdog or the processor host.
     </figcaption>
 </div>
 
@@ -209,7 +213,7 @@ tracing = ["dep:tracing"]
 
 # crates/pcs-service/Cargo.toml
 tracing = ["dep:tracing", "pcs-core/tracing"]
-service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></pre>
+service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:pcs-config", ...]</code></pre>
 </div>
 
 <div class="note">
@@ -226,40 +230,50 @@ service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></
 <p>
     Two sites keep a fallback for the feature-off build, because losing them silently
     would be worse than the dependency. <code>HostIo::log</code> falls back to
-    <code>eprintln!</code> so guest log lines are never dropped, and
+    <code>eprintln!</code> so processor log lines are never dropped, and
     <code>DistributedRunner</code>'s claim-release path prints to stderr so a failed
     release is always visible.
 </p>
 
 <p>
-    Inside a <code>.wasm</code> guest the feature is never available:
-    <code>pcs-guest</code> pins its dependency as
-    <code>pcs-core = { default-features = false, features = ["guest"] }</code>. A guest
+    Inside a <code>.wasm</code> processor the feature is never available:
+    <code>pcs-processor</code> pins its dependency as
+    <code>pcs-core = { default-features = false, features = ["processor"] }</code>. A processor
     reports through the <code>host-io</code> imports instead: <code>log</code> and
     <code>metric</code>, which the host bridges into its own subscriber.
 </p>
 
 <p>
-    <b>A guest's <code>println!</code> goes nowhere.</b> The host builds each guest's WASI
+    <b>A processor's <code>println!</code> goes nowhere.</b> The host builds each processor's WASI
     context with <code>WasiCtxBuilder::new().build()</code> and never calls
     <code>inherit_stderr()</code>. That builder's documented default discards everything
     written to stdout and stderr, so <code>println!</code> and <code>eprintln!</code>
-    inside a guest vanish. <code>host-io::log</code> is the only channel out.
+    inside a processor vanish. <code>host-io::log</code> is the only channel out.
 </p>
 
-<h2 id="events">The events, module by module</h2>
+<h2 id="events">The spans and events, module by module</h2>
 
 <p>
-    One span, plus flat events spread across eleven modules. The span is
-    <code>task_attempt</code>, opened once per attempt by the shared retry driver in
-    <code>pcs-core</code>; every attempt of every system in a pipeline stage runs inside
-    one. Field names below are the exact keys the macros record, so they are what you
-    match on in a JSON log pipeline.
+    Nine span names, plus flat events across fourteen targets.
+    <code>pipeline.run</code>, <code>pipeline.stage</code> and
+    <code>system.execute</code> come from <code>pcs-core</code>'s execution path, and
+    <code>task_attempt</code> comes from the retry driver inside them. The host adds
+    five: <code>workflow.batch</code> around one iteration, <code>source.drain</code>,
+    <code>runtime.run</code>, <code>sink.write</code>, and <code>processor.batch</code>
+    around one out-of-process processor call. Every host span carries
+    <code>workflow</code>, the declared workflow id, and each node's span carries that
+    node's declared id. Field names below are the exact keys the
+    macros record, so they are what you match on in a JSON log pipeline.
 </p>
 
 <table class="rule-table">
     <thead><tr><th>Target</th><th>Levels</th><th>What it reports, and with which fields</th></tr></thead>
     <tbody>
+        <tr>
+            <td><code>pcs_core::pipeline::execution</code></td>
+            <td>info spans</td>
+            <td>Three nested spans per run: <code>pipeline.run</code> with <code>pipeline</code>, <code>stages</code> and <code>rows</code>; <code>pipeline.stage</code> with <code>stage</code> (0-based) and <code>systems</code>; and <code>system.execute</code> with <code>system</code>, the name from <code>SystemMeta</code>. The parallel-stage fan-out re-enters the stage span inside each <code>spawn_blocking</code> closure, so a sliced system's attempts stay under the right parent.</td>
+        </tr>
         <tr>
             <td><code>pcs_core::retry</code></td>
             <td>info span, warn, error</td>
@@ -272,13 +286,18 @@ service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></
         </tr>
         <tr>
             <td><code>pcs_service::service::standalone</code></td>
-            <td>info, warn, error</td>
-            <td>Iteration lifecycle and per-source / per-sink failures: <code>iteration</code>, <code>mode</code>, <code>rows_processed</code>, <code>duration_ms</code>, <code>iteration_errors</code>, <code>source_name</code>, <code>sink_name</code>, <code>error</code>. The busiest module, 15 sites.</td>
+            <td>info spans, info, warn, error</td>
+            <td>One <code>workflow.batch</code> span per iteration with <code>workflow</code>, <code>iteration</code> and <code>rows</code>, one <code>source.drain</code> per source with <code>workflow</code>, <code>source</code>, <code>component</code> and <code>rows</code>, one <code>runtime.run</code> per processor with <code>workflow</code>, <code>processor</code>, <code>rows_in</code> and <code>rows_out</code>, and one <code>sink.write</code> per sink with <code>workflow</code>, <code>sink</code>, <code>component</code> and <code>rows</code>, in topological order. Every iteration event names the batch span as its parent, so the whole iteration is one trace. The busiest module, 15 event sites.</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::service::stream</code></td>
+            <td>info spans, info, warn, error</td>
+            <td>The same span set per arriving item, minus <code>source.drain</code>: the wait for input precedes the item and would otherwise dominate its latency. Events carry <code>source_name</code>, <code>sink_name</code>, <code>component</code>, <code>error</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::distributed::runner</code></td>
-            <td>info, warn, error</td>
-            <td>Expired-lease sweeps and every release-instead-of-ack path: <code>reclaimed_count</code>, <code>claim_id</code>, <code>error</code>.</td>
+            <td>info spans, info, warn, error</td>
+            <td>One <code>workflow.batch</code> span per claimed batch with <code>workflow</code>, <code>claim</code> and <code>rows</code>, holding one <code>runtime.run</code>. Expired-lease sweeps and every release-instead-of-ack path: <code>reclaimed_count</code>, <code>claim_id</code>, <code>error</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::distributed::consensus::transport::server</code></td>
@@ -288,17 +307,22 @@ service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></
         <tr>
             <td><code>pcs_service::distributed::parquet_checkpoint</code></td>
             <td>debug</td>
-            <td>A parent-directory <code>fsync</code> that failed after a checkpoint write: <code>error</code>. Needs the <code>io</code> feature.</td>
+            <td>A parent-directory <code>fsync</code> that failed after a checkpoint write: <code>error</code>. Needs the <code>parquet-checkpoint</code> feature.</td>
         </tr>
         <tr>
             <td><code>pcs_service::wasm::host_impl</code></td>
             <td>trace&ndash;error</td>
-            <td>The guest's own <code>host-io::log</code> lines, re-emitted at the level the guest asked for and tagged <code>pipeline</code> and <code>target</code>. A guest <code>host-io::metric</code> call arrives here as a <code>trace</code> event with <code>metric</code> and <code>value</code>.</td>
+            <td>The processor's own <code>host-io::log</code> lines, re-emitted at the level the processor asked for and tagged <code>pipeline</code> and <code>target</code>. They land inside that batch's <code>processor.batch</code> span, because the runtime re-enters it on the blocking thread the guest call runs on. A <code>host-io::metric</code> call records the <code>pcs_processor_metric</code> histogram, labelled with the metric name, and also emits a <code>trace</code> event with <code>metric</code> and <code>value</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::wasm::runner</code></td>
-            <td>warn</td>
-            <td>Building the template dataset: <code>describe()</code> failed, or one component's schema would not parse (<code>component</code>, <code>error</code>).</td>
+            <td>info span, warn</td>
+            <td>One <code>processor.batch</code> span per <code>run-batch</code> call, covering the IPC encode, the guest call and the IPC decode: <code>workflow</code>, <code>processor</code>, <code>rows_in</code>, <code>rows_out</code>, <code>systems_run</code>, <code>retries</code>, <code>guest_wall_us</code>, the last four read back off the WIT <code>run-metrics</code> record. The <code>warn</code> covers building the template dataset: <code>describe()</code> failed, or one component's schema would not parse (<code>component</code>, <code>error</code>).</td>
+        </tr>
+        <tr>
+            <td><code>pcs_service::plugin::runtime</code></td>
+            <td>info span, debug</td>
+            <td>The same <code>processor.batch</code> span for a native plugin, with <code>plugin_wall_us</code> in place of <code>guest_wall_us</code>. The <code>debug</code> reports a loaded plugin's <code>plugin</code>, <code>version</code>, <code>stateful</code> and <code>components</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::service::http</code>, <code>::shutdown</code></td>
@@ -318,16 +342,108 @@ service = ["io", "distributed", "tracing", "dep:toml", "dep:axum", ...]</code></
     </tbody>
 </table>
 
-<div class="note note-warn">
-    <span class="note-label">One span, not a trace tree</span>
-    <p>
-        <code>task_attempt</code> is the only span PCS opens. There is no
-        <code>pipeline.run</code>, no <code>pipeline.stage</code>, no
-        <code>system.execute</code>. <code>pipeline/execution.rs</code> carries no
-        instrumentation of its own, so stage boundaries and per-system timings are not
-        visible. Anything needing a parent-child trace tree, such as OpenTelemetry span
-        export or span-based sampling, has almost nothing to hang information on.
-    </p>
+<p>
+    Spans nest, so a JSON log line carries its whole ancestry and a collector can
+    reconstruct one trace per iteration. The host draws the outer three levels.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 172" role="img" aria-labelledby="bat-t bat-d">
+        <title id="bat-t">The host spans one iteration opens</title>
+        <desc id="bat-d">
+            workflow.batch wraps one iteration and carries the workflow id, the iteration
+            number and the row count. Inside it, one source.drain span per source carries
+            the source node id, the component it writes and the rows drained; one
+            runtime.run span per processor carries the processor node id and the rows in
+            and out; and one sink.write span per sink carries the sink node id, the
+            component it reads and the rows written. Inside runtime.run sits whatever the
+            runtime opens: pipeline.run and its stage and system spans for a native
+            pipeline, or one processor.batch for a WASM processor or a native plugin.
+        </desc>
+
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="0" y="8" width="654" height="156" rx="8"/>
+            <text class="t-lbl t-ctl" x="12" y="28">workflow.batch</text>
+            <text class="t-sm t-end" x="642" y="28">workflow, iteration, rows</text>
+        </g>
+
+        <g class="anim anim-2">
+            <rect class="row row-r" x="20" y="40" width="614" height="22" rx="3"/>
+            <text class="t-sm" x="30" y="55">source.drain</text>
+            <text class="t-sm t-end" x="624" y="55">source, component, rows</text>
+        </g>
+
+        <g class="anim anim-3">
+            <rect class="blk blk-ctl" x="20" y="70" width="614" height="60" rx="8"/>
+            <text class="t-lbl t-ctl" x="32" y="90">runtime.run</text>
+            <text class="t-sm t-end" x="622" y="90">processor, rows_in, rows_out</text>
+            <rect class="blk blk-bnd" x="40" y="98" width="574" height="24" rx="4"/>
+            <text class="t-sm t-bnd" x="52" y="114">processor.batch</text>
+            <text class="t-sm t-end" x="602" y="114">processor, rows_in, rows_out, retries</text>
+        </g>
+
+        <g class="anim anim-4">
+            <rect class="row row-w" x="20" y="138" width="614" height="22" rx="3"/>
+            <text class="t-sm" x="30" y="153">sink.write</text>
+            <text class="t-sm t-end" x="624" y="153">sink, component, rows</text>
+        </g>
+    </svg>
+    </div>
+    <figcaption class="dgm-cap">
+        One source and one sink around one WASM processor opens five spans per
+        iteration. A native runtime puts <code>pipeline.run</code> where
+        <code>processor.batch</code> sits, and two linked processors open one
+        <code>runtime.run</code> and one <code>processor.batch</code> each.
+    </figcaption>
+</div>
+
+<p>
+    A native pipeline's <code>pipeline.run</code> nests three levels further. A processor
+    opens the same three inside the guest, where the host cannot see them, so a WASM
+    processor is one span rather than a subtree.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 150" role="img" aria-labelledby="spn-t spn-d">
+        <title id="spn-t">The four nested spans a pipeline run opens</title>
+        <desc id="spn-d">
+            pipeline.run wraps the whole call and carries the pipeline name, the stage
+            count and the row count. Inside it, one pipeline.stage span per stage carries
+            the stage index and how many systems it holds. Inside that, one system.execute
+            span per system carries the system name. Innermost, the retry driver opens one
+            task_attempt span per attempt, carrying the attempt number and the maximum.
+        </desc>
+
+        <g class="anim anim-1">
+            <rect class="blk blk-ctl" x="0" y="8" width="654" height="134" rx="8"/>
+            <text class="t-lbl t-ctl" x="12" y="28">pipeline.run</text>
+            <text class="t-sm t-end" x="642" y="28">pipeline, stages, rows</text>
+        </g>
+
+        <g class="anim anim-2">
+            <rect class="blk blk-ctl" x="20" y="40" width="614" height="98" rx="8"/>
+            <text class="t-lbl t-ctl" x="32" y="60">pipeline.stage</text>
+            <text class="t-sm t-end" x="622" y="60">stage, systems</text>
+        </g>
+
+        <g class="anim anim-3">
+            <rect class="blk blk-ctl" x="40" y="72" width="574" height="62" rx="8"/>
+            <text class="t-lbl t-ctl" x="52" y="92">system.execute</text>
+            <text class="t-sm t-end" x="602" y="92">system</text>
+        </g>
+
+        <g class="anim anim-4">
+            <rect class="row" x="60" y="104" width="534" height="22" rx="3"/>
+            <text class="t-sm" x="70" y="119">task_attempt</text>
+            <text class="t-sm t-end" x="584" y="119">attempt, max_attempts</text>
+        </g>
+    </svg>
+    </div>
+    <figcaption class="dgm-cap">
+        Three stages of two systems each, all succeeding first try, opens one
+        <code>pipeline.run</code>, three <code>pipeline.stage</code>, six
+        <code>system.execute</code> and six <code>task_attempt</code> spans.
+    </figcaption>
 </div>
 
 <h2 id="subscriber">Installing a subscriber</h2>
@@ -356,15 +472,18 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // build and run your pipeline; task_attempt spans and any
-    // window / runner events now reach stdout
+    // build and run your pipeline; the pipeline.run span tree and any
+    // window or runner events now reach stdout
 }</code></pre>
 </div>
 
 <p>
     The service binary does this for you. <code>pcs-service serve</code> calls
     <code>init_logging</code> as step 3, before anything else can emit, and treats a
-    second call as an error because the global subscriber is already installed.
+    second call as an error because the global subscriber is already installed. It stacks
+    four layers: the <code>EnvFilter</code>, the <code>fmt</code> layer,
+    <code>SpanMetricsLayer</code> for the stage histogram, and an OTLP layer when
+    <code>otlp_endpoint</code> is set.
 </p>
 
 <div class="code">
@@ -372,23 +491,32 @@ async fn main() {
     <pre><code class="language-rust">use pcs_service::service::config::ObservabilityConfig;
 use pcs_service::service::logging::init_logging;
 
-let cfg = ObservabilityConfig::default();  // Pretty format, "info" level
-init_logging(&amp;cfg)?;</code></pre>
+let cfg = ObservabilityConfig::default();  // Pretty, "info", no span export
+let telemetry = init_logging(&amp;cfg, node_id)?;
+
+// ... run the service ...
+
+// Flush exported spans. Dropping the guard is not enough, because
+// set_tracer_provider keeps a clone in a process-lifetime static.
+telemetry.shutdown().await;</code></pre>
 </div>
 
-<h2 id="config">Level and format from TOML</h2>
+<h2 id="config">Level, format and span export from the config file</h2>
 
 <p>
-    The <code>[observability]</code> table has exactly two keys. There is no exporter
-    configuration, no sampling ratio, and no per-module table. Module filtering is the
-    filter string's job.
+    The <code>observability</code> node has four keys: two for the log stream and two
+    for span export. There is no per-module table, because module filtering is the filter
+    string's job.
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>TOML</span><em>from examples/configs/standalone.toml</em></div>
-    <pre><code class="language-toml">[observability]
-log_format = "pretty"   # use "json" in production log aggregators
-log_level = "info"</code></pre>
+    <div class="code-cap"><span>KDL</span><em>span export is off unless otlp_endpoint is set</em></div>
+    <pre><code class="language-kdl">observability {
+    log_format "pretty"   // use "json" in production log aggregators
+    log_level "info"
+    otlp_endpoint "http://collector:4318"
+    trace_sample_ratio 0.1
+}</code></pre>
 </div>
 
 <table class="rule-table">
@@ -403,6 +531,16 @@ log_level = "info"</code></pre>
             <td><code>log_level</code></td>
             <td>Any <code>EnvFilter</code> directive string, so <code>"debug"</code> and <code>"warn,pcs_service::service::standalone=debug"</code> are both valid here.</td>
             <td><code>"info"</code></td>
+        </tr>
+        <tr>
+            <td><code>otlp_endpoint</code></td>
+            <td>Collector base URL for OTLP over HTTP. The exporter appends <code>/v1/traces</code>, so give it the collector root. Omit the key and no span exporter is built.</td>
+            <td>none</td>
+        </tr>
+        <tr>
+            <td><code>trace_sample_ratio</code></td>
+            <td>Parent-based trace-id-ratio sampling, <code>0.0</code> to <code>1.0</code>. A value outside that range fails startup with a configuration error.</td>
+            <td><code>1.0</code></td>
         </tr>
     </tbody>
 </table>
@@ -424,22 +562,25 @@ log_level = "info"</code></pre>
 <div class="code">
     <div class="code-cap"><span>Bash</span><em>three orders of precedence, and real module paths</em></div>
     <pre><code class="language-bash"># CLI flag beats the config file
-pcs-service serve --config standalone.toml --log-format json --log-level debug
+pcs-service serve --config standalone.kdl --log-format json --log-level debug
 
 # ... and so do PCS_LOG_FORMAT / PCS_LOG_LEVEL
-PCS_LOG_LEVEL=debug pcs-service serve --config standalone.toml
+PCS_LOG_LEVEL=debug pcs-service serve --config standalone.kdl
+
+# Span export can be turned on without touching the config file
+pcs-service serve --config standalone.kdl --otlp-endpoint http://127.0.0.1:4318
 
 # RUST_LOG beats all of them: only the standalone runner, everything else quiet
 RUST_LOG="warn,pcs_service::service::standalone=info" \
-  pcs-service serve --config standalone.toml
+  pcs-service serve --config standalone.kdl
 
 # The Raft accept loop, including per-connection debug events
 RUST_LOG="warn,pcs_service::distributed::consensus::transport=debug" \
-  pcs-service serve --config cluster.toml
+  pcs-service serve --config cluster.kdl
 
-# Guest log lines and guest metric calls, nothing else
+# Processor log lines and processor metric calls, nothing else
 RUST_LOG="off,pcs_service::wasm::host_impl=trace" \
-  pcs-service serve --config standalone_wasm.toml</code></pre>
+  pcs-service serve --config standalone_wasm.kdl</code></pre>
 </div>
 
 <h2 id="metrics">The Prometheus endpoint</h2>
@@ -448,15 +589,23 @@ RUST_LOG="off,pcs_service::wasm::host_impl=trace" \
     The service binary builds a <code>prometheus::Registry</code>, hands it to
     <code>opentelemetry_prometheus::exporter()</code>, wraps that in an
     <code>SdkMeterProvider</code>, installs it as the global OpenTelemetry meter provider,
-    and then describes the standard instruments. The <code>/metrics</code> handler gathers
-    that same registry and encodes it with <code>prometheus::TextEncoder</code>, returning
-    <code>text/plain; version=0.0.4</code>.
+    and then calls <code>pcs_service::metrics::init()</code> to build every instrument.
+    The <code>/metrics</code> handler gathers that same registry and encodes it with
+    <code>prometheus::TextEncoder</code>, returning <code>text/plain; version=0.0.4</code>.
+</p>
+
+<p>
+    The exporter is built with <code>without_counter_suffixes()</code>, because the
+    instrument names already end in <code>_total</code>.
 </p>
 
 <div class="code">
     <div class="code-cap"><span>Bash</span><em>default bind is 0.0.0.0:8080</em></div>
-    <pre><code class="language-bash">curl -s localhost:8080/metrics
-# the only series present is pcs_liveness_counter
+    <pre><code class="language-bash">curl -s localhost:8080/metrics | grep '^pcs_'
+# pcs_liveness_counter{otel_scope_name="pcs"} 6
+# pcs_workflow_runs_total{otel_scope_name="pcs"} 50
+# pcs_ready{otel_scope_name="pcs"} 1
+# pcs_uptime_seconds{otel_scope_name="pcs"} 5.0141387
 
 curl -s localhost:8080/status | jq .standalone
 # {
@@ -471,75 +620,115 @@ curl -s localhost:8080/status | jq .standalone
 <p>
     <code>/metrics</code> shares the router with <code>/health</code>,
     <code>/ready</code> and <code>/status</code>, all four behind a 10-second timeout
-    layer. <code>/metrics</code> carries a single series,
-    <code>pcs_liveness_counter</code>, recorded once a second by the watchdog task; the
-    other eleven descriptors are covered under
-    <a href="#gaps">what is not instrumented yet</a>. The counters an operator wants
-    (iterations, rows, batch and error totals) are on <code>/status</code> instead, read
-    from the runner's own <code>StandaloneStats</code>.
+    layer. Nineteen series are declared and every one has a writer. A series reaches the
+    scrape output once its writer has recorded a value, so the <code>pcs_raft_*</code>
+    gauges appear on a cluster node and the <code>pcs_processor_*</code> series appear
+    once a <code>.wasm</code> processor has run a batch.
 </p>
 
 <p>
-    Two of the probes mean less than they look. <code>/ready</code> is flipped to ready
-    immediately after the runner task is spawned, so it reports <b>the process started</b>,
-    not that a pipeline iteration succeeded. And in cluster mode <code>/status</code>
-    always answers <code>"cluster": null</code>, because the service passes no cluster
-    probe into the HTTP state. <code>/health</code> is the one to alert on: it is backed by
-    the watchdog counter, so it goes stale if the main loop wedges.
+    Eleven of those series are also recorded a second time under the id that wrote
+    them: <code>pcs_rows_processed_total</code> and
+    <code>pcs_source_batches_drained_total</code> under <code>source</code>,
+    <code>pcs_sink_batches_written_total</code> under <code>sink</code>, the six
+    <code>pcs_processor_*</code> series under <code>processor</code>, and the two
+    workflow counters under <code>workflow</code>. The attribute value is the id the
+    config declared for that node (or workflow).
 </p>
 
-<h2 id="gaps">What is not instrumented yet</h2>
+<p>
+    Attribution is additive, not a replacement. The unattributed write always happens,
+    and it is the process-wide total across every node of that kind, which is what a
+    scrape has always read. An existing query keeps working untouched, at the cost that
+    summing the attributed and unattributed forms double counts. A node id is a dimension
+    on nine existing instruments. A workflow id is a dimension on the two workflow
+    counters. The one attributed-only series,
+    <code>pcs_window_watermark_seconds</code>, is the exception: a watermark belongs to
+    one node's merged inbound stream, so there is no unattributed form to double count.
+</p>
+
+<table class="rule-table">
+    <thead><tr><th>Series</th><th>Type</th><th>Written by</th></tr></thead>
+    <tbody>
+        <tr><td><code>pcs_workflow_runs_total</code></td><td>counter</td><td>The standalone, stream and cluster runners, once per completed run. Also recorded under <code>workflow</code>, the id the config declared for that workflow.</td></tr>
+        <tr><td><code>pcs_workflow_errors_total</code></td><td>counter</td><td>The same three runners, when a processor run itself fails. Source and sink drain failures stay on <code>/status</code>, so this series is alertable on its own. Also recorded under <code>workflow</code>, the id the config declared for that workflow.</td></tr>
+        <tr><td><code>pcs_stage_duration_seconds</code></td><td>histogram</td><td><code>SpanMetricsLayer</code>, from the lifetime of each <code>pipeline.stage</code> span. Unattributed: the layer discards that span's fields, so there is nothing to attribute from.</td></tr>
+        <tr><td><code>pcs_source_batches_drained_total</code></td><td>counter</td><td>The three runners, per non-empty source drain or claimed partition. Also recorded under <code>source</code>.</td></tr>
+        <tr><td><code>pcs_sink_batches_written_total</code></td><td>counter</td><td>The standalone and stream runners, also recorded under <code>sink</code>. Cluster mode has no sinks, so it stays at zero there.</td></tr>
+        <tr><td><code>pcs_rows_processed_total</code></td><td>counter</td><td>The three runners, rows a source drained into the workflow. Also recorded under <code>source</code>.</td></tr>
+        <tr><td><code>pcs_liveness_counter</code></td><td>gauge</td><td>The watchdog task, once a second.</td></tr>
+        <tr><td><code>pcs_ready</code></td><td>gauge</td><td>The watchdog task: 1 once the runner is spawned.</td></tr>
+        <tr><td><code>pcs_uptime_seconds</code></td><td>gauge</td><td>The watchdog task.</td></tr>
+        <tr><td><code>pcs_raft_commit_index</code></td><td>gauge</td><td>The cluster runner's Raft recorder, once a second from the driver handle.</td></tr>
+        <tr><td><code>pcs_raft_term</code></td><td>gauge</td><td>The same recorder.</td></tr>
+        <tr><td><code>pcs_raft_leader_id</code></td><td>gauge</td><td>The same recorder. It reports <code>-1</code> when there is no leader, so a lost election shows up instead of a stale id.</td></tr>
+        <tr><td><code>pcs_processor_batch_duration_seconds</code></td><td>histogram</td><td>The wasm and native plugin hosts, from the batch's run metrics. Also recorded under <code>processor</code>, which is the dashboard's per-node latency.</td></tr>
+        <tr><td><code>pcs_processor_rows_in_total</code></td><td>counter</td><td>The wasm and native plugin hosts, from the batch's run metrics. Also recorded under <code>processor</code>.</td></tr>
+        <tr><td><code>pcs_processor_rows_out_total</code></td><td>counter</td><td>The wasm and native plugin hosts, from the batch's run metrics. Also recorded under <code>processor</code>, which is what rates that processor's outbound edge on the dashboard.</td></tr>
+        <tr><td><code>pcs_processor_systems_run_total</code></td><td>counter</td><td>The wasm and native plugin hosts, from the batch's run metrics. Also recorded under <code>processor</code>.</td></tr>
+        <tr><td><code>pcs_processor_retries_total</code></td><td>counter</td><td>The wasm and native plugin hosts, from the batch's run metrics. Also recorded under <code>processor</code>.</td></tr>
+        <tr><td><code>pcs_processor_metric</code></td><td>histogram</td><td>Every <code>host-io::metric</code> call, labelled <code>metric</code> with the processor's own name. Distinct names are capped at 256. The second record carries <code>metric</code> and <code>processor</code>, sorted by key.</td></tr>
+        <tr><td><code>pcs_window_watermark_seconds</code></td><td>gauge</td><td>The standalone and stream runners, once per processor call, for every processor node whose config declares a <code>window</code> block. Recorded only under <code>processor</code>: the maximum <code>time_field</code> event timestamp observed across the node's merged inbound rows, in epoch seconds.</td></tr>
+    </tbody>
+</table>
 
 <p>
-    A metric name in a table is worth nothing if no code writes to it.
+    <code>/health</code> is the one to alert on: it is backed by the watchdog counter, so
+    it goes stale if the main loop wedges. <code>/ready</code> and <code>/status</code>
+    both mean less than they look; see
+    <a href="#gaps">what is still missing</a>.
+</p>
+
+<p>
+    The in-process inspector reads these same nineteen series and introduces none of
+    its own, so a dashboard number and a <code>/metrics</code> number are always the
+    same value. See
+    <a href="{{ get_url(path='@/service/observability.md') }}">Observability</a>.
+</p>
+
+<h2 id="gaps">What is still missing</h2>
+
+<p>
+    Five things an operator may expect and will not find, and one that appears twice.
 </p>
 
 <ul>
     <li>
-        <b>Eleven of the twelve declared metrics are never emitted.</b>
-        <code>register_standard_metrics</code> only describes instruments; its own doc
-        comment says "Runners increment the counters/gauges; this function only registers
-        descriptions". No runner does. Declared but unfed:
-        <code>pcs_pipeline_runs_total</code>, <code>pcs_pipeline_errors_total</code>,
-        <code>pcs_stage_duration_seconds</code>,
-        <code>pcs_source_batches_drained_total</code>,
-        <code>pcs_sink_batches_written_total</code>,
-        <code>pcs_rows_processed_total</code>, <code>pcs_ready</code>,
-        <code>pcs_uptime_seconds</code>, <code>pcs_raft_commit_index</code>,
-        <code>pcs_raft_term</code>, <code>pcs_raft_leader_id</code>. The six counters and
-        the histogram are built and immediately dropped; the observable gauges have no
-        observation callback. Only <code>pcs_liveness_counter</code> is written, by the
-        watchdog.
+        <b>Export covers spans only.</b> <code>otlp_endpoint</code> installs a span
+        exporter. Metrics stay pull-only on <code>/metrics</code>: there is no OTLP
+        metrics exporter and no push path.
     </li>
     <li>
-        <b>The pipeline execution path emits nothing but retry attempts.</b>
-        <code>task_attempt</code> is the whole story: <code>pipeline/execution.rs</code>
-        has no instrumentation, so there is no event or span at a stage boundary, at a
-        system's start or finish, or on the parallel-stage fan-out.
+        <b><code>/status</code> answers <code>"cluster": null</code> in cluster mode.</b>
+        <code>ServiceState.cluster_probe</code> is never populated, so the rich Raft
+        snapshot the type describes is unreachable over HTTP. The three
+        <code>pcs_raft_*</code> gauges carry term, commit index and leader instead, read
+        straight from the driver handle.
     </li>
     <li>
-        <b>Guest batch metrics are computed and thrown away.</b> The guest fills every
-        field of the WIT <code>run-metrics</code> record (<code>wall-ns</code>,
-        <code>rows-in</code>, <code>rows-out</code>, <code>systems-run</code>,
-        <code>retries</code>), and <code>WasmPipelineRuntime</code> reads only
-        <code>output</code> and <code>checkpoint</code> off the result. Nothing on the host
-        looks at <code>metrics</code>.
+        <b><code>/ready</code> reports the process, not the workflow.</b> The flag flips
+        as soon as the runner task is spawned, so it never means an iteration succeeded.
     </li>
     <li>
-        <b><code>host-io::metric</code> does not reach Prometheus.</b> The WIT comment says
-        "Host routes to prometheus"; the implementation emits a <code>trace</code> event
-        with <code>metric</code> and <code>value</code> and stops there. A guest counter is
-        a log line, not a series.
+        <b>A native plugin's own metric names are log lines.</b> The C ABI's
+        <code>metric</code> callback is the counterpart of
+        <code>host-io::metric</code>, but it emits a <code>trace</code> event and
+        writes no series: the six <code>pcs_processor_*</code> names are
+        host-reserved for the per-batch numbers the runtime reports, which a
+        native plugin records exactly like a WASM processor.
     </li>
     <li>
-        <b>No OTLP or distributed-trace export.</b> The service depends on
-        <code>opentelemetry</code>, <code>opentelemetry_sdk</code> with the
-        <code>metrics</code> feature, and <code>opentelemetry-prometheus</code>.
-        <code>tracing-opentelemetry</code> is not a dependency at all, and
-        <code>init_logging</code> installs exactly one <code>EnvFilter</code> plus one
-        <code>fmt</code> layer. You can stack an OTLP layer in your own
-        <code>main</code> when you embed PCS as a library; the shipped binary offers no
-        configuration knob for it.
+        <b><code>pcs_stage_duration_seconds</code> follows the tracing filter.</b> It is
+        derived from the <code>pipeline.stage</code> span, and the
+        <code>EnvFilter</code> is subscriber-wide. A filter that suppresses
+        <code>pcs_core</code> at span level stops the histogram too.
+    </li>
+    <li>
+        <b>An attributed series overlaps its own total.</b> The form with no attributes is
+        already the sum across every node of that kind, and the attributed form is one
+        node's share, so a query that sums both counts every value twice. Select the empty
+        attribute value, <code>source=""</code>, <code>processor=""</code>,
+        <code>sink=""</code> or <code>workflow=""</code>, for the process-wide number.
     </li>
 </ul>
 
@@ -547,7 +736,7 @@ curl -s localhost:8080/status | jq .standalone
 
 <div class="next-steps-grid">
     <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
-        <span class="next-card-label">Running at scale</span>
+        <span class="next-card-label">Service</span>
         <h3>Operating pcs-service</h3>
         <p>The runbook that consumes all of this: probes, scrape config, log aggregation, and what to check when a node stalls.</p>
     </a>

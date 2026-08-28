@@ -576,7 +576,7 @@ pipeline.add_parallel_system(Score);</code></pre>
     Two sharp edges here. The capability check calls
     <code>run_slice(data, 0..0)</code> and throws the result away, so your
     implementation must tolerate an <b>empty range</b> without panicking. And on
-    guest builds, where the <code>runtime</code> feature is off, registering a
+    processor builds, where the <code>runtime</code> feature is off, registering a
     <code>ParallelSystem</code> is an error at run time: that path accepts plain
     <code>System</code> impls only.
 </p>

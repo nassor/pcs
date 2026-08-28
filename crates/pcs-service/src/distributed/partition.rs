@@ -85,7 +85,7 @@ pub struct BatchClaim {
 /// use pcs_service::distributed::partition::PartitionSource;
 ///
 /// async fn process_all(source: &impl PartitionSource) -> pcs_service::PcsResult<()> {
-///     let instance = uuid::Uuid::new_v4();
+///     let instance = uuid::Uuid::now_v7();
 ///     while let Some(claim) = source.claim_next_batch(instance).await? {
 ///         // … process …
 ///         source.ack_claim(claim.claim_id, claim.instance_id).await?;
@@ -159,8 +159,8 @@ mod tests {
             component: "orders".to_string(),
             row_range: 0..100,
             schema_id: 1,
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
             lease_expires_at: 0, // unused by default impl
             lease_ttl_millis,
             claimed_at: Instant::now() - Duration::from_millis(elapsed_ms),
@@ -234,8 +234,8 @@ mod tests {
 
     #[test]
     fn test_arrow_batch_claim_clone() {
-        let id = Uuid::new_v4();
-        let inst = Uuid::new_v4();
+        let id = Uuid::now_v7();
+        let inst = Uuid::now_v7();
         let a = BatchClaim {
             batch_id: 1,
             component: "test".to_string(),

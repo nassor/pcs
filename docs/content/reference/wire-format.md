@@ -1,25 +1,25 @@
 +++
-title = "Host to guest wire format"
-description = "The exact bytes crossing the Component Model boundary: segment framing, Arrow IPC message framing, the flatbuffer field ids a guest must read, buffer layout per Arrow type, and the schema fingerprint algorithm."
+title = "Host to processor wire format"
+description = "The exact bytes crossing the Component Model boundary: segment framing, Arrow IPC message framing, the flatbuffer field ids a processor must read, buffer layout per Arrow type, and the schema fingerprint algorithm."
 template = "page.html"
 weight = 1
 aliases = ["/polyglot/wire-format/"]
 +++
 
-# Host ↔ guest wire format
+# Host ↔ processor wire format
 
 Read this only if you are writing an Arrow codec by hand. Five languages already
-have one, [`pcs-arrow-ipc`](@/reference/arrow-ipc-packages.md). The implementation
-on both sides is `crates/pcs-core/src/dataset/ipc.rs`, called identically by the
-host and by the `export_pipeline!` expansion in the guest.
+have one, carried inside [`the SDK packages`](@/reference/arrow-ipc-packages.md).
+The implementation on both sides is `crates/pcs-core/src/dataset/ipc.rs`, called
+identically by the host and by the `export_pipeline!` expansion in the processor.
 
-`run-batch` takes `list<u8>` and returns `list<u8>`. This page specifies those
-bytes precisely enough to implement a guest in a language with no Arrow library,
-as the Go, Python, TypeScript, Kotlin and C# stages of
-[the polyglot example](@/guests/six-languages.md) do.
+`run-batch` takes `list<u8>` and returns `list<u8>`. This page specifies
+those bytes precisely enough to implement a processor in a language with no
+Arrow library, as the Go, Python, TypeScript, Kotlin and C# stages of
+[the polyglot example](@/processors/_index.md#six-languages-one-pipeline) do.
 
 The numbers here match the stream that
-`cargo run -p pcs-service --features wasm --example polyglot_orders -- emit`
+`cargo run -p pcs-service --features wasm --example polyglot_schema_emit -- emit`
 writes to `examples/polyglot/generated/fixture_input.pcs`.
 
 ---
@@ -29,7 +29,7 @@ writes to `examples/polyglot/generated/fixture_input.pcs`.
 The payload is **not** a single Arrow IPC stream. It is a sequence of
 length-prefixed streams with a zero terminator:
 
-```text
+```text,name=The segment framing grammar
 pcs_stream := segment* terminator
 segment    := u32le segment_len ++ arrow_ipc_stream[segment_len]
 terminator := u32le 0x00000000
@@ -52,14 +52,15 @@ Each segment's Schema carries custom metadata:
 | `__pcs_schema_version` | decimal `u32`; absent on the `__alive` segment |
 
 A segment with no `__pcs_component` key is fatal on the host side. So is a stream
-where any component's row count differs from the `__alive` length, or one with
-more than one `__alive` segment.
+where any component's row count exceeds the `__alive` length (a component may
+hold *fewer* rows — a windowing processor's reduced result component), or one
+with more than one `__alive` segment.
 
 ## Arrow IPC message framing
 
 Within a segment, each message is:
 
-```text
+```text,name=The Arrow IPC message framing
 message := 0xFFFFFFFF (u32le continuation)
         ++ u32le metadata_len
         ++ flatbuffer[metadata_len]
@@ -115,7 +116,7 @@ value, which is where the gaps in this table come from.
 | `RecordBatch` | `compression` | 3 | uoffset; **must be absent** — reject the batch if present |
 | `KeyValue` | `key` / `value` | 0 / 1 | string / string |
 
-`type_type` values a PCS guest needs: **2 = Int, 3 = FloatingPoint, 5 = Utf8,
+`type_type` values a PCS processor needs: **2 = Int, 3 = FloatingPoint, 5 = Utf8,
 6 = Bool**. Cross-check against Arrow's [`Message.fbs`][msg] and
 [`Schema.fbs`][sch] if you extend the set.
 
@@ -152,9 +153,9 @@ exactly 25 buffer slots; after the walk, the accumulated index must equal the
 | `Boolean` | bit-packed LSB-first: row `i` is bit `i & 7` of byte `i >> 3`; `ceil(n/8)` bytes |
 | `Utf8` | `n+1` i32 LE offsets into the values buffer; row `i` is `values[offsets[i]..offsets[i+1]]`, UTF-8 |
 
-## What a byte-mutating guest may and may not do
+## What a byte-mutating processor may and may not do
 
-A guest with no Arrow writer can still be a first-class stage, as long as it
+A processor with no Arrow writer can still be a first-class stage, as long as it
 never changes any length. The pattern the five non-Rust stages use:
 
 1. split the input into segments,
@@ -167,11 +168,11 @@ never changes any length. The pattern the five non-Rust stages use:
 5. return the input byte array, mutated. Every other byte passes through
    untouched: the `__alive` segment, both flatbuffers, the framing.
 
-Writing a variable-length column this way is not possible: a different string
-length changes the offsets buffer, the values buffer length, and the `Buffer`
-entries in the RecordBatch flatbuffer. A guest that must write `Utf8` needs a real
-RecordBatch-message *writer*; the field-id table above is sufficient to build
-one.
+Writing a variable-length column this way is not possible: a different
+string length changes the offsets buffer, the values buffer length, and the
+`Buffer` entries in the RecordBatch flatbuffer. A processor that must write
+`Utf8` needs a real RecordBatch-message *writer*; the field-id table above
+is sufficient to build one.
 
 ## Schema fingerprint
 
@@ -179,7 +180,7 @@ one.
 `format!("{:08x}", fnv1a32)`, lowercase and zero-padded to 8 characters. FNV-1a
 32-bit, offset basis `2166136261`, prime `16777619`, all arithmetic mod 2^32:
 
-```text
+```text,name=The fingerprint hash step by step
 hash := 2166136261
 for each component, sorted by name:
     for each byte of the component name:      hash = (hash XOR byte) * 16777619
@@ -193,10 +194,10 @@ return lowercase_hex_8(hash)
 Names, versions and field names only: no types, no nullability. Adding a field
 changes it; changing a field's type does not.
 
-Non-Rust guests should not reimplement this. The polyglot example generates the
-value from the canonical Rust schema and embeds it as a constant, and both the
-driver and the integration test fail if a guest's reported fingerprint disagrees
-with the live one.
+Non-Rust processors should not reimplement this. The polyglot example
+generates the value from the canonical Rust schema and embeds it as a
+constant, and both the driver and the integration test fail if a
+processor's reported fingerprint disagrees with the live one.
 
 ## `component-descriptor.arrow-schema-ipc`
 
@@ -209,4 +210,4 @@ fingerprint.
 ## Error mapping
 
 `run-error` and what the host does with each variant are on
-[the WIT contract](@/guests/wit-contract.md).
+[the WIT contract](@/processors/wit-contract.md).

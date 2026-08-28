@@ -1,4 +1,4 @@
-# Copied in from examples/polyglot/generated/ by scripts/build-polyglot.sh; a committed copy silently desynchronises when the canonical Order schema changes.
+# Copied in from examples/polyglot/generated/ by `cargo xtask polyglot`; a committed copy silently desynchronises when the canonical Order schema changes.
 /schema_gen.ts
 # Build outputs: the component itself, jco's generated typings, and npm's tree.
 /score-ts.wasm

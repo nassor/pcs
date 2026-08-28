@@ -3,7 +3,7 @@
 // component it instantiates.
 //
 // It operates on the same `Order` component the polyglot WASM example uses, so
-// the two guest paths are directly comparable. It reads `amount` and
+// the two processor paths are directly comparable. It reads `amount` and
 // `currency`, converts each order through a host supplied rate, and writes
 // `review_tier`, the settlement disposition:
 //
@@ -116,7 +116,7 @@ import (
 	"time"
 	"unsafe"
 
-	arrowipc "github.com/nassor/pcs/packages/arrow-ipc-go"
+	arrowipc "github.com/nassor/pcs/packages/pcs-sdk-go/arrowipc"
 )
 
 const (

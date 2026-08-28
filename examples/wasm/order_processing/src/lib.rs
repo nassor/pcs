@@ -1,13 +1,13 @@
-//! Order processing pipeline as a WebAssembly Component Model guest.
+//! Order processing pipeline as a WebAssembly Component Model processor.
 //!
 //! A 2-stage field-granular DAG (Validate and Enrich in parallel, then Report)
-//! running inside a WASM guest via `pcs-guest`. It mirrors
-//! `crates/pcs-service/examples/scheduler_etl.rs`, with two differences the
+//! running inside a WASM processor via `pcs-processor`. It mirrors
+//! `examples/native/scheduler_etl.rs`, with two differences the
 //! WASM model forces:
 //!
 //! - No ingest system. Data arrives in the host's `run-batch` Arrow IPC
 //!   payload, one batch per partition, from whatever source `pcs-service`'s
-//!   TOML configures.
+//!   the config file configures.
 //! - `FxRates` lives on the `EnrichSystem` struct rather than on the
 //!   `Dataset`. `Dataset::write_ipc` serializes registered components and the
 //!   alive bitmap, not the resource map, so a dataset rebuilt from IPC has no
@@ -17,39 +17,44 @@
 //! # Build
 //!
 //! ```bash
-//! cargo component build --release -p order-processing-wasm --target wasm32-wasip2
+//! cargo build --release -p order-processing-wasm --target wasm32-wasip2
 //! ```
 //!
 //! The output component is at:
 //!
 //! ```text
-//! target/wasm32-wasip1/release/order_processing_wasm.wasm
+//! target/wasm32-wasip2/release/order_processing_wasm.wasm
 //! ```
-//!
-//! cargo-component uses the `wasip1` directory name in its component-wrap step.
 //!
 //! # Run via pcs-service
 //!
 //! ```bash
-//! pcs-service serve --config examples/configs/standalone_wasm.toml
+//! pcs-service serve --config examples/configs/standalone_wasm.kdl
 //! ```
 //!
 //! See `README.md` in this crate for the full instructions.
 
 #![deny(missing_docs)]
 
-// cargo-component generates `src/bindings.rs` only when building for
-// wasm32-wasip2, so the module declaration and the macro invocation are gated
-// on `target_arch = "wasm32"`.
+// The bindings are generated in place from `crates/pcs-processor/wit`. The
+// module and the `export_pipeline!` invocation below are gated on
+// `target_arch = "wasm32"`: the expansion emits canonical ABI intrinsics and the
+// `component-type` custom section, neither of which the host target can link.
 #[cfg(target_arch = "wasm32")]
 #[allow(warnings)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../../../crates/pcs-processor/wit",
+        world: "pcs-pipeline",
+        generate_all,
+    });
+}
 
 use std::sync::Arc;
 
-use pcs_guest::arrow_array::{BooleanArray, Float64Array, RecordBatch};
-use pcs_guest::arrow_schema::{DataType, Field, Schema};
-use pcs_guest::prelude::*;
+use pcs_processor::arrow_array::{BooleanArray, Float64Array, RecordBatch};
+use pcs_processor::arrow_schema::{DataType, Field, Schema};
+use pcs_processor::prelude::*;
 
 /// A financial transaction in columnar form.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -110,7 +115,7 @@ impl FxRates {
     /// Read the rates from the host's `[pipeline.wasm.config]` table, falling
     /// back to [`DEFAULT`](Self::DEFAULT) per missing key. A present but
     /// unparseable value keeps the default and warns on stderr rather than
-    /// trapping the guest mid-`describe`.
+    /// trapping the processor mid-`describe`.
     #[cfg(target_arch = "wasm32")]
     fn from_config() -> Self {
         fn rate(key: &str, default: f64) -> f64 {
@@ -151,7 +156,7 @@ impl FxRates {
 /// the same stage.
 struct ValidateSystem;
 
-#[pcs_guest::prelude::async_trait]
+#[pcs_processor::prelude::async_trait]
 impl System for ValidateSystem {
     fn meta(&self) -> SystemMeta {
         SystemMeta::new("validate")
@@ -181,15 +186,16 @@ impl System for ValidateSystem {
             .index_of("valid")
             .map_err(|e| PcsError::generic(format!("Transaction.valid missing: {e}")))?;
 
-        let new_columns: Vec<Arc<dyn pcs_guest::arrow_array::Array>> = (0..schema.fields().len())
-            .map(|i| {
-                if i == valid_idx {
-                    new_valid.clone() as Arc<dyn pcs_guest::arrow_array::Array>
-                } else {
-                    batch.column(i).clone()
-                }
-            })
-            .collect();
+        let new_columns: Vec<Arc<dyn pcs_processor::arrow_array::Array>> =
+            (0..schema.fields().len())
+                .map(|i| {
+                    if i == valid_idx {
+                        new_valid.clone() as Arc<dyn pcs_processor::arrow_array::Array>
+                    } else {
+                        batch.column(i).clone()
+                    }
+                })
+                .collect();
 
         let new_batch = RecordBatch::try_new(schema, new_columns)
             .map_err(|e| PcsError::generic(format!("RecordBatch rebuild error: {e}")))?;
@@ -208,12 +214,12 @@ impl System for ValidateSystem {
 ///
 /// Reads `amount` and `currency`, writes `usd_amount`. The rates are a struct
 /// field rather than a `Dataset` resource because resources do not survive the
-/// host and guest Arrow IPC round-trip; see the crate docs.
+/// host and processor Arrow IPC round-trip; see the crate docs.
 struct EnrichSystem {
     rates: FxRates,
 }
 
-#[pcs_guest::prelude::async_trait]
+#[pcs_processor::prelude::async_trait]
 impl System for EnrichSystem {
     fn meta(&self) -> SystemMeta {
         SystemMeta::new("enrich")
@@ -249,15 +255,16 @@ impl System for EnrichSystem {
             .index_of("usd_amount")
             .map_err(|e| PcsError::generic(format!("Transaction.usd_amount missing: {e}")))?;
 
-        let new_columns: Vec<Arc<dyn pcs_guest::arrow_array::Array>> = (0..schema.fields().len())
-            .map(|i| {
-                if i == usd_idx {
-                    new_usd.clone() as Arc<dyn pcs_guest::arrow_array::Array>
-                } else {
-                    batch.column(i).clone()
-                }
-            })
-            .collect();
+        let new_columns: Vec<Arc<dyn pcs_processor::arrow_array::Array>> =
+            (0..schema.fields().len())
+                .map(|i| {
+                    if i == usd_idx {
+                        new_usd.clone() as Arc<dyn pcs_processor::arrow_array::Array>
+                    } else {
+                        batch.column(i).clone()
+                    }
+                })
+                .collect();
 
         let new_batch = RecordBatch::try_new(schema, new_columns)
             .map_err(|e| PcsError::generic(format!("RecordBatch rebuild error: {e}")))?;
@@ -355,4 +362,4 @@ pub fn build() -> Pipeline {
 }
 
 #[cfg(target_arch = "wasm32")]
-pcs_guest::export_pipeline!(build);
+pcs_processor::export_pipeline!(build);

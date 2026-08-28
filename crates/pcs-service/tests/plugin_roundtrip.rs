@@ -18,7 +18,7 @@
 //!   is written by the plugin, so both directions of the Arrow IPC round-trip
 //!   are observed in one batch.
 //! - **State across batches.** The plugin's running total lives in a
-//!   `GuestState` resource, not in the dataset, so the second batch can only
+//!   `ProcessorState` resource, not in the dataset, so the second batch can only
 //!   continue from the first when the checkpoint blob crosses the boundary both
 //!   ways.
 //! - **Config delivery.** `smoketest.multiplier` reaches the plugin through the
@@ -149,6 +149,25 @@ async fn descriptor_comes_from_the_manifest() {
     let schema = batch.schema();
     let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(fields, vec!["id", "seen"]);
+
+    // `descriptor_info()` is the one generic way a host holding
+    // `Box<dyn PipelineRuntime>` can read what a plugin says about itself, so
+    // the override must report the manifest rather than the empty default.
+    let info = runtime.descriptor_info();
+    assert!(
+        !info.version.is_empty(),
+        "the manifest's version must reach descriptor_info()"
+    );
+    assert!(
+        info.stateful,
+        "the smoketest plugin carries state across batches"
+    );
+    assert_eq!(
+        info.schema_fingerprint.len(),
+        8,
+        "the fingerprint is lowercase 8-character hex: {}",
+        info.schema_fingerprint
+    );
 }
 
 /// One batch, both directions: `id` survives untouched and `seen` carries what

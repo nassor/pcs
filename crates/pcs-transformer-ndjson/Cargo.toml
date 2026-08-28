@@ -1,0 +1,21 @@
+[package]
+name = "pcs-transformer-ndjson"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "The ndjson byte format for PCS: a Transformer reading and writing newline-delimited JSON, as a stream and as discrete messages."
+
+[dependencies]
+pcs-core        = { path = "../pcs-core", version = "0.1.0" }
+pcs-transformer = { path = "../pcs-transformer", version = "0.1.0" }
+
+arrow-array   = { workspace = true }
+arrow-json    = { workspace = true }
+arrow-schema  = { workspace = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }

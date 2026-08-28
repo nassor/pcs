@@ -15,8 +15,11 @@ use crate::system::{
 #[cfg(feature = "io")]
 use crate::io::{drain_dataset, drain_into_dataset};
 
+#[cfg(feature = "tracing")]
+use tracing::{Instrument as _, info_span};
+
 use super::Pipeline;
-use super::dag::SystemEntry;
+use super::dag::{ExpandedMeta, SystemEntry};
 use crate::dataset::Dataset;
 
 /// Returns number of retries before success (0 = first attempt succeeded).
@@ -151,6 +154,7 @@ async fn run_parallel_system_sliced(
 async fn run_parallel_stage(
     systems: &[SystemEntry],
     configs: &[SystemConfig],
+    metas: &[ExpandedMeta],
     stage: &[usize],
     data: &mut Dataset,
 ) -> PcsResult<u32> {
@@ -158,6 +162,8 @@ async fn run_parallel_stage(
         sys: Arc<dyn ParallelSystem>,
         config: SystemConfig,
         use_slices: bool,
+        #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+        name: &'static str,
     }
 
     let world_rows = data.rows() as u32;
@@ -172,6 +178,7 @@ async fn run_parallel_stage(
                 sys: Arc::clone(sys),
                 config: *config,
                 use_slices,
+                name: metas[sys_idx].name,
             });
         }
     }
@@ -182,11 +189,27 @@ async fn run_parallel_stage(
     let handle = tokio::runtime::Handle::current();
     let num_tasks = task_descs.len();
 
+    // `spawn_blocking` runs outside the task-local context, so the stage span
+    // is captured here and re-entered inside the closure.
+    #[cfg(feature = "tracing")]
+    let stage_span = tracing::Span::current();
+
     let handles: Vec<tokio::task::JoinHandle<Result<(WriteSet, u32), PcsError>>> = task_descs
         .into_iter()
         .map(|desc| {
             let handle = handle.clone();
+            #[cfg(feature = "tracing")]
+            let stage_span = stage_span.clone();
             tokio::task::spawn_blocking(move || {
+                // The closure body has no `.await` (only `handle.block_on`), so
+                // plain guards are correct, as in `run_with_retries_blocking`.
+                #[cfg(feature = "tracing")]
+                let _stage_guard = stage_span.enter();
+                #[cfg(feature = "tracing")]
+                let system_span = info_span!("system.execute", system = desc.name);
+                #[cfg(feature = "tracing")]
+                let _system_guard = system_span.enter();
+
                 // SAFETY: world_ptr is valid; all handles are awaited before return.
                 let data = unsafe { &*(world_ptr as *const Dataset) };
 
@@ -263,91 +286,160 @@ async fn run_parallel_stage(
     Ok(total_retries)
 }
 
-/// Execute all stages against `data`, returning `(systems_run, retries_this_batch)`.
+/// Execute one stage against `data`, returning `(systems_run, retries)` for
+/// that stage alone.
+///
+/// Separate from [`run_stages`] so the `pipeline.stage` span can wrap the whole
+/// future: the body awaits, and a span guard held across an await attributes
+/// another task's work to this stage.
 #[cfg(feature = "runtime")]
-async fn run_stages(
+async fn run_stage(
     systems: &[SystemEntry],
     configs: &[SystemConfig],
-    stages: &[Vec<usize>],
+    metas: &[ExpandedMeta],
+    stage: &[usize],
     data: &mut Dataset,
 ) -> PcsResult<(usize, u32)> {
     let mut systems_run = 0usize;
-    let mut retries_this_batch: u32 = 0;
+    let mut retries: u32 = 0;
 
-    for stage in stages.iter() {
-        let all_parallel = stage.iter().all(|&idx| systems[idx].is_parallel());
+    let all_parallel = stage.iter().all(|&idx| systems[idx].is_parallel());
 
-        // Concurrent dispatch of a whole stage costs a `spawn_blocking` per
-        // system plus write-set merging; below `STAGE_INLINE_THRESHOLD` rows
-        // that dominates the work itself, so fall through to the sequential
-        // loop. Systems sharing a stage are non-conflicting by construction, so
-        // the result is identical either way.
-        if all_parallel && stage.len() > 1 && data.rows() as u32 >= STAGE_INLINE_THRESHOLD {
-            systems_run += stage.len();
-            retries_this_batch += run_parallel_stage(systems, configs, stage, data).await?;
-        } else if all_parallel && stage.len() == 1 {
-            let sys_idx = stage[0];
+    // Concurrent dispatch of a whole stage costs a `spawn_blocking` per
+    // system plus write-set merging; below `STAGE_INLINE_THRESHOLD` rows
+    // that dominates the work itself, so fall through to the sequential
+    // loop. Systems sharing a stage are non-conflicting by construction, so
+    // the result is identical either way.
+    if all_parallel && stage.len() > 1 && data.rows() as u32 >= STAGE_INLINE_THRESHOLD {
+        systems_run += stage.len();
+        retries += run_parallel_stage(systems, configs, metas, stage, data).await?;
+    } else if all_parallel && stage.len() == 1 {
+        let sys_idx = stage[0];
+        let config = &configs[sys_idx];
+        if let SystemEntry::Parallel(sys) = &systems[sys_idx] {
+            let fut = run_parallel_system_with_retries(Arc::clone(sys), config, data);
+            #[cfg(feature = "tracing")]
+            let (write_set, system_retries) = fut
+                .instrument(info_span!("system.execute", system = metas[sys_idx].name))
+                .await?;
+            #[cfg(not(feature = "tracing"))]
+            let (write_set, system_retries) = fut.await?;
+            data.apply_write_set(write_set)?;
+            systems_run += 1;
+            retries += system_retries;
+        }
+    } else {
+        for &sys_idx in stage {
             let config = &configs[sys_idx];
-            if let SystemEntry::Parallel(sys) = &systems[sys_idx] {
-                let (write_set, retries) =
-                    run_parallel_system_with_retries(Arc::clone(sys), config, data).await?;
-                data.apply_write_set(write_set)?;
-                systems_run += 1;
-                retries_this_batch += retries;
-            }
-        } else {
-            for &sys_idx in stage {
-                let config = &configs[sys_idx];
+            #[cfg(feature = "tracing")]
+            let span = info_span!("system.execute", system = metas[sys_idx].name);
 
-                match &systems[sys_idx] {
-                    SystemEntry::Sequential(sys) => {
-                        // `max_attempts == 1` needs no special case: the retry
-                        // driver wraps the first failure in `RetryExhausted`
-                        // with attempt 1 and never sleeps.
-                        retries_this_batch +=
-                            run_arrow_system_with_retries(sys.as_ref(), config, data).await?;
-                        systems_run += 1;
-                    }
-                    SystemEntry::Parallel(sys) => {
-                        let (write_set, retries) =
-                            run_parallel_system_with_retries(Arc::clone(sys), config, data).await?;
-                        data.apply_write_set(write_set)?;
-                        systems_run += 1;
-                        retries_this_batch += retries;
-                    }
+            match &systems[sys_idx] {
+                SystemEntry::Sequential(sys) => {
+                    // `max_attempts == 1` needs no special case: the retry
+                    // driver wraps the first failure in `RetryExhausted`
+                    // with attempt 1 and never sleeps.
+                    let fut = run_arrow_system_with_retries(sys.as_ref(), config, data);
+                    #[cfg(feature = "tracing")]
+                    let system_retries = fut.instrument(span).await?;
+                    #[cfg(not(feature = "tracing"))]
+                    let system_retries = fut.await?;
+                    retries += system_retries;
+                    systems_run += 1;
+                }
+                SystemEntry::Parallel(sys) => {
+                    let fut = run_parallel_system_with_retries(Arc::clone(sys), config, data);
+                    #[cfg(feature = "tracing")]
+                    let (write_set, system_retries) = fut.instrument(span).await?;
+                    #[cfg(not(feature = "tracing"))]
+                    let (write_set, system_retries) = fut.await?;
+                    data.apply_write_set(write_set)?;
+                    systems_run += 1;
+                    retries += system_retries;
                 }
             }
         }
     }
 
-    Ok((systems_run, retries_this_batch))
+    Ok((systems_run, retries))
 }
 
-/// Execute all stages sequentially (no-runtime/guest path).
-/// `ParallelSystem` entries are rejected; register only `System` impls.
-#[cfg(not(feature = "runtime"))]
-async fn run_stages_sequential(
+/// Execute all stages against `data`, returning `(systems_run, retries_this_batch)`.
+#[cfg(feature = "runtime")]
+async fn run_stages(
     systems: &[SystemEntry],
     configs: &[SystemConfig],
+    metas: &[ExpandedMeta],
     stages: &[Vec<usize>],
     data: &mut Dataset,
 ) -> PcsResult<(usize, u32)> {
     let mut systems_run = 0usize;
     let mut retries_this_batch: u32 = 0;
 
-    for stage in stages {
+    for (stage_idx, stage) in stages.iter().enumerate() {
+        let fut = run_stage(systems, configs, metas, stage, data);
+        #[cfg(feature = "tracing")]
+        let (ran, retries) = fut
+            .instrument(info_span!(
+                "pipeline.stage",
+                stage = stage_idx,
+                systems = stage.len()
+            ))
+            .await?;
+        #[cfg(not(feature = "tracing"))]
+        let (ran, retries) = {
+            let _ = stage_idx;
+            fut.await?
+        };
+        systems_run += ran;
+        retries_this_batch += retries;
+    }
+
+    Ok((systems_run, retries_this_batch))
+}
+
+/// Execute all stages sequentially (no-runtime/processor path).
+/// `ParallelSystem` entries are rejected; register only `System` impls.
+#[cfg(not(feature = "runtime"))]
+async fn run_stages_sequential(
+    systems: &[SystemEntry],
+    configs: &[SystemConfig],
+    metas: &[ExpandedMeta],
+    stages: &[Vec<usize>],
+    data: &mut Dataset,
+) -> PcsResult<(usize, u32)> {
+    let mut systems_run = 0usize;
+    let mut retries_this_batch: u32 = 0;
+
+    #[cfg(not(feature = "tracing"))]
+    let _ = metas;
+
+    for (stage_idx, stage) in stages.iter().enumerate() {
+        #[cfg(feature = "tracing")]
+        let stage_span = info_span!("pipeline.stage", stage = stage_idx, systems = stage.len());
+        #[cfg(not(feature = "tracing"))]
+        let _ = stage_idx;
+
         for &sys_idx in stage {
             let config = &configs[sys_idx];
 
             match &systems[sys_idx] {
                 SystemEntry::Sequential(sys) => {
-                    retries_this_batch +=
-                        run_arrow_system_with_retries(sys.as_ref(), config, data).await?;
+                    let fut = run_arrow_system_with_retries(sys.as_ref(), config, data);
+                    #[cfg(feature = "tracing")]
+                    let system_retries = fut
+                        .instrument(
+                            info_span!(parent: &stage_span, "system.execute", system = metas[sys_idx].name),
+                        )
+                        .await?;
+                    #[cfg(not(feature = "tracing"))]
+                    let system_retries = fut.await?;
+                    retries_this_batch += system_retries;
                     systems_run += 1;
                 }
                 SystemEntry::Parallel(_) => {
                     return Err(PcsError::generic(
-                        "ParallelSystem is not supported on the guest (no-runtime) path",
+                        "ParallelSystem is not supported on the processor (no-runtime) path",
                     ));
                 }
             }
@@ -367,15 +459,18 @@ impl Pipeline {
         let rows_before = self.data.live_rows() as isize;
 
         let Self {
+            name,
             data,
             systems,
             stages,
+            expanded_metas,
             configs,
             ..
         } = self;
 
         let stages_val = stages.get().unwrap().as_ref().unwrap();
         let configs_val = configs.get().unwrap();
+        let metas_val = expanded_metas.get().unwrap().as_ref().unwrap();
 
         if stages_val.is_empty() {
             self.last_stats.set(RunStats {
@@ -387,8 +482,20 @@ impl Pipeline {
             return Ok(());
         }
 
-        let (systems_run, retries_this_batch) =
-            run_stages(systems, configs_val, stages_val, data).await?;
+        #[cfg(feature = "tracing")]
+        let span = info_span!(
+            "pipeline.run",
+            pipeline = %name,
+            stages = stages_val.len(),
+            rows = data.rows()
+        );
+        #[cfg(not(feature = "tracing"))]
+        let _ = name;
+        let fut = run_stages(systems, configs_val, metas_val, stages_val, data);
+        #[cfg(feature = "tracing")]
+        let (systems_run, retries_this_batch) = fut.instrument(span).await?;
+        #[cfg(not(feature = "tracing"))]
+        let (systems_run, retries_this_batch) = fut.await?;
 
         self.last_stats.set(RunStats {
             rows_produced: data.live_rows() as isize - rows_before,
@@ -399,7 +506,7 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Run all systems against `self.data` (guest/sequential path).
+    /// Run all systems against `self.data` (processor/sequential path).
     ///
     /// `ParallelSystem` entries are not supported here: register only `System`
     /// impls when targeting wasm32-wasip2.
@@ -410,9 +517,11 @@ impl Pipeline {
         let start = Instant::now();
         let rows_before = self.data.live_rows() as isize;
 
-        // Clone stages/configs to break the borrow conflict with &mut self.data.
+        // Clone stages/configs/metas to break the borrow conflict with
+        // `&mut self.data`.
         let stages = self.stages.get().unwrap().as_ref().unwrap().clone();
         let configs: Vec<SystemConfig> = self.configs.get().unwrap().to_vec();
+        let metas = self.expanded_metas.get().unwrap().as_ref().unwrap().clone();
 
         if stages.is_empty() {
             self.last_stats.set(RunStats {
@@ -424,8 +533,18 @@ impl Pipeline {
             return Ok(());
         }
 
-        let (systems_run, retries_this_batch) =
-            run_stages_sequential(&self.systems, &configs, &stages, &mut self.data).await?;
+        #[cfg(feature = "tracing")]
+        let span = info_span!(
+            "pipeline.run",
+            pipeline = %self.name,
+            stages = stages.len(),
+            rows = self.data.rows()
+        );
+        let fut = run_stages_sequential(&self.systems, &configs, &metas, &stages, &mut self.data);
+        #[cfg(feature = "tracing")]
+        let (systems_run, retries_this_batch) = fut.instrument(span).await?;
+        #[cfg(not(feature = "tracing"))]
+        let (systems_run, retries_this_batch) = fut.await?;
 
         self.last_stats.set(RunStats {
             rows_produced: self.data.live_rows() as isize - rows_before,
@@ -439,7 +558,7 @@ impl Pipeline {
     /// Run all systems against a separately-provided `Dataset`, returning the
     /// stats for **this call**.
     ///
-    /// An escape hatch for distributed runners and WASM guests that manage
+    /// An escape hatch for distributed runners and WASM processors that manage
     /// their own per-partition datasets. Sources and sinks on `self` are
     /// ignored. The returned [`RunStats`] is also recorded in
     /// [`last_stats`](Pipeline::last_stats); callers that need a per-call value
@@ -453,6 +572,7 @@ impl Pipeline {
 
         let stages_val = self.stages.get().unwrap().as_ref().unwrap();
         let configs_val = self.configs.get().unwrap();
+        let metas_val = self.expanded_metas.get().unwrap().as_ref().unwrap();
 
         if stages_val.is_empty() {
             let stats = RunStats {
@@ -465,8 +585,18 @@ impl Pipeline {
             return Ok(stats);
         }
 
-        let (systems_run, retries_this_batch) =
-            run_stages(&self.systems, configs_val, stages_val, data).await?;
+        #[cfg(feature = "tracing")]
+        let span = info_span!(
+            "pipeline.run",
+            pipeline = %self.name,
+            stages = stages_val.len(),
+            rows = data.rows()
+        );
+        let fut = run_stages(&self.systems, configs_val, metas_val, stages_val, data);
+        #[cfg(feature = "tracing")]
+        let (systems_run, retries_this_batch) = fut.instrument(span).await?;
+        #[cfg(not(feature = "tracing"))]
+        let (systems_run, retries_this_batch) = fut.await?;
 
         let stats = RunStats {
             rows_produced: data.live_rows() as isize - rows_before,
@@ -478,7 +608,7 @@ impl Pipeline {
         Ok(stats)
     }
 
-    /// Run all systems against a separately-provided `Dataset` (guest/sequential
+    /// Run all systems against a separately-provided `Dataset` (processor/sequential
     /// path), returning the stats for **this call**.
     #[cfg(not(feature = "runtime"))]
     pub async fn run_on_with_stats(&self, data: &mut Dataset) -> PcsResult<RunStats> {
@@ -489,6 +619,7 @@ impl Pipeline {
 
         let stages_val = self.stages.get().unwrap().as_ref().unwrap();
         let configs_val = self.configs.get().unwrap();
+        let metas_val = self.expanded_metas.get().unwrap().as_ref().unwrap();
 
         if stages_val.is_empty() {
             let stats = RunStats {
@@ -501,8 +632,18 @@ impl Pipeline {
             return Ok(stats);
         }
 
-        let (systems_run, retries_this_batch) =
-            run_stages_sequential(&self.systems, configs_val, stages_val, data).await?;
+        #[cfg(feature = "tracing")]
+        let span = info_span!(
+            "pipeline.run",
+            pipeline = %self.name,
+            stages = stages_val.len(),
+            rows = data.rows()
+        );
+        let fut = run_stages_sequential(&self.systems, configs_val, metas_val, stages_val, data);
+        #[cfg(feature = "tracing")]
+        let (systems_run, retries_this_batch) = fut.instrument(span).await?;
+        #[cfg(not(feature = "tracing"))]
+        let (systems_run, retries_this_batch) = fut.await?;
 
         let stats = RunStats {
             rows_produced: data.live_rows() as isize - rows_before,
@@ -590,9 +731,11 @@ impl Pipeline {
 
         {
             let Self {
+                name,
                 data,
                 systems,
                 stages,
+                expanded_metas,
                 configs,
                 sources,
                 sinks,
@@ -601,6 +744,9 @@ impl Pipeline {
 
             let stages_val = stages.get().unwrap().as_ref().unwrap();
             let configs_val = configs.get().unwrap();
+            let metas_val = expanded_metas.get().unwrap().as_ref().unwrap();
+            #[cfg(not(feature = "tracing"))]
+            let _ = name;
             let (comp, source) = {
                 let (c, s) = &mut sources[0];
                 (*c, s)
@@ -611,7 +757,18 @@ impl Pipeline {
                 data.append_record_batch(comp, batch)?;
 
                 if !stages_val.is_empty() {
-                    let (run, retries) = run_stages(systems, configs_val, stages_val, data).await?;
+                    #[cfg(feature = "tracing")]
+                    let span = info_span!(
+                        "pipeline.run",
+                        pipeline = %name,
+                        stages = stages_val.len(),
+                        rows = data.rows()
+                    );
+                    let fut = run_stages(systems, configs_val, metas_val, stages_val, data);
+                    #[cfg(feature = "tracing")]
+                    let (run, retries) = fut.instrument(span).await?;
+                    #[cfg(not(feature = "tracing"))]
+                    let (run, retries) = fut.await?;
                     systems_run += run;
                     retries_this_batch += retries;
                 }
@@ -639,8 +796,8 @@ impl Pipeline {
 }
 
 // Every test here drives `Pipeline::run` / `run_on` through the tokio+rayon
-// stage executor, so the module is gated on `runtime`. The guest path is
-// covered end-to-end by `pcs-guest-smoketest` against a real component.
+// stage executor, so the module is gated on `runtime`. The processor path is
+// covered end-to-end by `pcs-processor-smoketest` against a real component.
 #[cfg(all(test, feature = "runtime"))]
 mod tests {
     use std::sync::Arc;
@@ -651,6 +808,7 @@ mod tests {
 
     use crate::component::Component;
     use crate::dataset::Dataset;
+    use crate::error::PcsError;
     use crate::pipeline::Pipeline;
     use crate::row::Row;
     use crate::system::{System, SystemMeta, WriteSet};
@@ -922,6 +1080,51 @@ mod tests {
         .unwrap()
     }
 
+    /// Yields pre-built batches in order, then EOF.
+    #[cfg(feature = "io")]
+    struct VecSource {
+        batches: std::collections::VecDeque<arrow_array::RecordBatch>,
+        schema: Arc<Schema>,
+    }
+
+    #[cfg(feature = "io")]
+    #[async_trait::async_trait]
+    impl crate::io::source::Source for VecSource {
+        fn schema(&self) -> Arc<Schema> {
+            Arc::clone(&self.schema)
+        }
+
+        async fn next_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>, PcsError> {
+            Ok(self.batches.pop_front())
+        }
+    }
+
+    /// Forwards every written batch to the test, which reads them back after the
+    /// run. Unbounded, so a write never blocks the runner.
+    #[cfg(feature = "io")]
+    struct CollectSink {
+        tx: tokio::sync::mpsc::UnboundedSender<arrow_array::RecordBatch>,
+        schema: Arc<Schema>,
+    }
+
+    #[cfg(feature = "io")]
+    #[async_trait::async_trait]
+    impl crate::io::sink::Sink for CollectSink {
+        fn schema(&self) -> Arc<Schema> {
+            Arc::clone(&self.schema)
+        }
+
+        async fn write_batch(&mut self, batch: &arrow_array::RecordBatch) -> Result<(), PcsError> {
+            self.tx
+                .send(batch.clone())
+                .map_err(|e| PcsError::generic(format!("CollectSink: {e}")))
+        }
+
+        async fn finish(&mut self) -> Result<(), PcsError> {
+            Ok(())
+        }
+    }
+
     /// Each source batch is a separate end-to-end invocation: three one-row
     /// batches in, three transformed sink writes out, three system calls.
     #[cfg(feature = "io")]
@@ -929,8 +1132,6 @@ mod tests {
     async fn test_run_stream_processes_each_batch_individually() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::io::channel_sink::ChannelSink;
-        use crate::io::channel_source::ChannelSource;
         use crate::system::{SystemMeta, system_fn};
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -955,17 +1156,19 @@ mod tests {
             },
         ));
 
-        let (tx, source) = ChannelSource::new(ExecOrder::schema(), 4);
-        let (sink, mut rx) = ChannelSink::new(ExecOrder::schema(), 8);
+        let source = VecSource {
+            batches: (0..3u64)
+                .map(|i| one_order(i, (i as f64 + 1.0) * 10.0))
+                .collect(),
+            schema: ExecOrder::schema(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = CollectSink {
+            tx,
+            schema: ExecOrder::schema(),
+        };
         p.add_source("ExecOrder", source);
         p.add_sink("ExecOrder", sink);
-
-        for i in 0..3u64 {
-            tx.send(one_order(i, (i as f64 + 1.0) * 10.0))
-                .await
-                .unwrap();
-        }
-        drop(tx); // EOF
 
         let stats = p.run_stream().await.unwrap();
 
@@ -1001,7 +1204,10 @@ mod tests {
     #[cfg(feature = "io")]
     #[tokio::test]
     async fn test_run_stream_requires_exactly_one_source() {
-        use crate::io::channel_source::ChannelSource;
+        let empty = || VecSource {
+            batches: std::collections::VecDeque::new(),
+            schema: ExecOrder::schema(),
+        };
 
         let mut none = Pipeline::new("no-source");
         none.data.register_component::<ExecOrder>().unwrap();
@@ -1013,10 +1219,8 @@ mod tests {
 
         let mut two = Pipeline::new("two-sources");
         two.data.register_component::<ExecOrder>().unwrap();
-        let (_tx_a, a) = ChannelSource::new(ExecOrder::schema(), 1);
-        let (_tx_b, b) = ChannelSource::new(ExecOrder::schema(), 1);
-        two.add_source("ExecOrder", a);
-        two.add_source("ExecOrder", b);
+        two.add_source("ExecOrder", empty());
+        two.add_source("ExecOrder", empty());
         let err = two.run_stream().await.unwrap_err().to_string();
         assert!(
             err.contains("run_stream requires exactly one source; 2 configured"),

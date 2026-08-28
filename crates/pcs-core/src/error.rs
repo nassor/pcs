@@ -21,8 +21,9 @@
 /// Each variant carries enough context to say what happened; the table in the
 /// [module docs](self) maps every variant to its cause and remedy.
 ///
-/// `From` impls exist for `&str`, `String`, `std::io::Error`, and
-/// `Box<dyn std::error::Error>`, so `?` works against those sources directly.
+/// `From` impls exist for `&str`, `String`, `std::io::Error`,
+/// `arrow_schema::ArrowError`, and `Box<dyn std::error::Error>`, so `?` works
+/// against those sources directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PcsError {
     /// Failure inside a system's own processing logic.
@@ -233,6 +234,19 @@ impl From<std::io::Error> for PcsError {
     }
 }
 
+/// Arrow's own error type, so `?` propagates a schema, cast or IPC failure
+/// straight into a [`PcsError`].
+///
+/// Every Arrow call a system makes — `RecordBatch::try_new`, `Schema::index_of`,
+/// a cast, an IPC read — returns this, and wrapping each one in
+/// `.map_err(|e| PcsError::generic(format!(...)))` is the same closure written
+/// once per call site.
+impl From<arrow_schema::ArrowError> for PcsError {
+    fn from(err: arrow_schema::ArrowError) -> Self {
+        PcsError::Generic(format!("Arrow error: {err}"))
+    }
+}
+
 /// `Result` alias with [`PcsError`] as the error type.
 pub type PcsResult<TState> = Result<TState, PcsError>;
 
@@ -408,5 +422,36 @@ mod tests {
         let c = PcsError::ResourceNotFound("Other".to_string());
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn an_arrow_error_converts_into_a_generic_pcs_error() {
+        let err: PcsError =
+            arrow_schema::ArrowError::SchemaError("field 'settlement' not found".to_string())
+                .into();
+        assert_eq!(err.category(), "generic");
+        assert!(
+            err.message().contains("field 'settlement' not found"),
+            "the Arrow message must survive: {err}"
+        );
+    }
+
+    #[test]
+    fn an_arrow_error_propagates_with_the_question_mark_operator() {
+        fn index_of(name: &str) -> PcsResult<usize> {
+            let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]);
+            Ok(schema.index_of(name)?)
+        }
+        assert_eq!(index_of("id").unwrap(), 0);
+        assert!(
+            index_of("missing")
+                .unwrap_err()
+                .message()
+                .contains("missing")
+        );
     }
 }

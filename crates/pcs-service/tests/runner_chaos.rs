@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 fn temp_db(dir: &TempDir) -> RedbSharedStore {
-    let path = dir.path().join(format!("{}.db", Uuid::new_v4()));
+    let path = dir.path().join(format!("{}.db", Uuid::now_v7()));
     RedbSharedStore::single_node(&path).expect("open db")
 }
 

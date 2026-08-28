@@ -1,24 +1,24 @@
-//! Drives the six-language guest chain in `examples/polyglot/` through the real
+//! Drives the six-language processor chain in `examples/polyglot/` through the real
 //! host (`WasmPipelineRuntime`).
 //!
 //! Six WebAssembly components (Go, Python, TypeScript, Kotlin, C#, Rust) export
-//! the same `pcs:pipeline@0.2.0` world, and each writes a different column of
+//! the same `pcs:pipeline@0.3.0` world, and each writes a different column of
 //! the same `Order` component. Running them in order and asserting every stage's
 //! exact values pins a codec failure to a named column instead of a byte diff.
-//! Five of the six guests share the `pcs-arrow-ipc` codec, standard library only
-//! in every language, mutating fixed-width value bytes in place; these
-//! assertions are the only automated check that they still agree with arrow-rs.
+//! Five of the six processors share one Arrow codec, carried inside each
+//! language's `pcs-sdk` package and standard library only; these assertions are
+//! the only automated check that they still agree with arrow-rs.
 //!
 //! # Soft skip
 //!
 //! Building the components needs Go, Python, Node, Kotlin and .NET toolchains,
 //! and the default `test` CI job installs none of the five non-Rust ones. A
 //! missing `examples/polyglot/build/` therefore prints `SKIP:` and passes. The
-//! dedicated `Polyglot Guests` CI job installs all six toolchains and runs
-//! `scripts/build-polyglot.sh` first.
+//! dedicated `Polyglot Processors` CI job installs all six toolchains and runs
+//! `cargo xtask polyglot` first.
 //!
 //! ```bash
-//! bash scripts/build-polyglot.sh
+//! cargo xtask polyglot
 //! cargo test -p pcs-service --features wasm --test polyglot_chain -- --nocapture
 //! ```
 
@@ -26,23 +26,25 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use arrow_schema::{DataType, Field, Schema};
 use pcs_core::runtime::PipelineRuntime;
-use pcs_polyglot_order::{Order, fixture_rows};
+use pcs_service::component::Component;
 use pcs_service::dataset::Dataset;
 use pcs_service::wasm::{WasmEngine, WasmPipelineRuntime};
 
 /// Absolute tolerance for float comparisons: `100.0 * 1.10` is not exactly
-/// `110.0` in f64, and the value passes through four more guest runtimes after
+/// `110.0` in f64, and the value passes through four more processor runtimes after
 /// the Python stage computes it.
 const EPS: f64 = 1e-6;
 
-/// Rows in `pcs_polyglot_order::fixture_rows()`. Every stage is a pure column
-/// rewrite, so the count is invariant across the chain.
+/// Rows in the fixture every stage is a pure column rewrite over, so the count
+/// is invariant across the chain.
 const ROWS: usize = 6;
 
 /// 100 epoch ticks of 100 ms: the same 10 s per-call budget the service loader
-/// grants. The Python guest re-initialises CPython on every `run-batch` because
+/// grants. The Python processor re-initialises CPython on every `run-batch` because
 /// the host builds a fresh `Store` per call, so the budget is tighter than it looks.
 const EPOCH_TICKS: u64 = 100;
 
@@ -96,6 +98,84 @@ const BATCH_SETTLED_COUNT: i64 = 2;
 /// `110.0 - 1.32 = 108.68`, id 3 gives `6800.0 - 54.4 = 6745.6`.
 const BATCH_SETTLED_USD: f64 = 6_854.28;
 
+/// One order, in the shape every polyglot stage reads and writes. Field order
+/// is load-bearing: it feeds the schema fingerprint and the buffer walk the
+/// SDK codecs perform. This is the test's own copy of the row type
+/// (the shared `pcs_polyglot_order` crate no longer exists); the fingerprint
+/// agreement check below is what pins it to the six stages' schemas.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct Order {
+    id: i64,
+    region: String,
+    currency: String,
+    amount: f64,
+    valid: bool,
+    usd_amount: f64,
+    usd_amount_display: String,
+    risk_score: f64,
+    flagged: bool,
+    fee: f64,
+    review_tier: i64,
+    settlement: String,
+}
+
+impl Component for Order {
+    fn name() -> &'static str {
+        "Order"
+    }
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("valid", DataType::Boolean, false),
+            Field::new("usd_amount", DataType::Float64, false),
+            Field::new("usd_amount_display", DataType::Utf8, false),
+            Field::new("risk_score", DataType::Float64, false),
+            Field::new("flagged", DataType::Boolean, false),
+            Field::new("fee", DataType::Float64, false),
+            Field::new("review_tier", DataType::Int64, false),
+            Field::new("settlement", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl Order {
+    fn seed(id: i64, region: &str, currency: &str, amount: f64) -> Self {
+        Self {
+            id,
+            region: region.to_string(),
+            currency: currency.to_string(),
+            amount,
+            valid: false,
+            usd_amount: 0.0,
+            usd_amount_display: String::new(),
+            risk_score: 0.0,
+            flagged: false,
+            fee: 0.0,
+            review_tier: 0,
+            settlement: String::new(),
+        }
+    }
+}
+
+/// The six-row fixture every polyglot verification path uses. The rows are
+/// chosen so every branch of every stage fires once: two rows fail validation,
+/// one is flagged and escalated, one lands in manual review, and two settle
+/// from different regions at different fee rates.
+fn fixture_rows() -> Vec<Order> {
+    vec![
+        Order::seed(1, "emea", "EUR", 100.0),
+        Order::seed(2, "emea", "GBP", -5.0),
+        Order::seed(3, "apac", "JPY", 1_000_000.0),
+        Order::seed(4, "amer", "USD", 60_000.0),
+        Order::seed(5, "emea", "EUR", 0.0),
+        Order::seed(6, "apac", "USD", 20_000.0),
+    ]
+}
+
 /// Resolves the build directory the way the driver example does, so
 /// `PCS_POLYGLOT_BUILD_DIR` redirects both at a scratch tree.
 fn build_dir() -> PathBuf {
@@ -120,16 +200,6 @@ fn order_dataset() -> Dataset {
     dataset
 }
 
-/// The fingerprint the host sees in every stage's descriptor, derived from
-/// `pcs_polyglot_order::Order` rather than hardcoded.
-fn expected_fingerprint() -> String {
-    let mut dataset = Dataset::new();
-    dataset
-        .register_component::<Order>()
-        .expect("register Order");
-    format!("{:08x}", dataset.schemas().fingerprint())
-}
-
 fn load_stages() -> Option<Vec<(&'static str, WasmPipelineRuntime)>> {
     let dir = build_dir();
     let missing: Vec<&str> = STAGES
@@ -139,7 +209,7 @@ fn load_stages() -> Option<Vec<(&'static str, WasmPipelineRuntime)>> {
         .collect();
     if !missing.is_empty() {
         println!(
-            "SKIP: polyglot components not built (run scripts/build-polyglot.sh) — \
+            "SKIP: polyglot components not built (run cargo xtask polyglot) — \
              the default CI `test` job installs none of the five non-Rust toolchains — \
              missing {missing:?} under {}",
             dir.display()
@@ -201,9 +271,10 @@ fn assert_floats(label: &str, actual: &[f64], expected: &[f64]) {
     }
 }
 
-/// Assert every column of the chain's output. The only column Rust wrote is
-/// `settlement`; `valid` came from Go, `usd_amount` from Python, `risk_score`
-/// and `flagged` from TypeScript, `fee` from Kotlin, and `review_tier` from C#.
+/// Assert every column of the chain's output. `valid` came from Go,
+/// `usd_amount`/`usd_amount_display` from Python, `risk_score` and `flagged`
+/// from TypeScript, `fee` from Kotlin, `review_tier` from C#, and `settlement`
+/// from Rust.
 fn assert_chain_output(dataset: &Dataset) {
     let orders = dataset.view::<Order>().expect("Order view");
     assert_eq!(orders.len(), ROWS, "row count survived the chain");
@@ -244,7 +315,7 @@ fn assert_chain_output(dataset: &Dataset) {
     assert_eq!(
         valid,
         [true, false, true, true, false, true],
-        "`valid` is written by the Go guest"
+        "`valid` is written by the Go processor"
     );
 
     // Python: usd_amount = valid ? amount * fx(currency) : 0. USD is 1.0.
@@ -252,9 +323,26 @@ fn assert_chain_output(dataset: &Dataset) {
         .map(|i| orders.f64("usd_amount").unwrap().value(i))
         .collect();
     assert_floats(
-        "usd_amount (Python guest)",
+        "usd_amount (Python processor)",
         &usd,
         &[110.0, 0.0, 6_800.0, 60_000.0, 0.0, 20_000.0],
+    );
+
+    // Python: usd_amount_display = valid ? "<usd_amount:.2f> USD" : "".
+    let display: Vec<&str> = (0..ROWS)
+        .map(|i| orders.str("usd_amount_display").unwrap().value(i))
+        .collect();
+    assert_eq!(
+        display,
+        [
+            "110.00 USD",
+            "",
+            "6800.00 USD",
+            "60000.00 USD",
+            "",
+            "20000.00 USD",
+        ],
+        "`usd_amount_display` is written by the Python processor"
     );
 
     // TypeScript: risk_score = usd_amount / risk_threshold, flagged = risk >= 1.
@@ -262,7 +350,7 @@ fn assert_chain_output(dataset: &Dataset) {
         .map(|i| orders.f64("risk_score").unwrap().value(i))
         .collect();
     assert_floats(
-        "risk_score (TypeScript guest)",
+        "risk_score (TypeScript processor)",
         &risk,
         &[0.0022, 0.0, 0.136, 1.2, 0.0, 0.4],
     );
@@ -273,7 +361,7 @@ fn assert_chain_output(dataset: &Dataset) {
     assert_eq!(
         flagged,
         [false, false, false, true, false, false],
-        "`flagged` is written by the TypeScript guest"
+        "`flagged` is written by the TypeScript processor"
     );
 
     // Kotlin: fee = valid ? usd_amount * rate(region) : 0. Rates are 0.012
@@ -282,7 +370,7 @@ fn assert_chain_output(dataset: &Dataset) {
         .map(|i| orders.f64("fee").unwrap().value(i))
         .collect();
     assert_floats(
-        "fee (Kotlin guest)",
+        "fee (Kotlin processor)",
         &fee,
         &[1.32, 0.0, 54.4, 600.0, 0.0, 160.0],
     );
@@ -294,7 +382,7 @@ fn assert_chain_output(dataset: &Dataset) {
     assert_eq!(
         tier,
         [0, 0, 0, 2, 0, 1],
-        "`review_tier` is written by the C# guest"
+        "`review_tier` is written by the C# processor"
     );
 
     // Rust: !valid -> REJECTED, tier 2 -> HOLD, tier 1 -> REVIEW, else SETTLED.
@@ -306,11 +394,11 @@ fn assert_chain_output(dataset: &Dataset) {
         [
             "SETTLED", "REJECTED", "SETTLED", "HOLD", "REJECTED", "REVIEW"
         ],
-        "`settlement` is written by the Rust guest"
+        "`settlement` is written by the Rust processor"
     );
 }
 
-/// The whole chain in one test: the six `describe()` contracts, the eleven
+/// The whole chain in one test: the six `describe()` contracts, the twelve
 /// output columns, and the ledger accumulating over two batches. Splitting it
 /// would recompile and re-instantiate six components per assertion group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -319,25 +407,32 @@ async fn six_language_chain_produces_exact_values() {
         return;
     };
 
-    let fingerprint = expected_fingerprint();
-    for (name, runtime) in &stages {
-        let descriptor = runtime.describe().expect("describe()");
+    // There is no canonical fingerprint anymore: every stage derives its schema
+    // from its own native declaration. What must hold is that all six agree
+    // with each other.
+    let fingerprints: Vec<String> = stages
+        .iter()
+        .map(|(name, runtime)| {
+            let descriptor = runtime.describe().expect("describe()");
+            assert_eq!(
+                runtime.declared_components(),
+                ["Order"],
+                "{name} must declare exactly the Order component"
+            );
+            assert_eq!(
+                descriptor.stateful,
+                *name == STATEFUL_STAGE,
+                "{name}: only {STATEFUL_STAGE} keeps state across batches"
+            );
+            descriptor.schema_fingerprint
+        })
+        .collect();
+    for ((name, _), fingerprint) in stages.iter().zip(&fingerprints).skip(1) {
         assert_eq!(
-            descriptor.schema_fingerprint, fingerprint,
-            "{name} reports a schema fingerprint that disagrees with \
-             pcs_polyglot_order::Order — the generated constants have drifted, \
-             re-run `cargo run -p pcs-service --features wasm \
-             --example polyglot_orders -- emit` and rebuild"
-        );
-        assert_eq!(
-            runtime.declared_components(),
-            ["Order"],
-            "{name} must declare exactly the Order component"
-        );
-        assert_eq!(
-            descriptor.stateful,
-            *name == STATEFUL_STAGE,
-            "{name}: only {STATEFUL_STAGE} keeps state across batches"
+            fingerprint, &fingerprints[0],
+            "{name} reports a schema fingerprint that disagrees with the other \
+             five stages — the six independently-authored Order schemas must be \
+             structurally identical"
         );
     }
 
@@ -372,7 +467,7 @@ async fn six_language_chain_produces_exact_values() {
     );
 
     // The host builds a fresh wasmtime Store per call, so the checkpoint blob is
-    // the only channel for guest state: doubled totals prove it round-tripped.
+    // the only channel for processor state: doubled totals prove it round-tripped.
     let mut dataset2 = order_dataset();
     let mut checkpoint2: Option<Vec<u8>> = None;
     for (name, runtime) in &stages {

@@ -296,8 +296,8 @@ pub(crate) mod raft_impl {
                 .unwrap();
             }
 
-            let claim_id = uuid::Uuid::new_v4();
-            let inst = uuid::Uuid::new_v4();
+            let claim_id = uuid::Uuid::now_v7();
+            let inst = uuid::Uuid::now_v7();
             apply(
                 &db,
                 ConsensusCommand::ClaimRowRange {

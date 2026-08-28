@@ -1,8 +1,10 @@
 //! [`Dataset`]: the Arrow-backed columnar data container.
 //!
 //! `Dataset` stores data in Apache Arrow [`RecordBatch`]es, one per registered
-//! component type. All batches share the same row count, so a row index is
-//! valid across every component at once.
+//! component type. Components normally share the same row count, so a row
+//! index is valid across every component at once; a component may hold fewer
+//! rows than the dataset's row count when it is a *results* component, such as
+//! the reduced output of a windowing processor.
 //!
 //! ## Design
 //!
@@ -60,8 +62,9 @@ pub(crate) fn intern_component_name(name: &str) -> &'static str {
 ///
 /// ## Invariant
 ///
-/// Every registered component's accumulated chunks have exactly `row_count`
-/// rows in total. The alive bitmap also has exactly `row_count` bits.
+/// Every registered component's accumulated chunks have at most `row_count`
+/// rows in total — a component may hold fewer when it is a results component,
+/// but never more. The alive bitmap has exactly `row_count` bits.
 pub struct Dataset {
     pub(crate) components: HashMap<&'static str, Vec<RecordBatch>>,
     merged_cache: RwLock<HashMap<&'static str, Box<RecordBatch>>>,
@@ -225,6 +228,7 @@ pub(crate) fn ipc_stream_to_batch<R: std::io::Read>(
 mod append;
 mod builder;
 mod chunks;
+mod forward;
 mod ipc;
 mod lifecycle;
 mod reads;

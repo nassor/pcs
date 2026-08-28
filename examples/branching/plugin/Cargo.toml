@@ -1,0 +1,17 @@
+[package]
+name = "branching-plugin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# A sample processor, not a library a downstream consumer would depend on.
+publish = false
+description = "Routing demo native plugin: decides per batch which branch link its output is delivered to."
+
+# A native plugin is a shared library exporting the pcs-plugin-abi C ABI.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcs-plugin = { path = "../../../crates/pcs-plugin" }
+serde = { workspace = true }

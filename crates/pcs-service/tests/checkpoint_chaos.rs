@@ -25,7 +25,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 fn temp_store(dir: &TempDir) -> RedbSharedStore {
-    let path = dir.path().join(format!("{}.db", Uuid::new_v4()));
+    let path = dir.path().join(format!("{}.db", Uuid::now_v7()));
     RedbSharedStore::single_node(&path).unwrap()
 }
 
@@ -183,14 +183,14 @@ async fn checkpoint_failure_integration_releases_not_acks() {
 
 /// Parquet load rejects a checkpoint file truncated mid-write, before the atomic
 /// rename landed.
-#[cfg(all(feature = "io", feature = "distributed"))]
+#[cfg(feature = "parquet-checkpoint")]
 #[tokio::test]
 async fn parquet_load_rejects_crashed_tmp_file() {
     use pcs_service::distributed::parquet_checkpoint::ParquetCheckpointStore;
 
     let dir = TempDir::new().unwrap();
     let store = ParquetCheckpointStore::new(dir.path()).unwrap();
-    let claim_id = Uuid::new_v4();
+    let claim_id = Uuid::now_v7();
 
     // Write a valid checkpoint to get the final path.
     let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(

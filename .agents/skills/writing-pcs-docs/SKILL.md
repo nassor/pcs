@@ -22,7 +22,7 @@ Three rules carry most of the weight:
 | `README.md` | the pitch and the first command | simplest, shortest |
 | `docs/content/*.md` (top level) | front matter only; prose sits in `docs/templates/<name>.html` | n/a |
 | `docs/templates/*.html` | the concept pages: dataset, systems, pipeline, service, ... | simple, worked examples |
-| `docs/content/{native,guests,operations,reference,benchmarks}/` | markdown pages with prose and inline SVG. A `template = "page.html"` page must open its body with its own `#` heading, because that template renders no title | simple, longer |
+| `docs/content/{native,processors,operations,reference,benchmarks}/` | markdown pages with prose and inline SVG. A `template = "page.html"` page must open its body with its own `#` heading, because that template renders no title | simple, longer |
 | `AGENTS.md` | the workspace map for agents | dense, terse |
 | `//!` and `///` | API reference | precise, example driven |
 
@@ -70,8 +70,8 @@ Use em dash, en dash and hyphen only when nothing else works.
 - **Em dash:** replace with a period, comma or colon. Target zero per page.
 - **En dash:** write ranges as words, "100k to 100M rows" not the dashed form.
 - **Hyphen:** keep identifiers (`wasm32-wasip2`, `pcs-service`) and existing compounds (field-level,
-  at-least-once, row-range). Do not coin new ones or stack three: "host to guest wire format", not
-  "host-to-guest-wire-format".
+  at-least-once, row-range). Do not coin new ones or stack three: "host to processor wire format", not
+  "host-to-processor-wire-format".
 
 The em dash in a template title block (`{% block title %}Systems — PCS{% endblock %}`) is the site
 title separator. Leave it.

@@ -21,7 +21,7 @@ canonical `Order` schema:
 cargo run -p pcs-service --features conformance --example conformance_vectors -- emit
 ```
 
-The generator is `crates/pcs-service/examples/conformance_vectors.rs`. It builds
+The generator is `examples/conformance/conformance_vectors.rs`. It builds
 a real `Dataset::write_ipc` stream and derives each malformed vector by editing
 those bytes in place. Nothing here is a hand-forged flatbuffer: a forged stream
 can drift from what arrow-rs actually emits, and then a codec that rejects it
@@ -99,7 +99,7 @@ Two rules in the reference are not codec rules, and no vector asserts them.
 
 **The `__alive` cross-check.** The reference makes a mismatch between a
 component's row count and the `__alive` length fatal *on the host side*. These
-codecs are guest-side: each one documents that it never parses `__alive`
+codecs are processor-side: each one documents that it never parses `__alive`
 content, and the host enforces the rule.
 
 **8-byte buffer alignment.** The reference states alignment as a property the

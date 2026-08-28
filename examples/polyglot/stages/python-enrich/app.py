@@ -1,13 +1,17 @@
-"""Stage 2 of the polyglot example: the **Python** guest.
+"""Stage 2 of the polyglot example: the **Python** processor.
 
 Reads `valid` (written by the Go stage), `currency` and `amount`, and writes
-`usd_amount`:
+`usd_amount` with its display string:
 
     usd_amount = amount * rate(currency)   when valid
     usd_amount = 0.0                       otherwise
 
 Rejected rows are zeroed rather than converted, so a row the validator dropped
-carries no misleading money downstream.
+carries no misleading money downstream. `usd_amount_display` is that number
+formatted, and it is the one `Utf8` column no in-place processor could write: a
+different string length moves the values buffer, the offsets buffer and the
+`Buffer` entries describing both. This stage re-encodes its whole segment
+through `pcs_sdk` instead of patching bytes, so the string costs it nothing.
 
 Exchange rates come from `pipeline.wasm.config` via `get-config`, falling back
 to the constants below when a key is absent. `USD` is the reporting currency
@@ -20,35 +24,31 @@ host creates a fresh wasmtime `Store` per `run-batch`, so the bundled CPython
 re-initialises every batch. That cost is why a hot inner loop belongs in the
 Rust or Go stage rather than here.
 
+Everything else a processor owes the WIT world — the descriptor, the schema
+bytes, the fingerprint, the Arrow decode and re-encode, the error mapping — is
+`pcs_sdk.processor`. The dataclass below *is* the component, and the decorators
+register it while componentize-py builds: that build imports this file once and
+snapshots the CPython heap, so the schema is derived at build time and the
+finished component starts with it in memory.
+
 Build (from this directory):
 
-    componentize-py -d ../../../../crates/pcs-guest/wit -w pcs-pipeline bindings .
-    componentize-py -d ../../../../crates/pcs-guest/wit -w pcs-pipeline componentize app \
-        -p . -p ../../../../packages/arrow-ipc-py/src -o enrich-py.wasm
+    componentize-py -d ../../../../crates/pcs-processor/wit -w pcs-pipeline bindings .
+    componentize-py -d ../../../../crates/pcs-processor/wit -w pcs-pipeline componentize app \
+        -p . -p ../../../../packages/pcs-sdk-py/src -o enrich-py.wasm
 
 No `--stub-wasi`: the bundled CPython needs the real WASI imports, which the
 host supplies through `wasmtime_wasi::p2::add_to_linker_sync`.
 
 componentize-py resolves imports at build time only, and from the directories
-named by `-p`, which is why the codec's `src` is on that list. Every import in
-this file is module level: a function-local import is a runtime `ImportError`
-inside the component, not a build failure.
+named by `-p`, which is why the SDK's `src` is on that
+list. Every import in this file is module level: a function-local import is a
+runtime `ImportError` inside the component, not a build failure.
 """
 
-import time
-from typing import Optional
+from dataclasses import dataclass
 
-from componentize_py_types import Err
-from wit_world import exports
-from wit_world.imports import types as wtypes
-from wit_world.imports.host_io import LogLevel, get_config, log, metric
-
-import pcs_arrow_ipc as arrow_ipc
-from schema_gen import ORDER_FINGERPRINT, ORDER_SCHEMA_IPC_BASE64
-
-_NAME = "polyglot-enrich-py"
-_VERSION = "0.1.0"
-_COMPONENT = "Order"
+import pcs_sdk
 
 #: Config key and fallback rate per currency the host may override.
 _RATES = {
@@ -60,97 +60,65 @@ _RATES = {
 #: Reporting currency, and the rate used for any code not listed above.
 _IDENTITY_RATE = 1.0
 
-#: Decoded once at module load: the descriptor bytes are the same every call.
-_ORDER_SCHEMA_IPC = arrow_ipc.decode_base64(ORDER_SCHEMA_IPC_BASE64)
+
+@pcs_sdk.component
+@dataclass
+class Order:
+    """The component all six stages of the example share.
+
+    Field order is the cross-language contract: it feeds the schema fingerprint
+    the host checks at load time and the buffer walk every SDK codec performs.
+    Each of the six stages declares this schema in its own
+    language, and the six-way fingerprint check the host runs at load time keeps
+    the declarations in agreement: a stage that drifts is refused.
+    """
+
+    id: int
+    region: str
+    currency: str
+    amount: float
+    valid: bool = False
+    usd_amount: float = 0.0
+    usd_amount_display: str = ""
+    risk_score: float = 0.0
+    flagged: bool = False
+    fee: float = 0.0
+    review_tier: int = 0
+    settlement: str = ""
 
 
-def _config_float(key, default):
-    """Read a numeric config value, rejecting one that will not parse."""
-    raw = get_config(key)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        raise ValueError("config {!r} is not a number: {!r}".format(key, raw)) from None
+def _rate(config, currency):
+    """This batch's rate for a currency: host config, then the fallback."""
+    entry = _RATES.get(currency)
+    if entry is None:
+        return _IDENTITY_RATE
+    key, default = entry
+    return config.float(key, default)
 
 
-def _rate_table():
-    """Currency -> rate for this batch, resolved against host config."""
-    table = {"USD": _IDENTITY_RATE}
-    for code, (key, default) in _RATES.items():
-        table[code] = _config_float(key, default)
-    return table
+@pcs_sdk.transform(Order)
+def enrich(row, config):
+    """Convert one order into USD, or zero a rejected one."""
+    if row.valid:
+        row.usd_amount = row.amount * _rate(config, row.currency)
+        row.usd_amount_display = f"{row.usd_amount:.2f} USD"
+    else:
+        row.usd_amount = 0.0
+        row.usd_amount_display = ""
 
 
-class Pipeline(exports.Pipeline):
-    """The `pcs:pipeline/pipeline` export."""
+@pcs_sdk.batch(Order)
+def report(rows, config):
+    """The batch's own numbers, reported once: `run-batch` is what the host measures."""
+    total = sum(row.usd_amount for row in rows)
+    converted = sum(1 for row in rows if row.valid)
+    config.metric("enrich.usd_total", total)
+    config.log(
+        "info",
+        "enrich",
+        f"converted {converted} of {len(rows)} rows, {total:.2f} USD total",
+    )
 
-    def describe(self) -> wtypes.PipelineDescriptor:
-        return wtypes.PipelineDescriptor(
-            name=_NAME,
-            version=_VERSION,
-            components=[
-                wtypes.ComponentDescriptor(
-                    name=_COMPONENT,
-                    arrow_schema_ipc=_ORDER_SCHEMA_IPC,
-                )
-            ],
-            stateful=False,
-            schema_fingerprint=ORDER_FINGERPRINT,
-        )
 
-    def run_batch(self, input: bytes, prior: Optional[bytes]) -> wtypes.RunResult:
-        started = time.monotonic_ns()
-        try:
-            stream = arrow_ipc.PcsStream(input)
-            orders = stream.component(_COMPONENT)
-            rows = orders.rows
-
-            valid = orders.bools("valid")
-            currency = orders.strings("currency")
-            amount = orders.float64s("amount")
-            rates = _rate_table()
-
-            total = 0.0
-            for row in range(rows):
-                if valid[row]:
-                    usd = amount[row] * rates.get(currency[row], _IDENTITY_RATE)
-                else:
-                    usd = 0.0
-                orders.set_float64("usd_amount", row, usd)
-                total += usd
-
-            metric("enrich.usd_total", total)
-            log(
-                LogLevel.INFO,
-                "enrich",
-                "converted {} of {} rows, {:.2f} USD total".format(
-                    sum(valid), rows, total
-                ),
-            )
-
-            return wtypes.RunResult(
-                output=stream.to_bytes(),
-                # Stateless: nothing to carry, so `prior` is ignored and the
-                # host stores no checkpoint for this stage.
-                checkpoint=None,
-                metrics=wtypes.RunMetrics(
-                    wall_ns=time.monotonic_ns() - started,
-                    rows_in=rows,
-                    rows_out=rows,
-                    systems_run=1,
-                    retries=0,
-                ),
-            )
-        except ValueError as exc:
-            # Malformed input or unusable config: replaying cannot help.
-            raise Err(wtypes.RunError_Permanent("{}: {}".format(_NAME, exc))) from exc
-        except Exception as exc:
-            # The WIT variant has no "unknown" arm, and `run-batch` must never
-            # emit `schema-mismatch`, so everything else collapses to permanent.
-            raise Err(
-                wtypes.RunError_Permanent(
-                    "{}: unexpected {}: {}".format(_NAME, type(exc).__name__, exc)
-                )
-            ) from exc
+#: The `pcs:pipeline/pipeline` export. componentize-py looks up this name.
+Pipeline = pcs_sdk.processor("polyglot-enrich-py", "0.1.0", enrich, report)

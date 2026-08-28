@@ -862,8 +862,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let cmd = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
         };
         let result = forward_proposal(&addr.to_string(), cmd).await;
         assert!(
@@ -898,8 +898,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let cmd = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
         };
         let result = forward_proposal(&addr.to_string(), cmd).await;
         assert!(result.is_err(), "expected error from leader error response");
@@ -917,8 +917,8 @@ mod tests {
 
         // Port 1 is never listening.
         let cmd = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
         };
         let result = forward_proposal("127.0.0.1:1", cmd).await;
         assert!(

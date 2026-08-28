@@ -5,7 +5,7 @@
 //! It reads the `.wasm` bytes through a [`ModuleResolver`], verifies the
 //! optional digest before JIT compilation, compiles and instantiates the
 //! component via [`WasmPipelineRuntime::from_bytes`], then calls `describe()`
-//! eagerly to warm the component-name cache and surface guest errors at
+//! eagerly to warm the component-name cache and surface processor errors at
 //! startup rather than at the first batch.
 
 use std::collections::HashMap;
@@ -92,9 +92,12 @@ impl ModuleResolver for LocalModuleResolver {
 /// let resolver = LocalModuleResolver::with_base_dir("/opt/pcs/pipelines");
 /// let loader = PipelineRuntimeLoader::new(engine, resolver);
 ///
-/// // WasmSpec comes from ServiceConfig::pipeline.wasm (deserialized from TOML).
-/// # let spec = WasmSpec { module: "transform.wasm".into(), sha3_256: None,
-/// #     config: Default::default() };
+/// // WasmSpec comes from a declared workflow's `wasm` list (deserialized from config).
+/// # let spec = WasmSpec { id: "my-pipeline".into(), name: None,
+/// #     module: Some("transform.wasm".into()), sha3_256: None,
+/// #     config: Default::default(),
+/// #     #[cfg(feature = "windows")]
+/// #     window: None };
 /// let runtime = loader.load("my-pipeline", &spec).unwrap();
 /// # }
 /// ```
@@ -132,10 +135,16 @@ impl<R: ModuleResolver> PipelineRuntimeLoader<R> {
     /// # Errors
     ///
     /// Returns [`PcsError::Configuration`] for IO / digest / compile failures.
-    /// Returns [`PcsError::SystemExecution`] if the guest's `describe()` call
+    /// Returns [`PcsError::SystemExecution`] if the processor's `describe()` call
     /// fails on the first instantiation.
     pub fn load(&self, pipeline_name: &str, spec: &WasmSpec) -> PcsResult<WasmPipelineRuntime> {
-        let bytes = self.resolver.resolve(&spec.module)?;
+        let module = spec.module.as_deref().ok_or_else(|| {
+            PcsError::configuration(format!(
+                "wasm node '{pipeline_name}' declares no 'module'; supply a runtime through \
+                 ServiceBuilder::with_runtime instead"
+            ))
+        })?;
+        let bytes = self.resolver.resolve(module)?;
 
         if let Some(ref expected) = spec.sha3_256 {
             verify_sha3_256("wasm module", &bytes, expected)?;
@@ -151,12 +160,9 @@ impl<R: ModuleResolver> PipelineRuntimeLoader<R> {
         )?;
 
         // describe() eagerly, to populate the component-name cache and surface
-        // guest errors at startup.
+        // processor errors at startup.
         runtime.describe().map_err(|e| {
-            PcsError::configuration(format!(
-                "wasm module '{}' describe() failed: {e}",
-                spec.module
-            ))
+            PcsError::configuration(format!("wasm module '{module}' describe() failed: {e}"))
         })?;
 
         Ok(runtime)
@@ -195,13 +201,39 @@ mod tests {
         let engine = WasmEngine::new().expect("engine");
         let loader = PipelineRuntimeLoader::new(engine, FailingResolver);
         let spec = WasmSpec {
-            module: "missing.wasm".to_string(),
+            id: "test".to_string(),
+            name: None,
+            module: Some("missing.wasm".to_string()),
             sha3_256: None,
             config: HashMap::new(),
+            #[cfg(feature = "windows")]
+            window: None,
         };
         let err = loader.load("test", &spec).err().expect("expected error");
         assert!(
             err.to_string().contains("simulated IO failure"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_module_declared_is_a_configuration_error() {
+        let engine = WasmEngine::new().expect("engine");
+        let loader = PipelineRuntimeLoader::new(engine, FailingResolver);
+        let spec = WasmSpec {
+            id: "p".to_string(),
+            name: None,
+            module: None,
+            sha3_256: None,
+            config: HashMap::new(),
+            #[cfg(feature = "windows")]
+            window: None,
+        };
+        let err = loader.load("p", &spec).err().expect("expected error");
+        assert_eq!(err.category(), "configuration");
+        assert!(err.to_string().contains("'p'"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("with_runtime"),
             "unexpected error: {err}"
         );
     }
@@ -212,9 +244,13 @@ mod tests {
         let loader =
             PipelineRuntimeLoader::new(engine, InMemoryResolver::new(b"not-wasm".to_vec()));
         let spec = WasmSpec {
-            module: "bad.wasm".to_string(),
+            id: "test".to_string(),
+            name: None,
+            module: Some("bad.wasm".to_string()),
             sha3_256: None,
             config: HashMap::new(),
+            #[cfg(feature = "windows")]
+            window: None,
         };
         let err = loader.load("test", &spec).err().expect("expected error");
         assert!(

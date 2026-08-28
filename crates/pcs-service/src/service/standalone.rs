@@ -1,16 +1,28 @@
 //! Standalone runner for [`BuiltService`].
 //!
 //! [`run_standalone`] drives a [`BuiltService`] through repeated processing
-//! iterations in a single process with no distributed coordination. It handles
-//! cancellation, transient source and sink errors, and run-mode pacing
-//! (one-shot, continuous, or interval-based).
+//! iterations in a single process with no distributed coordination, walking
+//! every declared node in topological order each pass. It handles
+//! cancellation, transient per-node errors, and run-mode pacing (one-shot,
+//! continuous, or interval-based).
 //!
 //! ## Store-per-call semantics (WASM runtimes)
 //!
 //! With a `WasmPipelineRuntime`, every `run_on` call creates a fresh wasmtime
-//! `Store` and resets guest linear memory. In-guest state that must survive
+//! `Store` and resets processor linear memory. In-processor state that must survive
 //! iterations (accumulators, window buffers, caches) has to be round-tripped
 //! through the host with `snapshot`/`restore`, or it is silently lost.
+//!
+//! ## One trace per iteration
+//!
+//! Each iteration opens a `workflow.batch` root span holding one `source.drain`
+//! per source, one `runtime.run` per processor, and one `sink.write` per sink,
+//! in topological order. The span closes before run-mode pacing, so its
+//! duration is the iteration and not the wait after it. `runtime.run` is the
+//! contextual parent of whatever the runtime opens: `pipeline.run` for a
+//! native [`Pipeline`](pcs_core::Pipeline), `processor.batch` for a WASM
+//! processor or a native plugin. That tree is the only host-side view of a
+//! pipeline whose systems run inside a guest.
 //!
 //! ## Example
 //!
@@ -19,7 +31,7 @@
 //! # {
 //! use tokio_util::sync::CancellationToken;
 //! use pcs_service::service::standalone::{run_standalone, StandaloneStats};
-//! // Build a BuiltService (via ServiceBuilder::build) then:
+//! // Build a BuiltService (via ServiceBuilder::build_all) then:
 //! // let stats = run_standalone(built, &config, cancel).await?;
 //! # }
 //! ```
@@ -27,16 +39,56 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow_array::RecordBatch;
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "tracing")]
+use tracing::Instrument as _;
 
 use crate::dataset::Dataset;
 use crate::error::PcsError;
-use crate::io::sink::drain_dataset;
-use crate::io::source::drain_into_dataset;
+use pcs_core::io::sink::Sink;
+use pcs_core::io::source::Source;
+use pcs_core::runtime::PipelineRuntime;
 
-use super::builder::{BuiltService, BuiltSink};
+use super::builder::{BuiltNodeKind, BuiltService};
 use super::config::{RunMode, ServiceConfig, ServiceMode};
+#[cfg(feature = "windows")]
+use super::windowing::WindowTracker;
+
+/// Which of the three roles a node plays while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeRunKind {
+    Source,
+    Processor,
+    Sink,
+}
+
+impl NodeRunKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeRunKind::Source => "source",
+            NodeRunKind::Processor => "processor",
+            NodeRunKind::Sink => "sink",
+        }
+    }
+}
+
+/// Cumulative counters for one workflow node, across every iteration.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct NodeRunStats {
+    /// The node's declared id.
+    pub id: String,
+    /// `"source"`, `"processor"` or `"sink"`.
+    pub kind: String,
+    /// Rows this node produced (source, processor) or wrote (sink).
+    pub rows: u64,
+    /// Non-empty batches this node produced, ran, or wrote.
+    pub batches: u64,
+    /// Errors this node raised.
+    pub errors: u64,
+}
 
 /// Diagnostic counters accumulated over a [`run_standalone`] call.
 ///
@@ -52,7 +104,7 @@ pub struct StandaloneStats {
     pub rows_processed: u64,
     /// Total number of sink drain calls that wrote at least one row.
     pub sink_batches_written: u64,
-    /// Count of non-fatal errors (source, scheduler, or sink failures).
+    /// Count of non-fatal errors (source, processor, or sink failures).
     pub iteration_errors: u64,
     /// Wall-clock time from the first iteration to the last, in milliseconds.
     pub total_duration_ms: u64,
@@ -62,14 +114,77 @@ pub struct StandaloneStats {
     /// Slowest single item, in microseconds. Stream mode only; the batch loop
     /// leaves this at 0.
     pub max_item_micros: u64,
+    /// Per-node breakdown of the flat counters above, one entry per declared
+    /// workflow node, in topological order.
+    pub nodes: Vec<NodeRunStats>,
 }
 
-/// Promote a `String` to a `&'static str` via `Box::leak`.
-///
-/// Appropriate for service-lifetime strings (component names). The leaked
-/// allocation lives until the process exits, which is fine for a service runner.
-pub(super) fn leak_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
+/// Write every batch staged for one sink, without finalising it.
+async fn write_staged(
+    sink: &mut dyn Sink,
+    staged: &mut Vec<RecordBatch>,
+    id: &str,
+    node_stat: &mut NodeRunStats,
+    stats: &mut StandaloneStats,
+) {
+    for batch in staged.drain(..) {
+        let rows = batch.num_rows() as u64;
+        match sink.write_batch(&batch).await {
+            Ok(()) => {
+                node_stat.rows += rows;
+                node_stat.batches += 1;
+                stats.sink_batches_written += 1;
+                crate::metrics::instruments().sink_batch(id);
+            }
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                tracing::error!(sink = id, error = %_e, "sink write error (continuing)");
+                stats.iteration_errors += 1;
+                node_stat.errors += 1;
+            }
+        }
+    }
+}
+
+/// Finalise one sink.
+async fn finish_sink(
+    sink: &mut dyn Sink,
+    id: &str,
+    node_stat: &mut NodeRunStats,
+    stats: &mut StandaloneStats,
+) {
+    if let Err(_e) = sink.finish().await {
+        #[cfg(feature = "tracing")]
+        tracing::error!(sink = id, error = %_e, "sink finish error");
+        stats.iteration_errors += 1;
+        node_stat.errors += 1;
+    }
+}
+
+/// Write and finalise every sink's staged output. Used both for a normal
+/// final iteration and for a cancellation that lands mid-pass, before the
+/// main loop reaches every sink node on its own.
+async fn flush_and_finish_all(
+    sinks: &mut [Option<Box<dyn Sink>>],
+    staged: &mut [Vec<RecordBatch>],
+    ids: &[String],
+    node_stats: &mut [NodeRunStats],
+    stats: &mut StandaloneStats,
+) {
+    for i in 0..sinks.len() {
+        let Some(sink) = sinks[i].as_mut() else {
+            continue;
+        };
+        write_staged(
+            sink.as_mut(),
+            &mut staged[i],
+            &ids[i],
+            &mut node_stats[i],
+            stats,
+        )
+        .await;
+        finish_sink(sink.as_mut(), &ids[i], &mut node_stats[i], stats).await;
+    }
 }
 
 /// Drive a [`BuiltService`] through repeated processing iterations.
@@ -78,16 +193,22 @@ pub(super) fn leak_str(s: String) -> &'static str {
 /// a clean exit. `Err` is reserved for unrecoverable conditions such as an
 /// internal invariant violation.
 ///
-/// Each iteration checks cancellation, drains every source into the dataset,
-/// calls `runtime.run_on`, drains the dataset into every sink, publishes stats
-/// to `live_stats` when it is `Some` so `GET /status` sees current progress,
-/// clears the dataset, then sleeps or exits according to [`RunMode`].
+/// Each iteration checks cancellation, then walks every declared node in
+/// topological order: a source drains into every downstream node, a processor
+/// runs and forwards its output, and a sink writes whatever was staged for it.
+/// Live stats publish to `live_stats` when it is `Some` so `GET /status` sees
+/// current progress, then the run paces or exits according to [`RunMode`].
 ///
 /// ## Error policy
 ///
-/// - Source errors: log WARN, increment `iteration_errors`, continue.
-/// - Runtime errors: log ERROR, increment `iteration_errors`, still flush sinks.
+/// - Source errors: log WARN, increment `iteration_errors`, stop draining that
+///   source this iteration, continue to the next node.
+/// - Processor errors: log ERROR, increment `iteration_errors`, record
+///   `workflow_error`, skip its fan-out so a failed processor feeds nothing
+///   downstream, still clear its dataset, continue.
 /// - Sink errors: log ERROR, increment `iteration_errors`, continue.
+/// - A `forward_into` or `append_record_batch` fan-out error: log WARN naming
+///   both node ids, increment `iteration_errors`, continue.
 pub async fn run_standalone(
     built: BuiltService,
     config: &ServiceConfig,
@@ -103,160 +224,455 @@ pub async fn run_standalone(
         }
     };
 
-    // Stream mode is a different loop shape entirely: one pipeline invocation
+    // Stream mode is a different loop shape entirely: one workflow invocation
     // per arriving batch, no inter-item pacing.
     if run_mode == RunMode::Stream {
         return super::stream::run_stream(built, cancel, live_stats).await;
     }
 
-    // Destructuring keeps runtime, sources, and sinks in separate bindings:
-    // `run_on` takes `&self` while the dataset is borrowed mutably.
     let BuiltService {
-        runtime,
-        mut sources,
-        mut sinks,
-        registry: _,
+        workflow_id, nodes, ..
     } = built;
+    let n = nodes.len();
 
-    let mut dataset = runtime.template_dataset();
+    // Parallel per-node vectors, so the borrow checker sees disjoint fields
+    // rather than one `Vec` of trait objects being indexed twice: `runtimes`
+    // and `datasets` are different fields, so a processor step borrows them
+    // disjointly, and `datasets.split_at_mut(i + 1)` gives a processor's own
+    // dataset and a downstream one as two non-overlapping slices.
+    let mut ids: Vec<String> = Vec::with_capacity(n);
+    let mut components: Vec<Option<&'static str>> = Vec::with_capacity(n);
+    let mut downstream: Vec<Vec<crate::service::builder::BuiltEdge>> = Vec::with_capacity(n);
+    let mut kinds: Vec<NodeRunKind> = Vec::with_capacity(n);
+    let mut sources: Vec<Option<Box<dyn Source>>> = Vec::with_capacity(n);
+    let mut runtimes: Vec<Option<Box<dyn PipelineRuntime>>> = Vec::with_capacity(n);
+    let mut datasets: Vec<Option<Dataset>> = Vec::with_capacity(n);
+    let mut sinks: Vec<Option<Box<dyn Sink>>> = Vec::with_capacity(n);
+    let mut node_stats: Vec<NodeRunStats> = Vec::with_capacity(n);
+    // One watermark tracker per windowed processor node; `None` everywhere
+    // else. The tracker survives across iterations, so the watermark is
+    // monotonic over the whole run, exactly like the guest-side state a
+    // windowed processor keeps in its checkpoint blob.
+    #[cfg(feature = "windows")]
+    let mut trackers: Vec<Option<WindowTracker>> = Vec::with_capacity(n);
 
-    // Promote component name strings to `&'static str` once at startup.
-    let source_component_names: Vec<&'static str> = sources
-        .iter()
-        .map(|s| leak_str(s.target_component.clone()))
-        .collect();
+    for node in nodes {
+        ids.push(node.id);
+        components.push(node.component);
+        downstream.push(node.downstream);
+        #[cfg(feature = "windows")]
+        trackers.push(node.window.map(WindowTracker::new));
 
-    let sink_component_names: Vec<&'static str> = sinks
-        .iter()
-        .map(|s| leak_str(s.source_component.clone()))
-        .collect();
+        let (kind, source, runtime, dataset, sink) = match node.kind {
+            BuiltNodeKind::Source(source) => (NodeRunKind::Source, Some(source), None, None, None),
+            BuiltNodeKind::Processor { runtime, .. } => {
+                let dataset = runtime.template_dataset();
+                (
+                    NodeRunKind::Processor,
+                    None,
+                    Some(runtime),
+                    Some(dataset),
+                    None,
+                )
+            }
+            BuiltNodeKind::Sink(sink) => (NodeRunKind::Sink, None, None, None, Some(sink)),
+        };
+        kinds.push(kind);
+        sources.push(source);
+        runtimes.push(runtime);
+        datasets.push(dataset);
+        sinks.push(sink);
+        node_stats.push(NodeRunStats {
+            id: ids.last().expect("just pushed").clone(),
+            kind: kind.as_str().to_string(),
+            rows: 0,
+            batches: 0,
+            errors: 0,
+        });
+    }
+
+    let mut staged: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
 
     let mut stats = StandaloneStats::default();
     let start = Instant::now();
 
     #[cfg(feature = "tracing")]
-    tracing::info!(mode = ?run_mode, "standalone runner starting");
+    tracing::info!(workflow = %workflow_id, mode = ?run_mode, "standalone runner starting");
+    #[cfg(not(feature = "tracing"))]
+    let _ = &workflow_id;
 
     loop {
+        // One root span per iteration, which is the trace the dashboard draws.
+        // Children name it as their explicit parent instead of entering it: the
+        // loop awaits, and an entered guard held across an await would adopt
+        // every span the runtime opens on this thread meanwhile.
+        #[cfg(feature = "tracing")]
+        let batch_span = tracing::info_span!(
+            "workflow.batch",
+            workflow = %workflow_id,
+            iteration = stats.iterations + 1,
+            rows = tracing::field::Empty
+        );
+
         if cancel.is_cancelled() {
             #[cfg(feature = "tracing")]
-            tracing::info!("standalone runner cancelled, draining in-flight work");
-            flush_sinks(
-                &dataset,
-                &mut sinks,
-                &sink_component_names,
-                &mut stats,
-                true,
-            )
-            .await;
+            tracing::info!(parent: &batch_span, "standalone runner cancelled, draining in-flight work");
+            let flush =
+                flush_and_finish_all(&mut sinks, &mut staged, &ids, &mut node_stats, &mut stats);
+            #[cfg(feature = "tracing")]
+            flush.instrument(batch_span.clone()).await;
+            #[cfg(not(feature = "tracing"))]
+            flush.await;
             break;
         }
 
         let iter_start = Instant::now();
-
         #[cfg(feature = "tracing")]
-        tracing::info!(iteration = stats.iterations + 1, mode = ?run_mode, "iteration starting");
+        tracing::info!(parent: &batch_span, iteration = stats.iterations + 1, mode = ?run_mode, "iteration starting");
 
-        let mut source_error = false;
-        let mut cancelled_during_drain = false;
-        for i in 0..sources.len() {
-            let component_name = source_component_names[i];
-            let result = tokio::select! {
-                r = drain_into_dataset(sources[i].source.as_mut(), &mut dataset, component_name) => Some(r),
-                _ = cancel.cancelled() => None,
-            };
-            let result = match result {
-                None => {
-                    #[cfg(feature = "tracing")]
-                    tracing::info!("standalone runner cancelled during source drain");
-                    cancelled_during_drain = true;
-                    break;
-                }
-                Some(r) => r,
-            };
+        let mut total_rows_in: u64 = 0;
+        let mut cancelled_mid_pass = false;
 
-            match result {
-                Ok(rows) if rows > 0 => {
-                    stats.source_batches_drained += 1;
-                    stats.rows_processed += rows as u64;
-                }
-                Ok(_) => { /* empty drain, no-op */ }
-                Err(e) => {
+        for i in 0..n {
+            match kinds[i] {
+                NodeRunKind::Source => {
+                    let component =
+                        components[i].expect("a source node always declares a component");
                     #[cfg(feature = "tracing")]
-                    tracing::warn!(source_name = %sources[i].name, error = %e, "source drain error (continuing)");
+                    let drain_span = tracing::info_span!(
+                        parent: &batch_span,
+                        "source.drain",
+                        workflow = %workflow_id,
+                        source = %ids[i],
+                        component,
+                        rows = tracing::field::Empty
+                    );
+                    let mut source_rows: u64 = 0;
+
+                    loop {
+                        let source = sources[i].as_mut().expect("source node keeps its source");
+                        let next = tokio::select! {
+                            r = source.next_batch() => Some(r),
+                            _ = cancel.cancelled() => None,
+                        };
+                        let Some(result) = next else {
+                            #[cfg(feature = "tracing")]
+                            tracing::info!(parent: &batch_span, "standalone runner cancelled during source drain");
+                            cancelled_mid_pass = true;
+                            break;
+                        };
+                        match result {
+                            Ok(None) => break,
+                            Ok(Some(batch)) => {
+                                let rows = batch.num_rows() as u64;
+                                source_rows += rows;
+                                total_rows_in += rows;
+                                stats.source_batches_drained += 1;
+                                stats.rows_processed += rows;
+                                node_stats[i].rows += rows;
+                                node_stats[i].batches += 1;
+                                crate::metrics::instruments().source_batch(&ids[i]);
+                                crate::metrics::instruments().rows(&ids[i], rows);
+
+                                for edge in &downstream[i] {
+                                    let d = edge.node;
+                                    match kinds[d] {
+                                        NodeRunKind::Processor => {
+                                            if let Err(_e) = datasets[d]
+                                                .as_mut()
+                                                .expect("processor node keeps its dataset")
+                                                .append_record_batch(component, batch.clone())
+                                            {
+                                                #[cfg(feature = "tracing")]
+                                                tracing::warn!(
+                                                    parent: &batch_span,
+                                                    from = %ids[i], to = %ids[d], error = %_e,
+                                                    "fan-out append error (continuing)"
+                                                );
+                                                stats.iteration_errors += 1;
+                                            }
+                                        }
+                                        NodeRunKind::Sink => staged[d].push(batch.clone()),
+                                        NodeRunKind::Source => {
+                                            unreachable!("a source is never a link target")
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(parent: &batch_span, source = %ids[i], error = %_e, "source drain error (continuing)");
+                                stats.iteration_errors += 1;
+                                node_stats[i].errors += 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    #[cfg(feature = "tracing")]
+                    drain_span.record("rows", source_rows);
                     #[cfg(not(feature = "tracing"))]
-                    let _ = &e;
-                    stats.iteration_errors += 1;
-                    source_error = true;
+                    let _ = source_rows;
+
+                    if cancelled_mid_pass {
+                        break;
+                    }
+                }
+
+                NodeRunKind::Processor => {
+                    // The fan-in merge is complete once every upstream node has
+                    // run: sources appended their batches directly and upstream
+                    // processors forwarded their datasets. A windowed node's
+                    // watermark therefore advances from everything this
+                    // iteration delivered, before the runtime sees the batch.
+                    #[cfg(feature = "windows")]
+                    if let Some(tracker) = trackers[i].as_mut() {
+                        match tracker.advance_from(
+                            datasets[i]
+                                .as_ref()
+                                .expect("processor node keeps its dataset"),
+                        ) {
+                            Ok(()) => {
+                                let dataset = datasets[i]
+                                    .as_mut()
+                                    .expect("processor node keeps its dataset");
+                                dataset.insert_resource(pcs_core::windows::WindowWatermark(
+                                    tracker.watermark_ms(),
+                                ));
+                                if tracker.has_watermark() {
+                                    crate::metrics::instruments()
+                                        .window_watermark(&ids[i], tracker.watermark_seconds());
+                                }
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    parent: &batch_span,
+                                    processor = %ids[i],
+                                    error = %_e,
+                                    "window watermark advance error (continuing without it)"
+                                );
+                                #[cfg(not(feature = "tracing"))]
+                                let _ = _e;
+                                stats.iteration_errors += 1;
+                            }
+                        }
+                    }
+
+                    let rows_in = datasets[i]
+                        .as_ref()
+                        .expect("processor node keeps its dataset")
+                        .rows() as u64;
+                    // `runtime.run` is the seam the out-of-process runtimes hang
+                    // from: it is the contextual parent of a native pipeline's
+                    // `pipeline.run` and of a processor's host-side
+                    // `processor.batch`.
+                    #[cfg(feature = "tracing")]
+                    let run_span = tracing::info_span!(
+                        parent: &batch_span,
+                        "runtime.run",
+                        workflow = %workflow_id,
+                        processor = %ids[i],
+                        rows_in,
+                        rows_out = tracing::field::Empty
+                    );
+                    let runtime = runtimes[i]
+                        .as_ref()
+                        .expect("processor node keeps its runtime");
+                    let dataset = datasets[i]
+                        .as_mut()
+                        .expect("processor node keeps its dataset");
+                    let run = runtime.run_on_with_state_and_routes(dataset, None);
+                    #[cfg(feature = "tracing")]
+                    let run = run.instrument(run_span.clone());
+                    let run_result = tokio::select! {
+                        r = run => Some(r),
+                        _ = cancel.cancelled() => None,
+                    };
+
+                    let Some(run_result) = run_result else {
+                        #[cfg(feature = "tracing")]
+                        tracing::info!(parent: &batch_span, "standalone runner cancelled during runtime run");
+                        cancelled_mid_pass = true;
+                        break;
+                    };
+
+                    match run_result {
+                        Ok(out) => {
+                            let rows_out = datasets[i]
+                                .as_ref()
+                                .expect("processor node keeps its dataset")
+                                .rows() as u64;
+                            #[cfg(feature = "tracing")]
+                            run_span.record("rows_out", rows_out);
+                            #[cfg(not(feature = "tracing"))]
+                            let _ = rows_out;
+                            node_stats[i].rows += rows_out;
+                            node_stats[i].batches += 1;
+                            // `out.state` is discarded: the standalone runner
+                            // threads no state, and passing `None` as prior
+                            // keeps today's per-call fresh-Store behaviour.
+                            let _ = out.state;
+
+                            let routes = &out.routes;
+                            for name in routes.iter().flatten() {
+                                if !downstream[i]
+                                    .iter()
+                                    .any(|e| e.branch.as_deref() == Some(name.as_str()))
+                                {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::warn!(
+                                        parent: &batch_span,
+                                        processor = %ids[i],
+                                        branch = %name,
+                                        "routing decision names a branch no link carries (continuing)"
+                                    );
+                                    #[cfg(not(feature = "tracing"))]
+                                    let _ = name;
+                                }
+                            }
+
+                            for edge in &downstream[i] {
+                                let d = edge.node;
+                                if !crate::service::builder::edge_selected(routes, &edge.branch) {
+                                    continue;
+                                }
+                                if let Some(branch) = &edge.branch {
+                                    crate::metrics::instruments()
+                                        .processor_branch_rows(&ids[i], branch, rows_out);
+                                }
+                                match kinds[d] {
+                                    NodeRunKind::Processor => {
+                                        let (left, right) = datasets.split_at_mut(i + 1);
+                                        let src = left[i].as_ref().expect("processor dataset");
+                                        let dst = right[d - i - 1]
+                                            .as_mut()
+                                            .expect("downstream processor dataset");
+                                        if let Err(_e) = src.forward_into(dst) {
+                                            #[cfg(feature = "tracing")]
+                                            tracing::warn!(
+                                                parent: &batch_span,
+                                                from = %ids[i], to = %ids[d], error = %_e,
+                                                "fan-out forward error (continuing)"
+                                            );
+                                            stats.iteration_errors += 1;
+                                        }
+                                    }
+                                    NodeRunKind::Sink => {
+                                        let component = components[d]
+                                            .expect("a sink node always declares a component");
+                                        if let Some(batch) = datasets[i]
+                                            .as_ref()
+                                            .expect("processor dataset")
+                                            .batch_for(component)
+                                            .cloned()
+                                            && batch.num_rows() > 0
+                                        {
+                                            staged[d].push(batch);
+                                        }
+                                    }
+                                    NodeRunKind::Source => {
+                                        unreachable!("a source is never a link target")
+                                    }
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(parent: &run_span, processor = %ids[i], error = %_e, "processor error (continuing, skipping fan-out)");
+                            stats.iteration_errors += 1;
+                            node_stats[i].errors += 1;
+                            crate::metrics::instruments().workflow_error(&workflow_id);
+                            // Fall through to clear() without fanning out.
+                        }
+                    }
+
+                    datasets[i]
+                        .as_mut()
+                        .expect("processor node keeps its dataset")
+                        .clear();
+                }
+
+                NodeRunKind::Sink => {
+                    let component = components[i].expect("a sink node always declares a component");
+                    #[cfg(feature = "tracing")]
+                    let write_span = tracing::info_span!(
+                        parent: &batch_span,
+                        "sink.write",
+                        workflow = %workflow_id,
+                        sink = %ids[i],
+                        component,
+                        rows = tracing::field::Empty
+                    );
+                    let rows_before: u64 = staged[i].iter().map(|b| b.num_rows() as u64).sum();
+                    let sink = sinks[i].as_mut().expect("sink node keeps its sink");
+                    let write = write_staged(
+                        sink.as_mut(),
+                        &mut staged[i],
+                        &ids[i],
+                        &mut node_stats[i],
+                        &mut stats,
+                    );
+                    #[cfg(feature = "tracing")]
+                    write.instrument(write_span.clone()).await;
+                    #[cfg(not(feature = "tracing"))]
+                    write.await;
+                    #[cfg(feature = "tracing")]
+                    write_span.record("rows", rows_before);
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = rows_before;
                 }
             }
         }
 
-        if cancelled_during_drain {
-            flush_sinks(
-                &dataset,
-                &mut sinks,
-                &sink_component_names,
-                &mut stats,
-                true,
-            )
-            .await;
+        if cancelled_mid_pass {
+            let flush =
+                flush_and_finish_all(&mut sinks, &mut staged, &ids, &mut node_stats, &mut stats);
+            #[cfg(feature = "tracing")]
+            flush.instrument(batch_span.clone()).await;
+            #[cfg(not(feature = "tracing"))]
+            flush.await;
             stats.total_duration_ms = start.elapsed().as_millis() as u64;
+            stats.nodes = node_stats.clone();
             return Ok(stats);
         }
 
-        let _ = source_error; // no error-rate policy consumes this yet
-
-        let run_result = tokio::select! {
-            r = runtime.run_on(&mut dataset) => r,
-            _ = cancel.cancelled() => {
-                #[cfg(feature = "tracing")]
-                tracing::info!("standalone runner cancelled during runtime run");
-                flush_sinks(&dataset, &mut sinks, &sink_component_names, &mut stats, true).await;
-                stats.total_duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(stats);
-            }
-        };
-
-        if let Err(e) = run_result {
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "runtime error (continuing, attempting sink drain)");
-            #[cfg(not(feature = "tracing"))]
-            let _ = &e;
-            stats.iteration_errors += 1;
-            // Fall through to the sink drain rather than skipping it.
-        }
+        #[cfg(feature = "tracing")]
+        batch_span.record("rows", total_rows_in);
+        #[cfg(not(feature = "tracing"))]
+        let _ = total_rows_in;
 
         let is_oneshot_final = run_mode == RunMode::OneShot;
-        let cancelled_before_sink = cancel.is_cancelled();
-        flush_sinks(
-            &dataset,
-            &mut sinks,
-            &sink_component_names,
-            &mut stats,
-            is_oneshot_final || cancelled_before_sink,
-        )
-        .await;
-
-        if cancelled_before_sink {
+        let cancelled_before_finish = cancel.is_cancelled();
+        if is_oneshot_final || cancelled_before_finish {
+            let finish = async {
+                for i in 0..n {
+                    if let Some(sink) = sinks[i].as_mut() {
+                        finish_sink(sink.as_mut(), &ids[i], &mut node_stats[i], &mut stats).await;
+                    }
+                }
+            };
             #[cfg(feature = "tracing")]
-            tracing::info!("standalone runner cancelled after runtime, clean exit");
-            break;
+            finish.instrument(batch_span.clone()).await;
+            #[cfg(not(feature = "tracing"))]
+            finish.await;
         }
 
         stats.iterations += 1;
+        crate::metrics::instruments().workflow_run(&workflow_id);
         let iter_ms = iter_start.elapsed().as_millis() as u64;
 
-        // Publish live stats so /status reflects current progress.
-        if let Some(ref shared) = live_stats {
+        stats.nodes = node_stats.clone();
+        if let Some(shared) = &live_stats {
             *shared.write().await = stats.clone();
         }
 
-        // Dataset::clear() resets row data but keeps component schemas registered.
-        dataset.clear();
+        // Every processor dataset was already cleared per-node above; a
+        // source or sink node has none to clear.
 
         #[cfg(feature = "tracing")]
         tracing::info!(
+            parent: &batch_span,
             iteration = stats.iterations,
             rows_processed = stats.rows_processed,
             duration_ms = iter_ms,
@@ -264,6 +680,17 @@ pub async fn run_standalone(
         );
         #[cfg(not(feature = "tracing"))]
         let _ = iter_ms;
+
+        // Close the trace here: run-mode pacing is the gap between iterations,
+        // not part of one.
+        #[cfg(feature = "tracing")]
+        drop(batch_span);
+
+        if cancelled_before_finish {
+            #[cfg(feature = "tracing")]
+            tracing::info!("standalone runner cancelled after runtime, clean exit");
+            break;
+        }
 
         match &run_mode {
             RunMode::OneShot => {
@@ -311,6 +738,7 @@ pub async fn run_standalone(
     }
 
     stats.total_duration_ms = start.elapsed().as_millis() as u64;
+    stats.nodes = node_stats.clone();
 
     #[cfg(feature = "tracing")]
     tracing::info!(
@@ -324,757 +752,743 @@ pub async fn run_standalone(
     Ok(stats)
 }
 
-async fn flush_sinks(
-    dataset: &Dataset,
-    sinks: &mut [BuiltSink],
-    sink_component_names: &[&'static str],
-    stats: &mut StandaloneStats,
-    finish: bool,
-) {
-    for (i, built_sink) in sinks.iter_mut().enumerate() {
-        let component_name = sink_component_names[i];
-
-        match drain_dataset(dataset, component_name, built_sink.sink.as_mut()).await {
-            Ok(rows) if rows > 0 => {
-                stats.sink_batches_written += 1;
-            }
-            Ok(_) => { /* empty, no-op */ }
-            Err(e) => {
-                #[cfg(feature = "tracing")]
-                tracing::error!(sink_name = %built_sink.name, error = %e, "sink drain error (continuing)");
-                #[cfg(not(feature = "tracing"))]
-                let _ = &e;
-                stats.iteration_errors += 1;
-            }
-        }
-
-        if finish && let Err(e) = built_sink.sink.finish().await {
-            #[cfg(feature = "tracing")]
-            tracing::error!(sink_name = %built_sink.name, error = %e, "sink finish error");
-            #[cfg(not(feature = "tracing"))]
-            let _ = &e;
-            stats.iteration_errors += 1;
-        }
-    }
-}
-
 #[cfg(all(test, feature = "service"))]
 mod tests {
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use arrow_array::RecordBatch;
-    use arrow_array::{ArrayRef, Int32Array};
+    use super::*;
+    use crate::pipeline::Pipeline;
+    use crate::service::builder::{BuiltEdge, BuiltNode, BuiltNodeKind, BuiltService};
+    use crate::service::config::{
+        HttpConfig, NodeConfig, ObservabilityConfig, RunMode as CfgRunMode,
+        ServiceMode as CfgServiceMode, StandaloneConfig,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
+    use pcs_connector_channel::{ChannelSink, ChannelSource};
+    use pcs_core::PcsResult;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    use crate::dataset::Dataset;
-    use crate::error::PcsError;
-    use crate::io::channel_sink::ChannelSink;
-    use crate::io::channel_source::ChannelSource;
-    use crate::io::sink::Sink;
-    use crate::io::source::Source;
-    use crate::pipeline::Pipeline;
-    use crate::service::builder::{BuiltService, BuiltSink, BuiltSource};
-    use crate::service::config::{
-        HttpConfig, NodeConfig, ObservabilityConfig, PipelineSpec, RunMode, ServiceConfig,
-        ServiceMode, StandaloneConfig,
-    };
-    use crate::service::registry::Registry;
-    use crate::system::{System, SystemMeta};
-
-    use super::run_standalone;
-
-    const COMP: &str = "values";
-
-    fn test_schema() -> Arc<Schema> {
+    fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
     }
 
-    fn make_batch(schema: Arc<Schema>, values: &[i32]) -> RecordBatch {
-        let arr: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
-        RecordBatch::try_new(schema, vec![arr]).unwrap()
-    }
-
-    struct NoopSystem;
-    #[async_trait]
-    impl System for NoopSystem {
-        fn meta(&self) -> SystemMeta {
-            SystemMeta::new("noop")
-        }
-        async fn run(&self, _data: &mut Dataset) -> Result<(), PcsError> {
-            Ok(())
-        }
-    }
-
-    struct FailingSystem;
-    #[async_trait]
-    impl System for FailingSystem {
-        fn meta(&self) -> SystemMeta {
-            SystemMeta::new("failing")
-        }
-        async fn run(&self, _data: &mut Dataset) -> Result<(), PcsError> {
-            Err(PcsError::generic("intentional test failure"))
-        }
-    }
-
-    struct FallibleSource {
-        schema: Arc<Schema>,
-        call_count: u32,
-        batches: Vec<RecordBatch>,
-        pos: usize,
-    }
-
-    impl FallibleSource {
-        fn new(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Self {
-            Self {
-                schema,
-                call_count: 0,
-                batches,
-                pos: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Source for FallibleSource {
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
-        }
-
-        async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
-            self.call_count += 1;
-            if self.call_count.is_multiple_of(2) {
-                return Err(PcsError::generic("FallibleSource: alternating error"));
-            }
-            if self.pos < self.batches.len() {
-                let batch = self.batches[self.pos].clone();
-                self.pos += 1;
-                Ok(Some(batch))
-            } else {
-                Ok(None)
-            }
-        }
-    }
-
-    struct FinishTrackingSink {
-        inner: ChannelSink,
-        finish_called: Arc<Mutex<bool>>,
-    }
-
-    impl FinishTrackingSink {
-        fn new(
-            schema: Arc<Schema>,
-            finish_called: Arc<Mutex<bool>>,
-        ) -> (Self, mpsc::Receiver<RecordBatch>) {
-            let (inner, rx) = ChannelSink::new(schema, 8);
-            (
-                Self {
-                    inner,
-                    finish_called,
-                },
-                rx,
-            )
-        }
-    }
-
-    #[async_trait]
-    impl Sink for FinishTrackingSink {
-        fn schema(&self) -> Arc<Schema> {
-            self.inner.schema()
-        }
-        async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), PcsError> {
-            self.inner.write_batch(batch).await
-        }
-        async fn finish(&mut self) -> Result<(), PcsError> {
-            *self.finish_called.lock().unwrap() = true;
-            self.inner.finish().await
-        }
-    }
-
-    fn build_service(
-        system: Box<dyn System>,
-    ) -> (
-        BuiltService,
-        mpsc::Sender<RecordBatch>,
-        mpsc::Receiver<RecordBatch>,
-    ) {
-        let schema = test_schema();
-
-        let (tx, src) = ChannelSource::new(schema.clone(), 16);
-        let built_source = BuiltSource {
-            name: "test_source".to_string(),
-            target_component: COMP.to_string(),
-            source: Box::new(src),
-        };
-
-        let (sink, rx) = ChannelSink::new(schema.clone(), 16);
-        let built_sink = BuiltSink {
-            name: "test_sink".to_string(),
-            source_component: COMP.to_string(),
-            sink: Box::new(sink),
-        };
-
-        let mut pipeline = Pipeline::new("test");
-        pipeline.data_mut().register_raw_component(COMP, schema);
-        pipeline.add_system_boxed(system);
-
-        let service = BuiltService::from_runtime(
-            Box::new(pipeline),
-            vec![built_source],
-            vec![built_sink],
-            Registry::new(),
-        );
-
-        (service, tx, rx)
-    }
-
-    fn make_config(run_mode: RunMode) -> ServiceConfig {
+    fn config(run_mode: CfgRunMode) -> ServiceConfig {
         ServiceConfig {
             node: NodeConfig {
                 id: 1,
                 name: None,
-                data_dir: std::path::PathBuf::from("/tmp/pcs-test"),
+                data_dir: PathBuf::from("/tmp/pcs-standalone-test"),
             },
-            mode: ServiceMode::Standalone {
+            mode: CfgServiceMode::Standalone {
                 config: StandaloneConfig { run_mode },
             },
-            pipeline: PipelineSpec {
+            workflows: vec![crate::service::config::WorkflowSpec {
+                id: "w".to_string(),
+                name: None,
+                transformers: Vec::new(),
+                sources: Vec::new(),
                 #[cfg(feature = "wasm")]
-                wasm: None,
+                wasm: Vec::new(),
                 #[cfg(feature = "plugin")]
-                plugin: None,
-            },
-            sources: vec![],
-            sinks: vec![],
+                plugin: Vec::new(),
+                sinks: Vec::new(),
+                links: Vec::new(),
+            }],
             http: HttpConfig::default(),
             observability: ObservabilityConfig::default(),
         }
     }
 
     #[tokio::test]
-    async fn test_oneshot_runs_one_iteration_and_exits() {
-        let schema = test_schema();
-        let (service, tx, mut rx) = build_service(Box::new(NoopSystem));
-        let config = make_config(RunMode::OneShot);
+    async fn source_straight_to_sink_forwards_every_row() {
+        let (tx, source) = ChannelSource::new(schema(), 8);
+        let (sink, mut rx) = ChannelSink::new(schema(), 8);
 
-        for _ in 0..3 {
-            tx.send(make_batch(schema.clone(), &[1, 2, 3]))
-                .await
-                .unwrap();
-        }
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        tx.send(batch.clone()).await.unwrap();
         drop(tx);
 
-        let cancel = CancellationToken::new();
-        let stats = run_standalone(service, &config, cancel, None)
-            .await
-            .unwrap();
+        let nodes = vec![
+            BuiltNode {
+                id: "in".to_string(),
+                name: None,
+                type_name: "ChannelSource".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Source(Box::new(source)),
+                downstream: vec![BuiltEdge {
+                    node: 1,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "out".to_string(),
+                name: None,
+                type_name: "ChannelSink".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Sink(Box::new(sink)),
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+        ];
+        let built = BuiltService {
+            workflow_id: "w".to_string(),
+            workflow_name: None,
+            nodes,
+            registry: Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
+        };
 
-        assert_eq!(stats.iterations, 1, "should complete exactly one iteration");
-        assert_eq!(stats.rows_processed, 9, "3 batches × 3 rows");
-        assert_eq!(stats.iteration_errors, 0);
+        let stats = run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
 
-        let mut total_sink_rows = 0usize;
-        while let Ok(batch) = rx.try_recv() {
-            total_sink_rows += batch.num_rows();
-        }
-        assert_eq!(total_sink_rows, 9, "sink should receive all 9 rows");
+        assert_eq!(stats.rows_processed, 3);
+        assert_eq!(stats.sink_batches_written, 1);
+        assert_eq!(stats.nodes.len(), 2);
+        assert_eq!(stats.nodes[0].id, "in");
+        assert_eq!(stats.nodes[0].rows, 3);
+        assert_eq!(stats.nodes[1].id, "out");
+        assert_eq!(stats.nodes[1].rows, 3);
+
+        let received = rx.recv().await.expect("sink forwarded the batch");
+        assert_eq!(received.num_rows(), 3);
     }
 
     #[tokio::test]
-    async fn test_continuous_multiple_iterations() {
-        let schema = test_schema();
-        let (service, tx, _rx) = build_service(Box::new(NoopSystem));
-        let config = make_config(RunMode::Continuous);
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
+    async fn processor_entry_point_runs_with_an_empty_dataset() {
+        let (sink, mut rx) = ChannelSink::new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            8,
+        );
 
-        let local = tokio::task::LocalSet::new();
-        let config_owned = config.clone();
-        let handle = local.spawn_local(async move {
-            run_standalone(service, &config_owned, cancel_clone, None).await
-        });
-
-        let schema_clone = schema.clone();
-        let feeder = local.spawn_local(async move {
-            for _ in 0..5 {
-                let _ = tx.send(make_batch(schema_clone.clone(), &[1])).await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        struct OrderComponent;
+        impl pcs_core::component::Component for OrderComponent {
+            fn name() -> &'static str {
+                "Order"
             }
-        });
-
-        local
-            .run_until(async {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                cancel.cancel();
-            })
-            .await;
-
-        let stats = local
-            .run_until(async { handle.await.unwrap().unwrap() })
-            .await;
-        feeder.abort();
-
-        assert!(
-            stats.iterations >= 2,
-            "expected ≥2 iterations in continuous mode, got {}",
-            stats.iterations
-        );
-        assert_eq!(stats.iteration_errors, 0);
-    }
-
-    #[tokio::test]
-    async fn test_interval_mode_honors_sleep() {
-        let mut pipeline = Pipeline::new("test");
-        pipeline.add_system_boxed(Box::new(NoopSystem));
-        let service =
-            BuiltService::from_runtime(Box::new(pipeline), vec![], vec![], Registry::new());
-
-        let config = make_config(RunMode::Interval { interval_ms: 200 });
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let wall_start = std::time::Instant::now();
-        let config_owned = config.clone();
-        let local = tokio::task::LocalSet::new();
-        let handle = local.spawn_local(async move {
-            run_standalone(service, &config_owned, cancel_clone, None).await
-        });
-
-        local
-            .run_until(async {
-                tokio::time::sleep(Duration::from_millis(750)).await;
-                cancel.cancel();
-            })
-            .await;
-
-        let stats = local
-            .run_until(async { handle.await.unwrap().unwrap() })
-            .await;
-        let elapsed = wall_start.elapsed();
-
-        assert!(
-            stats.iterations >= 3,
-            "expected ≥3 iterations in interval mode (200ms), got {}; elapsed={elapsed:?}",
-            stats.iterations
-        );
-        assert!(
-            elapsed >= Duration::from_millis(600),
-            "expected ≥600ms elapsed for 3 intervals, got {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cancellation_exits_cleanly() {
-        let (service, _tx, _rx) = build_service(Box::new(NoopSystem));
-        let config = make_config(RunMode::Continuous);
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let config_owned = config.clone();
-        let local = tokio::task::LocalSet::new();
-        let handle = local.spawn_local(async move {
-            run_standalone(service, &config_owned, cancel_clone, None).await
-        });
-
-        local
-            .run_until(async {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                cancel.cancel();
-            })
-            .await;
-
-        let result = local.run_until(async { handle.await.unwrap() }).await;
-        assert!(
-            result.is_ok(),
-            "cancellation should return Ok, got: {:?}",
-            result
-        );
-        let stats = result.unwrap();
-        assert_eq!(stats.iteration_errors, 0);
-    }
-
-    #[tokio::test]
-    async fn test_source_error_does_not_kill_service() {
-        let schema = test_schema();
-        let batches = vec![make_batch(schema.clone(), &[1, 2, 3])];
-        let fallible = FallibleSource::new(schema.clone(), batches);
-
-        let (sink, _rx) = ChannelSink::new(schema.clone(), 8);
-        let built_sink = BuiltSink {
-            name: "test_sink".to_string(),
-            source_component: COMP.to_string(),
-            sink: Box::new(sink),
-        };
-
-        let mut pipeline = Pipeline::new("test");
-        pipeline.data_mut().register_raw_component(COMP, schema);
-        pipeline.add_system_boxed(Box::new(NoopSystem));
-
-        let service = BuiltService::from_runtime(
-            Box::new(pipeline),
-            vec![BuiltSource {
-                name: "fallible".to_string(),
-                target_component: COMP.to_string(),
-                source: Box::new(fallible),
-            }],
-            vec![built_sink],
-            Registry::new(),
-        );
-
-        let config = make_config(RunMode::OneShot);
-        let cancel = CancellationToken::new();
-        let stats = run_standalone(service, &config, cancel, None)
-            .await
-            .unwrap();
-
-        assert_eq!(stats.iterations, 1);
-        assert_eq!(
-            stats.iteration_errors, 1,
-            "expected 1 source error, got {}",
-            stats.iteration_errors
-        );
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_error_still_drains_sink() {
-        let schema = test_schema();
-        let (service, tx, mut rx) = build_service(Box::new(FailingSystem));
-        let config = make_config(RunMode::OneShot);
-
-        tx.send(make_batch(schema.clone(), &[10, 20]))
-            .await
-            .unwrap();
-        drop(tx);
-
-        let cancel = CancellationToken::new();
-        let stats = run_standalone(service, &config, cancel, None)
-            .await
-            .unwrap();
-
-        assert!(
-            stats.iteration_errors >= 1,
-            "expected at least 1 error from failing runtime"
-        );
-        assert_eq!(stats.iterations, 1);
-
-        let mut sink_rows = 0;
-        while let Ok(b) = rx.try_recv() {
-            sink_rows += b.num_rows();
+            fn schema() -> Arc<Schema> {
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+            }
         }
-        assert_eq!(
-            sink_rows, 2,
-            "sink should receive the 2 rows from the dataset despite runtime error"
-        );
-    }
 
-    #[tokio::test]
-    async fn test_no_sources_runtime_still_runs() {
-        let mut pipeline = Pipeline::new("test");
-        pipeline.add_system_boxed(Box::new(NoopSystem));
-
-        let service =
-            BuiltService::from_runtime(Box::new(pipeline), vec![], vec![], Registry::new());
-
-        let config = make_config(RunMode::OneShot);
-        let cancel = CancellationToken::new();
-        let stats = run_standalone(service, &config, cancel, None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            stats.iterations, 1,
-            "runtime should run one iteration even with no sources"
-        );
-        assert_eq!(stats.rows_processed, 0);
-        assert_eq!(stats.iteration_errors, 0);
-    }
-
-    #[tokio::test]
-    async fn test_sink_finish_called_on_oneshot_exit() {
-        let schema = test_schema();
-        let finish_called = Arc::new(Mutex::new(false));
-        let (tracking_sink, _rx) = FinishTrackingSink::new(schema.clone(), finish_called.clone());
-
-        let (tx, src) = ChannelSource::new(schema.clone(), 8);
-        let built_source = BuiltSource {
-            name: "src".to_string(),
-            target_component: COMP.to_string(),
-            source: Box::new(src),
-        };
-
-        let mut pipeline = Pipeline::new("test");
+        let mut pipeline = Pipeline::new("p");
         pipeline
             .data_mut()
-            .register_raw_component(COMP, schema.clone());
-        pipeline.add_system_boxed(Box::new(NoopSystem));
-
-        let service = BuiltService::from_runtime(
-            Box::new(pipeline),
-            vec![built_source],
-            vec![BuiltSink {
-                name: "tracking".to_string(),
-                source_component: COMP.to_string(),
-                sink: Box::new(tracking_sink),
-            }],
-            Registry::new(),
-        );
-
-        tx.send(make_batch(schema.clone(), &[1])).await.unwrap();
-        drop(tx);
-
-        let config = make_config(RunMode::OneShot);
-        let cancel = CancellationToken::new();
-        run_standalone(service, &config, cancel, None)
-            .await
+            .register_component::<OrderComponent>()
             .unwrap();
 
+        let nodes = vec![
+            BuiltNode {
+                id: "p".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(pipeline),
+                    kind: "native",
+                },
+                downstream: vec![BuiltEdge {
+                    node: 1,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "out".to_string(),
+                name: None,
+                type_name: "ChannelSink".to_string(),
+                component: Some("Order"),
+                kind: BuiltNodeKind::Sink(Box::new(sink)),
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+        ];
+        let built = BuiltService {
+            workflow_id: "w".to_string(),
+            workflow_name: None,
+            nodes,
+            registry: Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
+        };
+
+        let stats = run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds even though the processor starts from an empty dataset");
+
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.iteration_errors, 0);
         assert!(
-            *finish_called.lock().unwrap(),
-            "finish() should have been called on the sink during OneShot exit"
+            rx.try_recv().is_err(),
+            "an identity run over zero rows writes nothing"
         );
     }
 
-    struct BurstSource {
-        schema: Arc<Schema>,
-        queue: Arc<Mutex<Vec<RecordBatch>>>,
+    /// A runtime that appends three rows to the batch dataset and reports a
+    /// fixed routing decision, so the runner's delivery is what a test asserts.
+    struct RoutingRuntime {
+        routes: Option<Vec<String>>,
     }
 
-    impl BurstSource {
-        fn new(schema: Arc<Schema>) -> (Arc<Mutex<Vec<RecordBatch>>>, Self) {
-            let queue = Arc::new(Mutex::new(Vec::new()));
-            let src = Self {
-                schema,
-                queue: queue.clone(),
-            };
-            (queue, src)
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct V {
+        v: i32,
+    }
+
+    impl pcs_core::component::Component for V {
+        fn name() -> &'static str {
+            "V"
+        }
+        fn schema() -> Arc<Schema> {
+            schema()
         }
     }
 
-    #[async_trait]
-    impl Source for BurstSource {
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
+    #[async_trait(?Send)]
+    impl PipelineRuntime for RoutingRuntime {
+        fn name(&self) -> &str {
+            "routing"
         }
 
-        async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
-            let batch = self.queue.lock().unwrap().pop();
-            Ok(batch)
+        async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+            self.run_on_with_state_and_routes(data, None)
+                .await
+                .map(|_| ())
         }
+
+        async fn run_on_with_state_and_routes(
+            &self,
+            data: &mut Dataset,
+            _prior: Option<&[u8]>,
+        ) -> PcsResult<pcs_core::runtime::RuntimeOutput> {
+            data.append::<V>(&[V { v: 1 }, V { v: 2 }, V { v: 3 }])?;
+            Ok(pcs_core::runtime::RuntimeOutput {
+                state: None,
+                routes: self.routes.clone(),
+            })
+        }
+
+        fn template_dataset(&self) -> Dataset {
+            let mut dataset = Dataset::new();
+            dataset.register_component::<V>().expect("register V");
+            dataset
+        }
+    }
+
+    /// A one-processor workflow with two labelled sink edges, `a` and `b`.
+    fn routing_built(
+        routes: Option<Vec<String>>,
+    ) -> (
+        BuiltService,
+        tokio::sync::mpsc::Receiver<RecordBatch>,
+        tokio::sync::mpsc::Receiver<RecordBatch>,
+    ) {
+        let (sink_a, rx_a) = ChannelSink::new(schema(), 8);
+        let (sink_b, rx_b) = ChannelSink::new(schema(), 8);
+        let nodes = vec![
+            BuiltNode {
+                id: "p".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(RoutingRuntime { routes }),
+                    kind: "native",
+                },
+                downstream: vec![
+                    BuiltEdge {
+                        node: 1,
+                        branch: Some("a".to_string()),
+                    },
+                    BuiltEdge {
+                        node: 2,
+                        branch: Some("b".to_string()),
+                    },
+                ],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "out_a".to_string(),
+                name: None,
+                type_name: "ChannelSink".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Sink(Box::new(sink_a)),
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "out_b".to_string(),
+                name: None,
+                type_name: "ChannelSink".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Sink(Box::new(sink_b)),
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+        ];
+        (
+            BuiltService {
+                workflow_id: "w".to_string(),
+                workflow_name: None,
+                nodes,
+                registry: Arc::new(crate::service::registry::Registry::new()),
+                inspector: None,
+            },
+            rx_a,
+            rx_b,
+        )
     }
 
     #[tokio::test]
-    async fn test_world_clear_between_iterations() {
-        let row_counts = Arc::new(Mutex::new(Vec::<usize>::new()));
+    async fn routing_processor_delivers_only_to_the_selected_branch() {
+        let (built, mut rx_a, mut rx_b) = routing_built(Some(vec!["a".to_string()]));
+        run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
 
-        struct RecordingSystem {
-            counts: Arc<Mutex<Vec<usize>>>,
+        let received = rx_a.recv().await.expect("sink a received the batch");
+        assert_eq!(received.num_rows(), 3);
+        assert!(
+            rx_b.try_recv().is_err(),
+            "sink b must not receive a batch the routing decision did not select"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_processor_can_route_to_nowhere() {
+        let (built, mut rx_a, mut rx_b) = routing_built(Some(Vec::new()));
+        run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
+
+        assert!(
+            rx_a.try_recv().is_err(),
+            "an empty routing decision delivers nowhere"
+        );
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn routing_processor_without_routes_multicasts_to_every_edge() {
+        let (built, mut rx_a, mut rx_b) = routing_built(None);
+        run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
+
+        assert_eq!(rx_a.recv().await.expect("sink a").num_rows(), 3);
+        assert_eq!(rx_b.recv().await.expect("sink b").num_rows(), 3);
+    }
+
+    /// A runtime that counts the rows its dataset held when run began, so a
+    /// test can assert how much fan-in merged before the call.
+    struct RowCounter {
+        rows_seen: Arc<std::sync::Mutex<u64>>,
+    }
+
+    #[async_trait(?Send)]
+    impl PipelineRuntime for RowCounter {
+        fn name(&self) -> &str {
+            "row-counter"
         }
 
-        #[async_trait]
-        impl System for RecordingSystem {
-            fn meta(&self) -> SystemMeta {
-                SystemMeta::new("recording")
+        async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+            *self.rows_seen.lock().unwrap() += data.rows() as u64;
+            Ok(())
+        }
+
+        fn template_dataset(&self) -> Dataset {
+            let mut dataset = Dataset::new();
+            dataset.register_component::<V>().expect("register V");
+            dataset
+        }
+    }
+
+    /// Two sources feeding one processor must merge into a single dataset
+    /// before the processor runs: the windowing contract is that a processor
+    /// receives the rows of every one of its inbound nodes in one batch.
+    #[tokio::test]
+    async fn two_sources_merge_into_one_processor() {
+        let (tx_a, source_a) = ChannelSource::new(schema(), 8);
+        let (tx_b, source_b) = ChannelSource::new(schema(), 8);
+        let rows_seen = Arc::new(std::sync::Mutex::new(0u64));
+
+        let batch_a = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let batch_b = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![3, 4, 5]))],
+        )
+        .unwrap();
+        tx_a.send(batch_a).await.unwrap();
+        tx_b.send(batch_b).await.unwrap();
+        drop(tx_a);
+        drop(tx_b);
+
+        let nodes = vec![
+            BuiltNode {
+                id: "a".to_string(),
+                name: None,
+                type_name: "ChannelSource".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Source(Box::new(source_a)),
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "b".to_string(),
+                name: None,
+                type_name: "ChannelSource".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Source(Box::new(source_b)),
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+            BuiltNode {
+                id: "p".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(RowCounter {
+                        rows_seen: Arc::clone(&rows_seen),
+                    }),
+                    kind: "native",
+                },
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            },
+        ];
+        let built = BuiltService {
+            workflow_id: "w".to_string(),
+            workflow_name: None,
+            nodes,
+            registry: Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
+        };
+
+        let stats = run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
+
+        assert_eq!(stats.rows_processed, 5);
+        assert_eq!(
+            *rows_seen.lock().unwrap(),
+            5,
+            "the processor must receive both sources' rows merged into one dataset"
+        );
+    }
+
+    /// A mixed fan-in — one source and one upstream processor feeding the same
+    /// downstream processor — must merge just like the all-sources case.
+    #[tokio::test]
+    async fn source_and_processor_fan_in_merge_into_one_processor() {
+        let (tx, source) = ChannelSource::new(schema(), 8);
+        let rows_seen = Arc::new(std::sync::Mutex::new(0u64));
+
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![7, 8]))],
+        )
+        .unwrap();
+        tx.send(batch).await.unwrap();
+        drop(tx);
+
+        // Upstream: appends three rows of its own on every run.
+        struct Producer;
+        #[async_trait(?Send)]
+        impl PipelineRuntime for Producer {
+            fn name(&self) -> &str {
+                "producer"
             }
-            async fn run(&self, data: &mut Dataset) -> Result<(), PcsError> {
-                self.counts.lock().unwrap().push(data.rows());
+            async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+                data.append::<V>(&[V { v: 9 }, V { v: 10 }, V { v: 11 }])?;
                 Ok(())
             }
+            fn template_dataset(&self) -> Dataset {
+                let mut dataset = Dataset::new();
+                dataset.register_component::<V>().expect("register V");
+                dataset
+            }
         }
 
-        let schema = test_schema();
-        let (queue, burst_src) = BurstSource::new(schema.clone());
-
-        let (sink, _rx) = ChannelSink::new(schema.clone(), 8);
-        let built_sink = BuiltSink {
-            name: "sink".to_string(),
-            source_component: COMP.to_string(),
-            sink: Box::new(sink),
-        };
-
-        let mut pipeline = Pipeline::new("test");
-        pipeline
-            .data_mut()
-            .register_raw_component(COMP, schema.clone());
-        pipeline.add_system_boxed(Box::new(RecordingSystem {
-            counts: row_counts.clone(),
-        }));
-
-        let service = BuiltService::from_runtime(
-            Box::new(pipeline),
-            vec![BuiltSource {
-                name: "burst".to_string(),
-                target_component: COMP.to_string(),
-                source: Box::new(burst_src),
-            }],
-            vec![built_sink],
-            Registry::new(),
-        );
-
-        for _ in 0..10 {
-            queue.lock().unwrap().push(make_batch(schema.clone(), &[1]));
-        }
-
-        let config = make_config(RunMode::Interval { interval_ms: 30 });
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let config_owned = config.clone();
-        let queue_clone = queue.clone();
-        let local = tokio::task::LocalSet::new();
-        let handle = local.spawn_local(async move {
-            run_standalone(service, &config_owned, cancel_clone, None).await
-        });
-
-        let schema_clone = schema.clone();
-        local
-            .run_until(async move {
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                for _ in 0..5 {
-                    queue_clone
-                        .lock()
-                        .unwrap()
-                        .push(make_batch(schema_clone.clone(), &[2]));
-                }
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                cancel.cancel();
-            })
-            .await;
-        local
-            .run_until(async { handle.await.unwrap().unwrap() })
-            .await;
-
-        let counts = row_counts.lock().unwrap().clone();
-        assert!(
-            counts.len() >= 2,
-            "expected ≥2 recorded row counts, got {counts:?}"
-        );
-
-        let max_rows = counts.iter().copied().max().unwrap_or(0);
-        assert!(
-            max_rows <= 10,
-            "dataset should be cleared between iterations; max rows seen = {max_rows}, counts = {counts:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cluster_config_returns_error() {
-        use crate::service::config::{ClusterConfig, PeerSpec};
-
-        let cluster_config = ServiceConfig {
-            node: NodeConfig {
-                id: 1,
+        let nodes = vec![
+            BuiltNode {
+                id: "s".to_string(),
                 name: None,
-                data_dir: std::path::PathBuf::from("/tmp/pcs"),
+                type_name: "ChannelSource".to_string(),
+                component: Some("V"),
+                kind: BuiltNodeKind::Source(Box::new(source)),
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
             },
-            mode: ServiceMode::Cluster {
-                config: ClusterConfig {
-                    peers: vec![PeerSpec {
-                        id: 1,
-                        addr: "127.0.0.1:9000".to_string(),
-                    }],
-                    bootstrap: true,
-                    lease_ttl_ms: 30_000,
-                    election_timeout_ms: 1_500,
-                    heartbeat_interval_ms: 300,
-                    snapshot_log_interval: 10_000,
+            BuiltNode {
+                id: "up".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(Producer),
+                    kind: "native",
                 },
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
             },
-            pipeline: PipelineSpec {
-                #[cfg(feature = "wasm")]
-                wasm: None,
-                #[cfg(feature = "plugin")]
-                plugin: None,
+            BuiltNode {
+                id: "down".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(RowCounter {
+                        rows_seen: Arc::clone(&rows_seen),
+                    }),
+                    kind: "native",
+                },
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
             },
-            sources: vec![],
-            sinks: vec![],
-            http: HttpConfig::default(),
-            observability: ObservabilityConfig::default(),
+        ];
+        let built = BuiltService {
+            workflow_id: "w".to_string(),
+            workflow_name: None,
+            nodes,
+            registry: Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
         };
 
-        let pipeline = Pipeline::new("test");
-        let service =
-            BuiltService::from_runtime(Box::new(pipeline), vec![], vec![], Registry::new());
+        let stats = run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
 
-        let cancel = CancellationToken::new();
-        let result = run_standalone(service, &cluster_config, cancel, None).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.category(), "configuration");
+        assert_eq!(stats.rows_processed, 2);
+        assert_eq!(
+            *rows_seen.lock().unwrap(),
+            5,
+            "the downstream processor must see the source's 2 rows and the upstream's 3"
+        );
     }
 
+    /// A windowed processor node: the runner advances the node's watermark
+    /// from the merged inbound timestamps, inserts the `WindowWatermark`
+    /// resource for an in-process runtime to read, and records the
+    /// `pcs_window_watermark_seconds` series attributed to the node.
+    #[cfg(feature = "windows")]
     #[tokio::test]
-    async fn test_live_stats_updated_during_execution() {
-        use crate::service::StandaloneStats;
-        use tokio::sync::RwLock;
+    async fn windowed_processor_tracks_watermark_from_merged_input() {
+        use pcs_core::windows::{WindowSpec, WindowWatermark};
 
-        let schema = test_schema();
-        let (queue, burst_src) = BurstSource::new(schema.clone());
-
-        for _ in 0..3 {
-            queue
-                .lock()
-                .unwrap()
-                .push(make_batch(schema.clone(), &[1, 2, 3]));
+        fn trade_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![
+                Field::new("timestamp_ms", DataType::Int64, false),
+                Field::new("price", DataType::Float64, false),
+            ]))
         }
 
-        let (sink, _rx) = ChannelSink::new(schema.clone(), 16);
-        let built_sink = BuiltSink {
-            name: "test_sink".to_string(),
-            source_component: COMP.to_string(),
-            sink: Box::new(sink),
+        let (tx_a, source_a) = ChannelSource::new(trade_schema(), 8);
+        let (tx_b, source_b) = ChannelSource::new(trade_schema(), 8);
+        let watermark_seen = Arc::new(std::sync::Mutex::new(i64::MIN));
+
+        struct WatermarkReader {
+            seen: Arc<std::sync::Mutex<i64>>,
+        }
+        #[async_trait(?Send)]
+        impl PipelineRuntime for WatermarkReader {
+            fn name(&self) -> &str {
+                "watermark-reader"
+            }
+            async fn run_on(&self, data: &mut Dataset) -> PcsResult<()> {
+                if let Some(watermark) = data.get_resource::<WindowWatermark>() {
+                    *self.seen.lock().unwrap() = watermark.as_ms();
+                }
+                Ok(())
+            }
+            fn template_dataset(&self) -> Dataset {
+                let mut dataset = Dataset::new();
+                dataset.register_raw_component("Trade", trade_schema());
+                dataset
+            }
+        }
+
+        let batch_at = |ts: i64| {
+            RecordBatch::try_new(
+                trade_schema(),
+                vec![
+                    Arc::new(arrow_array::Int64Array::from(vec![ts]))
+                        as Arc<dyn arrow_array::Array>,
+                    Arc::new(arrow_array::Float64Array::from(vec![1.0]))
+                        as Arc<dyn arrow_array::Array>,
+                ],
+            )
+            .unwrap()
+        };
+        tx_a.send(batch_at(1_000)).await.unwrap();
+        tx_a.send(batch_at(2_000)).await.unwrap();
+        tx_b.send(batch_at(3_000)).await.unwrap();
+        drop(tx_a);
+        drop(tx_b);
+
+        let nodes = vec![
+            BuiltNode {
+                id: "a".to_string(),
+                name: None,
+                type_name: "ChannelSource".to_string(),
+                component: Some("Trade"),
+                kind: BuiltNodeKind::Source(Box::new(source_a)),
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                window: None,
+            },
+            BuiltNode {
+                id: "b".to_string(),
+                name: None,
+                type_name: "ChannelSource".to_string(),
+                component: Some("Trade"),
+                kind: BuiltNodeKind::Source(Box::new(source_b)),
+                downstream: vec![BuiltEdge {
+                    node: 2,
+                    branch: None,
+                }],
+                artifact: None,
+                window: None,
+            },
+            BuiltNode {
+                id: "p".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(WatermarkReader {
+                        seen: Arc::clone(&watermark_seen),
+                    }),
+                    kind: "native",
+                },
+                downstream: Vec::new(),
+                artifact: None,
+                window: Some(crate::service::config::WindowConfig {
+                    spec: WindowSpec::Tumbling {
+                        size_ms: 30_000,
+                        offset_ms: 0,
+                    },
+                    time_field: "timestamp_ms".to_string(),
+                    key_fields: Vec::new(),
+                    allowed_lateness_ms: 0,
+                }),
+            },
+        ];
+        let built = BuiltService {
+            workflow_id: "w".to_string(),
+            workflow_name: None,
+            nodes,
+            registry: Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
         };
 
-        let mut pipeline = Pipeline::new("test");
-        pipeline
-            .data_mut()
-            .register_raw_component(COMP, schema.clone());
-        pipeline.add_system_boxed(Box::new(NoopSystem));
+        run_standalone(
+            built,
+            &config(CfgRunMode::OneShot),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run succeeds");
 
-        let service = BuiltService::from_runtime(
-            Box::new(pipeline),
-            vec![BuiltSource {
-                name: "burst".to_string(),
-                target_component: COMP.to_string(),
-                source: Box::new(burst_src),
-            }],
-            vec![built_sink],
-            Registry::new(),
+        assert_eq!(
+            *watermark_seen.lock().unwrap(),
+            3_000,
+            "the watermark resource must carry the max merged timestamp"
         );
 
-        let config = make_config(RunMode::Continuous);
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let live = Arc::new(RwLock::new(StandaloneStats::default()));
-        let live_clone = live.clone();
-
-        let local = tokio::task::LocalSet::new();
-        let config_owned = config.clone();
-        let handle = local.spawn_local(async move {
-            run_standalone(service, &config_owned, cancel_clone, Some(live_clone)).await
-        });
-
-        local
-            .run_until(async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                cancel.cancel();
-                handle.await.unwrap().unwrap();
-            })
-            .await;
-
-        let snapshot = live.read().await;
+        // The series must carry the node's id, so the dashboard can attribute
+        // the number to exactly this processor box.
+        let text = prometheus::TextEncoder::new()
+            .encode_to_string(&crate::metrics::test_registry().gather())
+            .expect("encode prometheus text");
         assert!(
-            snapshot.iterations > 0,
-            "live stats should be updated after at least one iteration, got iterations={}",
-            snapshot.iterations
-        );
-        assert!(
-            snapshot.rows_processed > 0,
-            "live stats should show rows processed, got rows_processed={}",
-            snapshot.rows_processed
+            text.contains("pcs_window_watermark_seconds") && text.contains("processor=\"p\""),
+            "window watermark series missing from:\n{text}"
         );
     }
 }

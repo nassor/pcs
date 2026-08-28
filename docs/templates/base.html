@@ -34,6 +34,10 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
     <script src="{{ get_url(path='script.js') }}" defer></script>
 </head>
 <body>
@@ -45,10 +49,14 @@
    Trailing slashes are trimmed on both sides: `get_url(path='/')` returns the
    bare base URL while `current_url` for the same page carries the slash, and
    the home page would otherwise match nothing. Tera cannot compare a function
-   call directly, so every URL is bound to a variable first. #}
-{%- set here = current_url | default(value="") | trim_end_matches(pat="/") -%}
+   call directly, so every URL is bound to a variable first.
+
+   An item's children are visited right after the item, so reading order is
+   depth first. The child body repeats the item body because a Tera macro
+   cannot `set_global` into its caller. #}
+{%- set here = current_url | default(value="") | trim_end(pat="/") -%}
 {%- set home = get_url(path='/') -%}
-{%- set home_key = home | trim_end_matches(pat="/") -%}
+{%- set home_key = home | trim_end(pat="/") -%}
 {%- set_global nav_group = "" -%}
 {%- set_global nav_prev = false -%}
 {%- set_global nav_prev_group = "" -%}
@@ -57,9 +65,10 @@
 {%- set_global nav_seen = false -%}
 {%- set_global nav_last = false -%}
 {%- set_global nav_last_group = "" -%}
+{%- set_global nav_parent = false -%}
 {%- for group in config.extra.nav -%}
     {%- for item in group.items -%}
-        {%- set item_url = get_url(path=item.path) | trim_end_matches(pat="/") -%}
+        {%- set item_url = get_url(path=item.path) | trim_end(pat="/") -%}
         {%- if nav_seen and not nav_next -%}
             {%- set_global nav_next = item -%}
             {%- set_global nav_next_group = group.label -%}
@@ -72,6 +81,22 @@
         {%- endif -%}
         {%- set_global nav_last = item -%}
         {%- set_global nav_last_group = group.label -%}
+        {%- for child in item.children | default(value=[]) -%}
+            {%- set child_url = get_url(path=child.path) | trim_end(pat="/") -%}
+            {%- if nav_seen and not nav_next -%}
+                {%- set_global nav_next = child -%}
+                {%- set_global nav_next_group = group.label -%}
+            {%- endif -%}
+            {%- if child_url == here -%}
+                {%- set_global nav_seen = true -%}
+                {%- set_global nav_group = group.label -%}
+                {%- set_global nav_parent = item -%}
+                {%- set_global nav_prev = nav_last -%}
+                {%- set_global nav_prev_group = nav_last_group -%}
+            {%- endif -%}
+            {%- set_global nav_last = child -%}
+            {%- set_global nav_last_group = group.label -%}
+        {%- endfor -%}
     {%- endfor -%}
 {%- endfor -%}
 
@@ -112,10 +137,22 @@
             <div class="sidebar-inner">
                 {% for group in config.extra.nav %}
                 <div class="nav-group">
-                    <div class="nav-group-label">{{ group.label }}</div>
-                    <ul class="nav-links">
+                    <button type="button" class="nav-group-label" aria-expanded="true" aria-controls="nav-group-{{ loop.index }}">
+                        <span>{{ group.label }}</span>
+                        <svg class="nav-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+                    </button>
+                    <ul class="nav-links" id="nav-group-{{ loop.index }}">
                         {% for item in group.items %}
-                        <li><a href="{{ get_url(path=item.path) }}">{{ item.title }}</a></li>
+                        <li>
+                            <a href="{{ get_url(path=item.path) }}">{{ item.title }}</a>
+                            {% if item.children is defined %}
+                            <ul class="nav-sublinks">
+                                {% for child in item.children %}
+                                <li><a href="{{ get_url(path=child.path) }}">{{ child.title }}</a></li>
+                                {% endfor %}
+                            </ul>
+                            {% endif %}
+                        </li>
                         {% endfor %}
                     </ul>
                 </div>
@@ -136,7 +173,21 @@
                 <a href="{{ home | safe }}">Docs</a>
                 <span aria-hidden="true">/</span>
                 <span>{{ nav_group }}</span>
+                {% if nav_parent %}
+                <span aria-hidden="true">/</span>
+                <a href="{{ get_url(path=nav_parent.path) }}">{{ nav_parent.title }}</a>
+                {% endif %}
             </nav>
+            {% endif %}
+
+            {# A subsection page names its parent here, where no page template can
+               forget it, and links up to the index that holds the cross-format
+               material. #}
+            {% if nav_parent %}
+            <a class="badge page-parent" href="{{ get_url(path=nav_parent.path) }}">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                {{ nav_parent.title }}
+            </a>
             {% endif %}
 
             {% block content %}{% endblock %}

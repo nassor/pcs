@@ -1,0 +1,75 @@
+// PCS standalone service configuration, built-in factories only.
+//
+// Run:
+//   cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- validate \
+//     --config examples/configs/standalone.kdl
+//   cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- serve \
+//     --config examples/configs/standalone.kdl
+//
+// The pipeline reads examples/configs/fixtures/orders.csv, runs a WASM processor
+// component, and writes /tmp/pcs-standalone-orders-out.csv. If you change that
+// path, create the parent directory first.
+//
+// Components and systems have no configuration representation: the processor
+// declares them through `describe()`. See crates/pcs-service/src/service/registry.rs.
+
+// Single process, no distributed coordination.
+mode "standalone"
+
+node id=1 name="pcs-standalone" data_dir="${PCS_DATA_DIR:-/tmp/pcs-standalone}"
+
+// Paces repeated iterations: one_shot, continuous, or interval every N ms.
+// Defaults to continuous.
+run_mode kind="one_shot"
+
+// One workflow declares the whole DAG: the byte format both ends speak, the
+// source, the processor, the sink, and the explicit links between them.
+//
+// The processor's `describe()` response supplies the component list, so the
+// `component` properties below must name components it declares. Build the
+// module with `cargo build --release --target wasm32-wasip2`.
+workflow "orders" {
+    // Both FileSource and FileSink move CSV bytes, so one declared transformer
+    // serves them both. csv requires schema_fields and reads has_headers off
+    // its own options, where it defaults to true.
+    transformer "csv_fmt" format="csv" {
+        options has_headers=#true
+    }
+
+    // Sources feed rows into component columns before the pipeline runs.
+    // FileSource requires path and schema_fields.
+    source "csv_orders" type="FileSource" component="orders" transformer="csv_fmt" {
+        config {
+            path "examples/configs/fixtures/orders.csv"
+            schema_fields "id" type="Int64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#true
+            schema_fields "status" type="Utf8" nullable=#true
+        }
+    }
+
+    wasm "process_orders" module="pipelines/orders.wasm"
+
+    // Sinks drain rows from component columns after the pipeline finishes.
+    // FileSink requires path and schema_fields.
+    //
+    // FileSink creates the output file as soon as the factory is built,
+    // including during `validate`, so the parent directory must already
+    // exist.
+    sink "csv_out" type="FileSink" component="orders" transformer="csv_fmt" {
+        config {
+            path "/tmp/pcs-standalone-orders-out.csv"
+            schema_fields "id" type="Int64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#true
+            schema_fields "status" type="Utf8" nullable=#true
+        }
+    }
+
+    link from="csv_orders" to="process_orders"
+    link from="process_orders" to="csv_out"
+}
+
+// HTTP control plane: /health and /metrics. Port 0 takes an ephemeral port.
+http bind="127.0.0.1:0" disabled=#false
+
+// Use log_format="json" in production log aggregators.
+observability log_format="pretty" log_level="info"

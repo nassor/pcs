@@ -1,4 +1,4 @@
-// Stage 3 of the polyglot example: the **TypeScript** guest.
+// Stage 3 of the polyglot example: the **TypeScript** processor.
 //
 // Reads `usd_amount`, which the Python stage wrote, and produces the two risk
 // columns the C# stage turns into a review tier:
@@ -6,9 +6,10 @@
 //   risk_score = usd_amount / risk_threshold      (host config, default 50000)
 //   flagged    = risk_score >= 1.0
 //
-// Both are fixed-width, so this stage only overwrites value bytes inside the
-// input buffer and hands the same array back. See `@nassor/pcs-arrow-ipc` for
-// the wire format and why a guest never writes a flatbuffer.
+// The whole stage is a component declaration and two transforms:
+// `@nassor/pcs-sdk` owns the descriptor, the schema fingerprint, the Arrow
+// decode/encode and the `run-error` shape, so nothing here mentions a buffer, a
+// flatbuffer or a generated constant.
 //
 // Build (jco 1.30.0, Node 24.12+):
 //
@@ -16,129 +17,83 @@
 //   npm run typecheck   # jco writes types/ from the WIT world, then tsc checks
 //   npm run build
 //
-// Three constraints:
-//
-// 1. The host-io import specifier carries the WIT package version. Dropping
-//    `@0.2.0` fails at wizer time with `Error loading module
-//    "pcs:pipeline/host-io"`. `wit.d.ts` points that specifier at the
-//    declarations `jco types` generates, so the import is type-checked.
-// 2. `jco componentize` bundles a TypeScript entrypoint automatically:
-//    StarlingMonkey cannot resolve the `@nassor/pcs-arrow-ipc` import on its
-//    own, and it never sees a type annotation either way.
-// 3. componentize-js lowers a thrown value into the WIT `err` arm, but it
-//    *re-throws* anything that is `instanceof Error`, which traps the
-//    component. Every failure path below therefore throws the plain object
-//    `{ tag: 'permanent', val }`.
+// The SDK carries the three jco constraints this stage used to spell out: the
+// versioned `pcs:pipeline/host-io@0.3.0` import specifier, the plain
+// `{ tag, val }` throw componentize-js needs (it re-throws anything
+// `instanceof Error`, which traps the component), and the `{ describe,
+// runBatch }` export object the `pcs-pipeline` world expects. `npm run build`
+// still needs `--disable http` paired with `--disable fetch-event`, and must
+// leave `clocks` enabled: `run-metrics.wall-ns` comes from `Date.now()`.
 
-import { log, metric, getConfig } from 'pcs:pipeline/host-io@0.2.0';
+import { component, transform, transformBatch, processor, type InferRow } from '@nassor/pcs-sdk';
 
-// The `pcs:pipeline/pipeline@0.2.0` export surface, as `jco types` declares it.
-// Typing `pipeline` against it is what TypeScript buys here: a `describe` that
-// forgot `schemaFingerprint`, or a `run-batch` returning `wallNs` as a number,
-// becomes a compile error instead of a host-side load failure or a silent zero
-// in `/metrics`.
-import type * as WitPipeline from './types/interfaces/pcs-pipeline-pipeline.js';
+/**
+ * The one component this stage declares.
+ *
+ * Field order is the cross-language contract: all six stages declare `Order`
+ * with these twelve fields in this order, and the host refuses a processor
+ * whose schema fingerprint disagrees. Property names are camelCase and the wire
+ * columns are snake_case; the SDK converts, so `usdAmountDisplay` addresses
+ * `usd_amount_display`.
+ */
+const Order = component('Order', {
+  id: 'i64',
+  region: 'utf8',
+  currency: 'utf8',
+  amount: 'f64',
+  valid: 'bool',
+  usdAmount: 'f64',
+  usdAmountDisplay: 'utf8',
+  riskScore: 'f64',
+  flagged: 'bool',
+  fee: 'f64',
+  reviewTier: 'i64',
+  settlement: 'utf8',
+} as const);
 
-import { PcsStream, decodeBase64 } from '@nassor/pcs-arrow-ipc';
-import { ORDER_SCHEMA_IPC_BASE64, ORDER_FINGERPRINT } from './schema_gen.ts';
-
-/** The one component this stage declares. */
-const COMPONENT = 'Order';
+/** The row type the declaration implies, erased before jco ever sees it. */
+type Order = InferRow<typeof Order>;
 
 /** USD volume at which a row scores 1.0 and gets flagged. */
 const DEFAULT_RISK_THRESHOLD = 50000;
 
-const FIELD_USD_AMOUNT = 'usd_amount';
-const FIELD_RISK_SCORE = 'risk_score';
-const FIELD_FLAGGED = 'flagged';
-
-// Decoded at module load: jco snapshots the initialised module into the
-// component, so this 584-byte decode never runs on the hot path.
-const ORDER_SCHEMA_IPC = decodeBase64(ORDER_SCHEMA_IPC_BASE64);
+/**
+ * Score one row.
+ *
+ * `config.float` refuses a threshold that is not a positive finite number: that
+ * is an operator error, not a row error, so it fails the whole batch rather
+ * than silently scoring every row `Infinity`. The read is memoised per batch,
+ * so asking for it per row costs one host call.
+ */
+const score = transform(Order, (row: Order, config) => {
+  const threshold = config.float('risk_threshold', DEFAULT_RISK_THRESHOLD);
+  row.riskScore = row.usdAmount / threshold;
+  row.flagged = row.riskScore >= 1.0;
+});
 
 /**
- * Read a numeric host config value.
+ * Report what the batch did.
  *
- * `get-config` hands over strings and leaves parsing to the guest; a value that
- * is not a usable positive number is an operator error, not a row error, so it
- * fails the whole batch rather than silently scoring every row `Infinity`.
+ * A per-row transform cannot emit a batch total: one metric observation and one
+ * log line per row would be the row count of each. `transformBatch` runs once,
+ * after `score`, so it observes the flags that transform just wrote.
  */
-function configNumber(key: string, fallback: number): number {
-  const raw = getConfig(key);
-  if (raw === undefined) {
-    return fallback;
-  }
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`config "${key}" must be a positive number, got ${JSON.stringify(raw)}`);
-  }
-  return value;
-}
-
-export const pipeline: typeof WitPipeline = {
-  describe() {
-    // Every field is a generated constant: the schema bytes and the fingerprint
-    // come from the canonical Rust `Order`, so this stage cannot drift from the
-    // five others. The driver asserts all six fingerprints are equal.
-    return {
-      name: 'polyglot-score-ts',
-      version: '0.1.0',
-      components: [{ name: COMPONENT, arrowSchemaIpc: ORDER_SCHEMA_IPC }],
-      stateful: false,
-      schemaFingerprint: ORDER_FINGERPRINT,
-    };
-  },
-
-  /**
-   * Score one batch.
-   *
-   * `prior` is ignored: this stage is stateless, so it returns no checkpoint and
-   * the host persists nothing for it.
-   */
-  runBatch(input) {
-    // StarlingMonkey's clock is millisecond-resolution, so a small batch
-    // reports 0 ns.
-    const startedMs = Date.now();
-    try {
-      const threshold = configNumber('risk_threshold', DEFAULT_RISK_THRESHOLD);
-      const stream = new PcsStream(input);
-      const batch = stream.component(COMPONENT);
-
-      const usdAmount = batch.float64s(FIELD_USD_AMOUNT);
-      let flaggedRows = 0;
-      for (let row = 0; row < batch.rows; row += 1) {
-        const score = usdAmount[row] / threshold;
-        const flagged = score >= 1.0;
-        batch.setFloat64(FIELD_RISK_SCORE, row, score);
-        batch.setBool(FIELD_FLAGGED, row, flagged);
-        if (flagged) {
-          flaggedRows += 1;
-        }
-      }
-
-      metric('score.flagged_rows', flaggedRows);
-      log(
-        'info',
-        'score',
-        `scored ${batch.rows} rows against threshold ${threshold}, flagged ${flaggedRows}`,
-      );
-
-      const rows = BigInt(batch.rows);
-      return {
-        output: stream.toBytes(),
-        checkpoint: undefined,
-        metrics: {
-          wallNs: BigInt(Date.now() - startedMs) * 1_000_000n,
-          rowsIn: rows,
-          rowsOut: rows,
-          systemsRun: 1,
-          retries: 0,
-        },
-      };
-    } catch (err) {
-      // A malformed batch or a bad config value will not fix itself on a retry,
-      // and `run-batch` must never surface `schema-mismatch`.
-      throw { tag: 'permanent', val: String(err) };
+const report = transformBatch(Order, (rows, config) => {
+  let flaggedRows = 0;
+  for (const row of rows) {
+    if (row.flagged) {
+      flaggedRows += 1;
     }
-  },
-};
+  }
+  const threshold = config.float('risk_threshold', DEFAULT_RISK_THRESHOLD);
+  config.metric('score.flagged_rows', flaggedRows);
+  config.log(
+    'info',
+    'score',
+    `scored ${rows.length} rows against threshold ${threshold}, flagged ${flaggedRows}`,
+  );
+});
+
+// Stateless: the SDK returns no checkpoint, so the host persists nothing for
+// this stage.
+export const pipeline = processor('polyglot-score-ts', '0.1.0', score, report);

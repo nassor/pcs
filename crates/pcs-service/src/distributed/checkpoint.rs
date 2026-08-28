@@ -22,7 +22,7 @@ pub const ACCUMULATOR_STAGE_SENTINEL: u32 = u32::MAX;
 /// stage index, which number from 0 and stay in the dozens. The payload is whatever
 /// [`PipelineRuntime::run_on_with_state`](pcs_core::runtime::PipelineRuntime::run_on_with_state)
 /// returned; the host never interprets it.
-pub const GUEST_STATE_STAGE_SENTINEL: u32 = u32::MAX - 1;
+pub const PROCESSOR_STATE_STAGE_SENTINEL: u32 = u32::MAX - 1;
 
 /// A persisted intermediate snapshot of pipeline state for one claim stage.
 ///

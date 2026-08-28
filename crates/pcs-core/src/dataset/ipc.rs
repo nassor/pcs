@@ -1,5 +1,5 @@
 //! Arrow IPC serialisation for [`Dataset`]: the bytes that cross the host and
-//! guest boundary, and the bytes a checkpoint holds.
+//! processor boundary, and the bytes a checkpoint holds.
 //!
 //! The payload is not one Arrow IPC stream. It is a sequence of
 //! length-prefixed streams closed by a zero sentinel:
@@ -17,7 +17,7 @@
 //! former.
 //!
 //! The byte level specification, down to flatbuffer field ids and per type
-//! buffer layouts, is the `Host to guest wire format` page of the docs site.
+//! buffer layouts, is the `Host to processor wire format` page of the docs site.
 
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -39,7 +39,7 @@ impl Dataset {
     /// Stamp a component's identity onto a copy of its batch schema.
     ///
     /// `__pcs_component` is what the reader dispatches on, and
-    /// `__pcs_schema_version` is what a guest compares against its own
+    /// `__pcs_schema_version` is what a processor compares against its own
     /// registration, so a segment without them is unreadable.
     fn annotate_batch(
         batch: &RecordBatch,
@@ -157,18 +157,24 @@ impl Dataset {
 
     /// Reconstruct a `Dataset` from an IPC stream produced by [`write_ipc`](Self::write_ipc).
     ///
-    /// The stream is untrusted: it may be operator-supplied, a guest's
+    /// The stream is untrusted: it may be operator-supplied, a processor's
     /// `run-batch` output, or a checkpoint read back from storage. Arrow-rs
     /// itself panics rather than erroring on some malformed buffer spans
     /// (documented on `Buffer::slice_with_length`'s `# Panics`), so the
     /// decode runs behind [`catch_unwind`] and turns any such panic into an
     /// `Err` instead of taking down the caller.
     ///
+    /// A component may hold fewer rows than the dataset's row count — a
+    /// windowing processor's output reduces N input rows to M result rows —
+    /// but never more: the `__alive` bitmap is the dataset's row bound, and a
+    /// component longer than it is corruption.
+    ///
     /// # Errors
     ///
     /// Returns `PcsError::Generic` if the stream is malformed, truncated,
-    /// contains batches without the `__pcs_component` metadata key, or
-    /// decodes to a buffer whose declared span exceeds its message body.
+    /// contains batches without the `__pcs_component` metadata key, decodes to
+    /// a buffer whose declared span exceeds its message body, or holds a
+    /// component with more rows than the alive bitmap.
     pub fn read_ipc<R: Read>(reader: &mut R) -> Result<Self, PcsError> {
         let mut dataset = Self::new();
         let mut alive_count: u32 = 0;
@@ -301,9 +307,15 @@ impl Dataset {
             ));
         }
 
+        // A component may hold *fewer* rows than the dataset's row count: that
+        // is exactly what a windowing processor outputs, where N input rows
+        // reduce to M result rows in a separate component, and it matches the
+        // in-memory model, where `append` grows components independently. A
+        // component with MORE rows than the alive bitmap is still corruption:
+        // the bitmap is the dataset's row bound and no component may exceed it.
         for (name, chunks) in &dataset.components {
             let component_rows: usize = chunks.iter().map(|b| b.num_rows()).sum();
-            if component_rows != dataset.row_count {
+            if component_rows > dataset.row_count {
                 return Err(PcsError::generic(format!(
                     "IPC component '{name}' has {component_rows} rows but alive bitmap has {}; \
                      stream is corrupted",
@@ -461,11 +473,29 @@ mod tests {
 
     #[test]
     fn test_read_ipc_row_count_mismatch_returns_error() {
+        // A component with MORE rows than the alive bitmap is corruption: the
+        // bitmap is the dataset's row bound.
         let buf = build_ipc_buffer(10, Some(5), false);
         let mut cursor = std::io::Cursor::new(&buf);
         let result = Dataset::read_ipc(&mut cursor);
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("IpcOrder"));
+    }
+
+    #[test]
+    fn test_read_ipc_shorter_component_is_accepted() {
+        // A component with FEWER rows than the alive bitmap is a results
+        // component: exactly what a windowing processor outputs when N input
+        // rows reduce to M aggregate rows. The component keeps its own length;
+        // the dataset's row count is the maximum.
+        let buf = build_ipc_buffer(3, Some(10), false);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let restored = Dataset::read_ipc(&mut cursor).expect("shorter component decodes");
+        assert_eq!(restored.rows(), 10);
+        let orders = restored
+            .batch_for("IpcOrder")
+            .expect("IpcOrder component present");
+        assert_eq!(orders.num_rows(), 3);
     }
 
     /// A length prefix that promises more bytes than the stream holds must be

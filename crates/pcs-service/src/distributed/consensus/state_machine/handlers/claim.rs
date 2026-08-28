@@ -678,8 +678,8 @@ mod tests {
         )
         .unwrap();
 
-        let claim_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let instance_id = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -728,9 +728,9 @@ mod tests {
         )
         .unwrap();
 
-        let c1 = uuid::Uuid::new_v4();
-        let c2 = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let c1 = uuid::Uuid::now_v7();
+        let c2 = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
 
         apply(
             &db,
@@ -781,8 +781,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -826,8 +826,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn test_heartbeat_stores_instance() {
         let (db, _path) = temp_db();
-        let inst = uuid::Uuid::new_v4();
+        let inst = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::Heartbeat {
@@ -888,8 +888,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -941,8 +941,8 @@ mod tests {
         )
         .unwrap();
 
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -996,7 +996,7 @@ mod tests {
         }
 
         // Claim a second range.
-        let claim2 = uuid::Uuid::new_v4();
+        let claim2 = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn test_secondary_index_batch_isolation() {
         let (db, _path) = temp_db();
-        let inst = uuid::Uuid::new_v4();
+        let inst = uuid::Uuid::now_v7();
 
         for batch_id in 1u64..=3 {
             apply(
@@ -1058,7 +1058,7 @@ mod tests {
         }
 
         // Claim rows 0..50 in batch 2.
-        let c2 = uuid::Uuid::new_v4();
+        let c2 = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -1074,7 +1074,7 @@ mod tests {
         .unwrap();
 
         // Claiming the same rows in batch 1 must succeed (different batch).
-        let c1 = uuid::Uuid::new_v4();
+        let c1 = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -1094,7 +1094,7 @@ mod tests {
         );
 
         // Claiming the same rows in batch 2 must be rejected (overlap).
-        let c2b = uuid::Uuid::new_v4();
+        let c2b = uuid::Uuid::now_v7();
         let resp2 = apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -1130,8 +1130,8 @@ mod tests {
         )
         .unwrap();
 
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         let cmd = ConsensusCommand::ClaimRowRange {
             batch_id: 1,
             row_range_start: 0,
@@ -1191,8 +1191,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         // Claim at t=1000, ttl=60_000 → expires at 61_000.
         apply(
             &db,
@@ -1258,8 +1258,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         // Claim at t=0 with ttl=100 → expires at 100.
         apply(
             &db,
@@ -1313,7 +1313,7 @@ mod tests {
         assert_eq!(rec_after.lease_expires_at, 0);
 
         // The range must now be claimable again by a different claim_id.
-        let claim_id2 = uuid::Uuid::new_v4();
+        let claim_id2 = uuid::Uuid::now_v7();
         let resp_reclaim = apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -1437,9 +1437,9 @@ mod tests {
     fn test_claim_row_range_idempotency_wrong_instance_rejected() {
         let (db, _path) = temp_db();
         let batch_id = 77u64;
-        let claim_id = uuid::Uuid::new_v4();
-        let instance_a = uuid::Uuid::new_v4();
-        let instance_b = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let instance_a = uuid::Uuid::now_v7();
+        let instance_b = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::RegisterMasterBatch {
@@ -1493,7 +1493,7 @@ mod tests {
     fn test_ack_claim_wrong_instance_rejected() {
         let (db, _path) = temp_db();
         let (claim_id, _correct) = seed_claimed_guard(&db);
-        let wrong_instance = uuid::Uuid::new_v4();
+        let wrong_instance = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::AckClaim {
@@ -1518,7 +1518,7 @@ mod tests {
     fn test_release_claim_wrong_instance_rejected() {
         let (db, _path) = temp_db();
         let (claim_id, _correct) = seed_claimed_guard(&db);
-        let wrong_instance = uuid::Uuid::new_v4();
+        let wrong_instance = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::ReleaseClaim {
@@ -1583,8 +1583,8 @@ mod tests {
     fn test_late_ack_after_reclaim_rejected() {
         let (db, _path) = temp_db();
         let batch_id = 88u64;
-        let claim_a = uuid::Uuid::new_v4();
-        let instance_a = uuid::Uuid::new_v4();
+        let claim_a = uuid::Uuid::now_v7();
+        let instance_a = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::RegisterMasterBatch {
@@ -1648,7 +1648,7 @@ mod tests {
     fn test_renew_claim_wrong_instance_rejected() {
         let (db, _path) = temp_db();
         let (claim_id, _correct) = seed_claimed_guard(&db);
-        let wrong_instance = uuid::Uuid::new_v4();
+        let wrong_instance = uuid::Uuid::now_v7();
         let resp = apply(
             &db,
             ConsensusCommand::RenewClaim {

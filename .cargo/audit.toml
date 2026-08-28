@@ -1,0 +1,29 @@
+# cargo audit policy. `cargo audit` exits nonzero on any unignored advisory.
+
+# Both RUSTSEC-2026-0194 (quadratic duplicate-attribute check) and
+# RUSTSEC-2026-0195 (unbounded namespace allocation in NsReader) affect
+# quick-xml <0.41.0, and both are fixed in quick-xml >=0.41.0.
+#
+# This workspace cannot reach that version through the registry: the newest
+# releases of datafusion (55.0.0) and parquet (59.2.0) both require
+# object_store ^0.13.2, whose newest 0.13.x (0.13.2) requires quick-xml
+# ^0.39.0. object_store 0.14.1 (quick-xml ^0.41.0) is the fixed line, but no
+# datafusion/parquet release accepts it yet. quick-xml publishes no 0.39.x
+# patch, and a vendored fork cannot help: cargo audit matches the version
+# string, and re-versioning the fork above 0.41.0 would violate object_store's
+# ^0.39.0 requirement.
+#
+# Reachability is limited: object_store uses quick-xml only to parse XML
+# responses from the configured object-storage endpoint, so the attack surface
+# is the S3 connection the operator configures, not unauthenticated input.
+# pcs-connector-datafusion never parses remote XML (its object_store copy is
+# inert under the DataFusionSource use).
+#
+# Remove both entries when datafusion or parquet publishes a release whose
+# object_store requirement admits 0.14.x (or later), then run
+# `cargo update` and re-verify `cargo audit`.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

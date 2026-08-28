@@ -24,27 +24,27 @@ The repository has a harness. It fixes the compiler flags, compiles as a
 separate step, extracts the exact benchmark binary from cargo's output and runs
 it directly. That is what makes these numbers comparable run to run:
 
-```bash
+```bash,name=The harness commands behind these numbers
 # Columnar pipeline benchmarks
-scripts/bench.sh tpch_q6
-scripts/bench.sh tpch_q1
-scripts/bench.sh parallelism_compute
-scripts/bench.sh ipc_checkpoint
+cargo xtask bench tpch_q6
+cargo xtask bench tpch_q1
+cargo xtask bench parallelism_compute
+cargo xtask bench ipc_checkpoint
 
 # Batch versus stream, and the stage cost curve
-scripts/bench.sh batch_vs_stream
+cargo xtask bench batch_vs_stream
 
 # SQL comparison
-scripts/bench.sh vs_datafusion_q6
+cargo xtask bench vs_datafusion_q6
 
 # Service-level per-item latency, native and WASM
-cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
+cargo build --release -p pcs-processor-smoketest --target wasm32-wasip2
 RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C codegen-units=1" \
   cargo run --release -p pcs-service --features service,wasm --example stream_latency
 ```
 
 The harness knows each benchmark's package and features, so do not pass your
-own: `batch_vs_stream` needs `io` and `vs_datafusion_q6` needs `datafusion`,
+own: `batch_vs_stream` needs `pcs-core`'s `io` feature and `vs_datafusion_q6` needs none,
 while `tpch_q6`, `tpch_q1`, `parallelism_compute` and `ipc_checkpoint` are built
 with no extra features. Cargo's metadata hash encodes the feature set, so a
 different `--features` list produces a *different binary*.
@@ -213,13 +213,13 @@ to arrive at the sink.
 <!-- fig:latency -->
 <div class="dgm animate-in">
     <div class="dgm-scroll"><svg viewBox="0 0 660 236" role="img" aria-labelledby="lat-t lat-d">
-        <title id="lat-t">Per-item round trip latency, native path against a WebAssembly guest</title>
+        <title id="lat-t">Per-item round trip latency, native path against a WebAssembly processor</title>
         <desc id="lat-d">
             Logarithmic, one gridline per ten-fold step. Native source to systems to sink, over 10
             000 items: mean 1.0 µs, p50 1 µs, p99 2 µs, max 6 µs. The same single-row round trip
-            through a WebAssembly guest calling run_on_with_state, over 1 000 items: mean 179.4
-            µs, p50 159 µs, p99 420 µs, max 678 µs. Every WASM bar sits roughly two gridlines, two
-            orders of magnitude, to the right of its native counterpart.
+            through a WebAssembly processor calling run_on_with_state, over 1 000 items: mean
+            179.4 µs, p50 159 µs, p99 420 µs, max 678 µs. Every WASM bar sits roughly two
+            gridlines, two orders of magnitude, to the right of its native counterpart.
         </desc>
         <text class="t-ax" x="0" y="11">ROUND TRIP, PRODUCER TO SINK · LOG SCALE</text>
         <path class="grid" d="M149.2 20 V214"/>
@@ -243,7 +243,7 @@ to arrive at the sink.
         <text class="t-sm t-end" x="96" y="96">max</text>
         <rect class="bar bar-data" x="108" y="87" width="147.8" height="9" rx="2"/>
         <text class="t-num" x="261.8" y="96">6 µs</text>
-        <text class="t-lbl" x="0" y="142">WASM guest · run_on_with_state · n = 1 000</text>
+        <text class="t-lbl" x="0" y="142">WASM processor · run_on_with_state · n = 1 000</text>
         <text class="t-sm t-end" x="96" y="159">mean</text>
         <rect class="bar bar-bnd" x="108" y="150" width="349.8" height="9" rx="2"/>
         <text class="t-num" x="463.8" y="159">179.4 µs</text>
@@ -264,8 +264,8 @@ to arrive at the sink.
     </div>
     <figcaption class="dgm-cap">
         Timed from the producer: send one single-row batch, wait for the transformed row to
-        arrive at the sink. Sample counts differ: 10 000 native, 1 000 through the guest. The
-        WASM tail is the thinly sampled half of the chart.
+        arrive at the sink. Sample counts differ: 10 000 native, 1 000 through the processor.
+        The WASM tail is the thinly sampled half of the chart.
     </figcaption>
 </div>
 <!-- /fig:latency -->
@@ -768,15 +768,15 @@ Every bar here comes from one build with thin LTO enabled, which optimises the
 whole bench unit graph, `serde` and `postcard` included. Comparisons within this
 chart are sound; do not compare a bar here against a figure from another build.
 
-For stream mode: a WASM guest that returns a checkpoint pays about 9 µs of IPC
-round trip per item on top of everything else, which is a large part of why the
-WASM p99 above sits at 420 µs while the native path is at 2 µs. A guest that
-carries no state should return `None` rather than an empty dataset.
+For stream mode: a WASM processor that returns a checkpoint pays about 9 µs of
+IPC round trip per item on top of everything else, which is a large part of why
+the WASM p99 above sits at 420 µs while the native path is at 2 µs. A processor
+that carries no state should return `None` rather than an empty dataset.
 
 ## Against DataFusion
 
 The same Q6 revenue sum, narrow schema, run through DataFusion 55 as SQL over a
-`MemTable`. Source: `crates/pcs-service/benches/vs_datafusion_q6.rs`.
+`MemTable`. Source: `crates/pcs-connector-datafusion/benches/vs_datafusion_q6.rs`.
 
 <!-- fig:datafusion -->
 <div class="dgm animate-in">

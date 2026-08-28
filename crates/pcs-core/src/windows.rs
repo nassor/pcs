@@ -23,4 +23,4 @@ pub use function::{ProcessWindowFn, ReduceAggregate, WindowContext, WindowFuncti
 pub use result::{DroppedLate, SideOutput, WindowResults};
 pub use spec::WindowSpec;
 pub use system::{WindowedSystem, WindowedSystemBuilder};
-pub use watermark::WatermarkState;
+pub use watermark::{WatermarkState, WindowWatermark};

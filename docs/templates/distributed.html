@@ -241,8 +241,8 @@
         <tr>
             <td><code>service-cluster</code></td>
             <td><code>service</code> plus <code>distributed-raft</code> &mdash; what the
-                <code>pcs-service</code> binary needs to run <code>mode = "cluster"</code>
-                from TOML.</td>
+                <code>pcs-service</code> binary needs to run <code>mode "cluster"</code>
+                from a config file.</td>
         </tr>
     </tbody>
 </table>
@@ -451,12 +451,12 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <text class="t-sm" x="140" y="317">the window accumulator</text>
         </g>
 
-        <!-- ── the guest boundary ─────────────────────────────────────── -->
+        <!-- ── the processor boundary ─────────────────────────────────────── -->
         <g class="anim anim-4">
             <rect class="blk blk-bnd" x="438" y="218" width="216" height="44" rx="8"/>
             <rect class="hd hd-bnd" x="438" y="218" width="216" height="22" rx="8"/>
             <rect class="hd hd-bnd" x="438" y="232" width="216" height="8"/>
-            <text class="t-lbl t-bnd" x="450" y="233">WASM guest</text>
+            <text class="t-lbl t-bnd" x="450" y="233">WASM processor</text>
             <text class="t-sm" x="450" y="252">run-batch returns it</text>
 
             <path class="arw arw-bnd" d="M546 264 V292 H424" marker-end="url(#dst-s-b)"/>
@@ -479,7 +479,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
     <div class="dgm-key">
         <span class="k-control"><i></i> replicated coordination state</span>
         <span class="k-data"><i></i> Arrow IPC payloads</span>
-        <span class="k-boundary"><i></i> produced inside the guest</span>
+        <span class="k-boundary"><i></i> produced inside the processor</span>
     </div>
     <figcaption class="dgm-cap">
         Every node has the whole picture, but only <code>raft-log.redb</code> is agreed on.
@@ -504,7 +504,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <td>The whole partition <code>Dataset</code>, written by the runner after the run.</td>
         </tr>
         <tr>
-            <td><code>GUEST_STATE_STAGE_SENTINEL</code></td>
+            <td><code>PROCESSOR_STATE_STAGE_SENTINEL</code></td>
             <td><code>u32::MAX - 1</code></td>
             <td>Whatever <code>run_on_with_state</code> returned. Opaque to the host.</td>
         </tr>
@@ -587,8 +587,8 @@ let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clon
     <code>BTreeMap&lt;u64, openraft::BasicNode&gt;</code>; a second call is swallowed as a
     no-op. Because <code>BasicNode</code> comes from openraft and PCS pins
     <code>=0.10.0-alpha.17</code>, a crate calling <code>initialize</code> directly has to
-    match that pin. The <code>pcs-service</code> binary does all of this from TOML under
-    <code>mode = "cluster"</code>, so hand-rolling it is only for embedding the runner in
+    match that pin. The <code>pcs-service</code> binary does all of this from a config file
+    under <code>mode "cluster"</code>, so hand-rolling it is only for embedding the runner in
     your own process.
 </p>
 
@@ -624,7 +624,7 @@ let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clon
     startup avoids a replica that diverges quietly.
 </p>
 
-<h2 id="guest-state">State that outlives a batch</h2>
+<h2 id="processor-state">State that outlives a batch</h2>
 
 <p>
     A native <code>Pipeline</code> keeps everything it knows in the <code>Dataset</code>, so
@@ -633,8 +633,8 @@ let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clon
 </p>
 
 <p>
-    A WASM guest cannot do that. Every call gets a fresh wasmtime <code>Store</code>, so
-    guest linear memory does not survive a batch. That is deliberate: a trapped instance
+    A WASM processor cannot do that. Every call gets a fresh wasmtime <code>Store</code>, so
+    processor linear memory does not survive a batch. That is deliberate: a trapped instance
     cannot corrupt anything that outlives it. The one channel left is the return value:
 </p>
 
@@ -648,21 +648,21 @@ let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clon
 </div>
 
 <p>
-    <code>WasmPipelineRuntime</code> passes <code>prior</code> straight into the guest's
+    <code>WasmPipelineRuntime</code> passes <code>prior</code> straight into the processor's
     <code>run-batch</code> export and returns the <code>checkpoint</code> field of the
     result. The runner stores that blob under
-    <code>GUEST_STATE_STAGE_SENTINEL</code> and hands it back as the next call's
-    <code>prior</code>. On the guest side, one macro form opts in:
+    <code>PROCESSOR_STATE_STAGE_SENTINEL</code> and hands it back as the next call's
+    <code>prior</code>. On the processor side, one macro form opts in:
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>Rust</span><em>in the guest crate</em></div>
+    <div class="code-cap"><span>Rust</span><em>in the processor crate</em></div>
     <pre><code class="language-rust">// Stateless: `prior` is ignored, `checkpoint` is always None.
-pcs_guest::export_pipeline!(build);
+pcs_processor::export_pipeline!(build);
 
-// Stateful: systems read and write a `GuestState&lt;Counter&gt;` resource, and
+// Stateful: systems read and write a `ProcessorState&lt;Counter&gt;` resource, and
 // whatever they leave in it becomes the next batch's `prior`.
-pcs_guest::export_pipeline!(build, state = Counter);</code></pre>
+pcs_processor::export_pipeline!(build, state = Counter);</code></pre>
 </div>
 
 <p>
@@ -671,20 +671,20 @@ pcs_guest::export_pipeline!(build, state = Counter);</code></pre>
     one, because the state machine resolves a checkpoint's <code>batch_id</code> through the
     claims table and rejects a write whose uuid is not a live claim. Reads survive the ack,
     so the chain holds for as long as the runner loop does. A runner that restarts hands the
-    runtime <code>None</code>, so the guest starts cold and rebuilds its state.
+    runtime <code>None</code>, so the processor starts cold and rebuilds its state.
 </p>
 
 <h2 id="next">Next</h2>
 
 <div class="next-steps-grid">
-    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
-        <span class="next-card-label">Running at scale</span>
+    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
+        <span class="next-card-label">Service</span>
         <h3>Service</h3>
-        <p>Stop writing <code>main</code>. Describe the same deployment in TOML and let the
-            <code>pcs-service</code> binary build it.</p>
+        <p>Stop writing <code>main</code>. Describe the same deployment in a config file and
+            let the <code>pcs-service</code> binary build it.</p>
     </a>
     <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
-        <span class="next-card-label">Running at scale</span>
+        <span class="next-card-label">Service</span>
         <h3>Operating pcs-service</h3>
         <p>Data directories, bootstrap, rolling restarts, and what to watch when a lease
             starts flapping.</p>

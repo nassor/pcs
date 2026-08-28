@@ -1,41 +1,35 @@
 // Package export_pcs_pipeline_pipeline implements the `pcs:pipeline/pipeline`
-// export for stage 1 of the polyglot example, the **Go** guest.
+// export for stage 1 of the polyglot example, the **Go** processor.
 //
 // It reads `amount` and writes `valid`, the gate every later stage keys off:
 // the Python stage converts only valid rows, the Kotlin stage charges a fee only
 // on valid rows, and the Rust stage rejects the invalid ones outright.
 //
+// The whole stage is the [Order] struct, one transform function, and the two
+// export wrappers below. The SDK derives the Arrow schema and the schema
+// fingerprint from the struct, decodes the host's stream into `Order` values,
+// runs the transform, and re-encodes. Nothing here parses a flatbuffer, embeds a
+// generated schema constant, or addresses a column by name.
+//
 // The package name and the `wit_component/...` import paths are not a choice:
 // `componentize-go bindings` generates `wit_exports.go`, which imports this
 // package by that exact path and calls exactly Describe and RunBatch. It also
-// rewrites go.mod's module line to `wit_component`.
-//
-// # Why there is no Arrow dependency
-//
-// Writing `valid` means overwriting one bit per row in a fixed-width value
-// buffer, so this stage mutates the input Arrow IPC bytes in place and hands the
-// same buffer back. The codec is the arrowipc package, an ordinary module
-// dependency, which documents the format and what in-place mutation cannot do.
-// Everything else in the stream, including the trailing `__alive` bitmap, passes
-// through untouched.
+// rewrites go.mod's module line to `wit_component`, which is why the SDK reaches
+// the host through an interface this file implements rather than importing the
+// generated bindings itself.
 //
 // # Why nothing here panics
 //
 // A Go panic inside a component traps the instance, and the host then sees an
 // opaque wasm trap instead of a reason. Every failure path is therefore folded
 // into `run-error::permanent`, which the WIT contract designates for bad input
-// shape and guest bugs; `schema-mismatch` must never come out of `run-batch`.
+// shape and processor bugs; `schema-mismatch` must never come out of `run-batch`.
 package export_pcs_pipeline_pipeline
 
 import (
-	"fmt"
-	"strconv"
-	"strings"
-	"time"
-
 	witTypes "go.bytecodealliance.org/pkg/wit/types"
 
-	arrowipc "github.com/nassor/pcs/packages/arrow-ipc-go"
+	pcs "github.com/nassor/pcs/packages/pcs-sdk-go"
 	hostio "wit_component/pcs_pipeline_host_io"
 	"wit_component/pcs_pipeline_types"
 )
@@ -49,54 +43,100 @@ const (
 	// logTarget is the tracing target the host bridges host-io::log onto.
 	logTarget = "validate"
 
-	componentName = "Order"
-	fieldAmount   = "amount"
-	fieldValid    = "valid"
-
 	// minAmountKey is read from `pipeline.wasm.config` in the service TOML, or
 	// from the driver's config map. Absent means "no floor".
 	minAmountKey     = "min_amount"
 	minAmountDefault = 0.0
+
+	// invalidRowsMetric counts the rows this stage rejected, summed over the
+	// batch and reported once.
+	invalidRowsMetric = "validate.invalid_rows"
 )
 
-var orderSchemaIPC, orderSchemaIPCErr = arrowipc.DecodeBase64(OrderSchemaIPCBase64)
-
-// orderSchema returns the generated schema-only Arrow IPC stream.
+// Order is the chain's row type: these twelve columns in this order are the
+// cross-language contract every stage agrees on, and the order the schema
+// fingerprint is computed in.
 //
-// The constant is compiled in, so a decode failure is a corrupt generated file
-// and is worth decoding, and reporting, exactly once.
-func orderSchema() ([]byte, error) {
-	if orderSchemaIPCErr != nil {
-		return nil, fmt.Errorf("decode OrderSchemaIPCBase64: %w", orderSchemaIPCErr)
-	}
-	return orderSchemaIPC, nil
+// The struct is the schema. The `pcs` tags spell the wire names out rather than
+// leaning on the SDK's lower snake case default, because these names are shared
+// with five other languages and a Go rename must not silently move a column.
+type Order struct {
+	ID               int64   `pcs:"id"`
+	Region           string  `pcs:"region"`
+	Currency         string  `pcs:"currency"`
+	Amount           float64 `pcs:"amount"`
+	Valid            bool    `pcs:"valid"`
+	UsdAmount        float64 `pcs:"usd_amount"`
+	UsdAmountDisplay string  `pcs:"usd_amount_display"`
+	RiskScore        float64 `pcs:"risk_score"`
+	Flagged          bool    `pcs:"flagged"`
+	Fee              float64 `pcs:"fee"`
+	ReviewTier       int64   `pcs:"review_tier"`
+	Settlement       string  `pcs:"settlement"`
 }
 
-// Describe reports the stage identity and the one component it operates on.
+// stage is the processor. It is a package-level var so the schema derivation and
+// the descriptor encoding happen once, at instantiation, rather than on the
+// first batch.
+var stage = pcs.New(stageName, stageVersion,
+	pcs.Transform("validate", func(row *Order, cfg pcs.Config) error {
+		minAmount, err := cfg.Float64(minAmountKey, minAmountDefault)
+		if err != nil {
+			return err
+		}
+		row.Valid = row.Amount > minAmount
+
+		// Counted unconditionally, so a batch with nothing to reject still
+		// reports a zero rather than dropping the series.
+		invalid := 0.0
+		if !row.Valid {
+			invalid = 1
+		}
+		cfg.Count(invalidRowsMetric, invalid)
+		return nil
+	}),
+).Bind(host{})
+
+// host bridges the SDK onto the generated host-io bindings.
 //
-// The schema bytes and the fingerprint are generated constants rather than
-// values computed here: encoding an Arrow schema flatbuffer would mean shipping
-// a writer, and the fingerprint is derived from the canonical Rust `Order`
-// definition. The driver and the integration test both fail loudly if either
-// constant drifts from that definition.
+// The SDK cannot import them: `componentize-go bindings` regenerates them into
+// whichever stage module it is run in, always under the module name
+// `wit_component`, so the import path is not unique across stages. The log
+// target is supplied here for the same reason it is a constant, it names this
+// stage to the host's tracing subscriber.
+type host struct{}
+
+func (host) GetConfig(key string) (string, bool) {
+	value := hostio.GetConfig(key)
+	if !value.IsSome() {
+		return "", false
+	}
+	return value.Some(), true
+}
+
+func (host) Log(level pcs.LogLevel, message string) {
+	hostio.Log(hostio.LogLevel(level), logTarget, message)
+}
+
+func (host) Metric(name string, value float64) { hostio.Metric(name, value) }
+
+// Describe reports the stage identity and the one component it operates on.
 func Describe() pcs_pipeline_types.PipelineDescriptor {
-	schema, err := orderSchema()
-	if err != nil {
-		// describe() has no error arm in the WIT world. A corrupt generated
-		// constant is reported here and then surfaces as a load-time failure
-		// when the host tries to parse the empty schema — which is a far better
-		// diagnostic than trapping the instance.
-		hostio.Log(hostio.LogLevelError, logTarget, err.Error())
+	descriptor := stage.Describe()
+
+	components := make([]pcs_pipeline_types.ComponentDescriptor, len(descriptor.Components))
+	for i, c := range descriptor.Components {
+		components[i] = pcs_pipeline_types.ComponentDescriptor{
+			Name:           c.Name,
+			ArrowSchemaIpc: c.ArrowSchemaIPC,
+		}
 	}
 	return pcs_pipeline_types.PipelineDescriptor{
-		Name:    stageName,
-		Version: stageVersion,
-		Components: []pcs_pipeline_types.ComponentDescriptor{{
-			Name:           componentName,
-			ArrowSchemaIpc: schema,
-		}},
-		Stateful:          false,
-		SchemaFingerprint: OrderFingerprint,
+		Name:              descriptor.Name,
+		Version:           descriptor.Version,
+		Components:        components,
+		Stateful:          descriptor.Stateful,
+		SchemaFingerprint: descriptor.SchemaFingerprint,
 	}
 }
 
@@ -106,82 +146,30 @@ func Describe() pcs_pipeline_types.PipelineDescriptor {
 // batches, which is what `stateful: false` in Describe promises the host.
 func RunBatch(input []uint8, prior witTypes.Option[[]uint8]) witTypes.Result[pcs_pipeline_types.RunResult, pcs_pipeline_types.RunError] {
 	_ = prior
-	started := time.Now()
 
-	minAmount, err := configFloat(minAmountKey, minAmountDefault)
+	outcome, err := stage.RunBatch(input)
 	if err != nil {
-		return failure("%v", err)
+		// Nothing this stage can hit is worth a host retry: the same bytes and
+		// the same config would fail again.
+		message := err.Error()
+		hostio.Log(hostio.LogLevelError, logTarget, stageName+": "+message)
+		return witTypes.Err[pcs_pipeline_types.RunResult, pcs_pipeline_types.RunError](
+			pcs_pipeline_types.MakeRunErrorPermanent(message),
+		)
 	}
 
-	stream, err := arrowipc.Parse(input)
-	if err != nil {
-		return failure("parse input stream: %v", err)
-	}
-	batch, err := stream.Component(componentName)
-	if err != nil {
-		return failure("locate %s batch: %v", componentName, err)
-	}
-	amounts, err := batch.Float64s(fieldAmount)
-	if err != nil {
-		return failure("read %s.%s: %v", componentName, fieldAmount, err)
-	}
-
-	invalid := 0
-	for row, amount := range amounts {
-		valid := amount > minAmount
-		if !valid {
-			invalid++
-		}
-		if err := batch.SetBool(fieldValid, row, valid); err != nil {
-			return failure("write %s.%s row %d: %v", componentName, fieldValid, row, err)
-		}
-	}
-
-	hostio.Metric("validate.invalid_rows", float64(invalid))
-	hostio.Log(hostio.LogLevelInfo, logTarget, fmt.Sprintf(
-		"%s: %d of %d rows valid at %s=%g",
-		stageName, batch.Rows-invalid, batch.Rows, minAmountKey, minAmount,
-	))
-
-	rows := uint64(batch.Rows)
 	return witTypes.Ok[pcs_pipeline_types.RunResult, pcs_pipeline_types.RunError](pcs_pipeline_types.RunResult{
-		Output:     stream.Buf,
+		Output:     outcome.Output,
 		Checkpoint: witTypes.None[[]uint8](),
 		Metrics: pcs_pipeline_types.RunMetrics{
-			WallNs:     uint64(time.Since(started).Nanoseconds()),
-			RowsIn:     rows,
-			RowsOut:    rows,
-			SystemsRun: 1,
+			WallNs:     outcome.Metrics.WallNs,
+			RowsIn:     outcome.Metrics.RowsIn,
+			RowsOut:    outcome.Metrics.RowsOut,
+			SystemsRun: outcome.Metrics.SystemsRun,
 			Retries:    0,
 		},
+		// The host multicasts to every downstream link, which is this chain's
+		// only routing.
+		Routes: witTypes.None[[]string](),
 	})
-}
-
-// configFloat reads a host-injected config value. The WIT contract hands config
-// over as strings and leaves numeric parsing to the guest, so an unparseable
-// value is a misconfiguration worth failing on rather than silently defaulting.
-func configFloat(key string, fallback float64) (float64, error) {
-	raw := hostio.GetConfig(key)
-	if !raw.IsSome() {
-		return fallback, nil
-	}
-	text := strings.TrimSpace(raw.Some())
-	if text == "" {
-		return fallback, nil
-	}
-	value, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		return 0, fmt.Errorf("config %s=%q is not a float64", key, text)
-	}
-	return value, nil
-}
-
-// failure logs and returns the permanent error arm. Nothing this stage can hit
-// is worth a host retry: the same bytes and the same config would fail again.
-func failure(format string, args ...any) witTypes.Result[pcs_pipeline_types.RunResult, pcs_pipeline_types.RunError] {
-	message := fmt.Sprintf(format, args...)
-	hostio.Log(hostio.LogLevelError, logTarget, stageName+": "+message)
-	return witTypes.Err[pcs_pipeline_types.RunResult, pcs_pipeline_types.RunError](
-		pcs_pipeline_types.MakeRunErrorPermanent(message),
-	)
 }

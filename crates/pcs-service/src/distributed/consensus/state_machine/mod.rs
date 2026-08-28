@@ -178,8 +178,8 @@ mod tests {
 
     pub(super) fn seed_claimed_guard(db: &Database) -> (uuid::Uuid, uuid::Uuid) {
         let batch_id = 99u64;
-        let claim_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let instance_id = uuid::Uuid::now_v7();
         apply(
             db,
             ConsensusCommand::RegisterMasterBatch {

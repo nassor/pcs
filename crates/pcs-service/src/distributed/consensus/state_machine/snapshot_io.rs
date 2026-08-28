@@ -246,8 +246,8 @@ mod tests {
             },
         )
         .unwrap();
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -320,8 +320,8 @@ mod tests {
         )
         .unwrap();
 
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         apply(
             &db,
             ConsensusCommand::ClaimRowRange {
@@ -364,7 +364,7 @@ mod tests {
         }
 
         // Overlap check should reject re-claiming the same range even after restore.
-        let c2 = uuid::Uuid::new_v4();
+        let c2 = uuid::Uuid::now_v7();
         let resp = apply(
             &db2,
             ConsensusCommand::ClaimRowRange {
@@ -407,8 +407,8 @@ mod tests {
             )
             .unwrap();
         }
-        let inst = uuid::Uuid::new_v4();
-        let c1 = uuid::Uuid::new_v4();
+        let inst = uuid::Uuid::now_v7();
+        let c1 = uuid::Uuid::now_v7();
         apply(
             &db1,
             ConsensusCommand::ClaimRowRange {
@@ -437,7 +437,7 @@ mod tests {
             },
         )
         .unwrap();
-        let c4 = uuid::Uuid::new_v4();
+        let c4 = uuid::Uuid::now_v7();
         apply(
             &db2,
             ConsensusCommand::ClaimRowRange {

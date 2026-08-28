@@ -1,42 +1,59 @@
-//! Built-in factory implementations shipped with PCS.
+//! Built-in factory re-exports and registration.
 //!
-//! IO sources: [`ParquetSourceFactory`], [`JsonSourceFactory`],
-//! [`CsvSourceFactory`], [`ChannelSourceFactory`], [`TcpSourceFactory`].
-//! IO sinks: [`ParquetSinkFactory`], [`JsonSinkFactory`], [`CsvSinkFactory`],
-//! [`ChannelSinkFactory`]. All are gated on `feature = "io"`.
+//! Two kinds of factory reach the registry here. A connector factory builds a
+//! [`Source`](pcs_core::io::source::Source) or a
+//! [`Sink`](pcs_core::io::sink::Sink) that moves bytes; a transformer factory
+//! builds the byte format a connector's `format` key names. One feature per
+//! crate decides whether it is compiled in and registered:
 //!
-//! [`register_builtin_factories`] adds every built-in factory to a
+//! - `connector-channel`: [`ChannelSourceFactory`], [`ChannelSinkFactory`]
+//! - `connector-file`: [`FileSourceFactory`], [`FileSinkFactory`]
+//! - `connector-kafka`: [`KafkaSourceFactory`], [`KafkaSinkFactory`]
+//! - `connector-nats`: [`NatsSourceFactory`], [`NatsSinkFactory`]
+//! - `connector-s3`: [`S3SourceFactory`], [`S3SinkFactory`]
+//! - `connector-tcp`: [`TcpSourceFactory`]
+//! - `transformer-arrow-ipc`: [`ArrowIpcTransformerFactory`]
+//! - `transformer-avro`: [`AvroTransformerFactory`]
+//! - `transformer-csv`: [`CsvTransformerFactory`]
+//! - `transformer-ndjson`: [`NdjsonTransformerFactory`]
+//! - `transformer-parquet`: [`ParquetTransformerFactory`]
+//!
+//! [`register_builtin_factories`] adds every enabled factory to a
 //! [`ServiceBuilder`] in one call.
 
-#[cfg(feature = "io")]
-pub mod channel;
-#[cfg(feature = "io")]
-pub mod csv;
-#[cfg(feature = "io")]
-pub mod json;
-#[cfg(feature = "io")]
-pub mod parquet;
-#[cfg(feature = "io")]
-pub mod tcp;
-
-#[cfg(feature = "io")]
-pub use channel::{ChannelSinkFactory, ChannelSourceFactory};
-#[cfg(feature = "io")]
-pub use csv::{CsvSinkFactory, CsvSourceFactory};
-#[cfg(feature = "io")]
-pub use json::{JsonSinkFactory, JsonSourceFactory};
-#[cfg(feature = "io")]
-pub use parquet::{ParquetSinkFactory, ParquetSourceFactory};
-#[cfg(feature = "io")]
-pub use tcp::TcpSourceFactory;
+#[cfg(feature = "connector-channel")]
+pub use pcs_connector_channel::{ChannelSinkFactory, ChannelSourceFactory};
+#[cfg(feature = "connector-file")]
+pub use pcs_connector_file::{FileSinkFactory, FileSourceFactory};
+#[cfg(feature = "connector-kafka")]
+pub use pcs_connector_kafka::{KafkaSinkFactory, KafkaSourceFactory};
+#[cfg(feature = "connector-nats")]
+pub use pcs_connector_nats::{NatsSinkFactory, NatsSourceFactory};
+#[cfg(feature = "connector-postgresql")]
+pub use pcs_connector_postgresql::{PostgresSinkFactory, PostgresSourceFactory};
+#[cfg(feature = "connector-s3")]
+pub use pcs_connector_s3::{S3SinkFactory, S3SourceFactory};
+#[cfg(feature = "connector-tcp")]
+pub use pcs_connector_tcp::TcpSourceFactory;
+#[cfg(feature = "transformer-arrow-ipc")]
+pub use pcs_transformer_arrow_ipc::ArrowIpcTransformerFactory;
+#[cfg(feature = "transformer-avro")]
+pub use pcs_transformer_avro::AvroTransformerFactory;
+#[cfg(feature = "transformer-csv")]
+pub use pcs_transformer_csv::CsvTransformerFactory;
+#[cfg(feature = "transformer-ndjson")]
+pub use pcs_transformer_ndjson::NdjsonTransformerFactory;
+#[cfg(feature = "transformer-parquet")]
+pub use pcs_transformer_parquet::ParquetTransformerFactory;
 
 use super::builder::ServiceBuilder;
 
-/// Register all built-in IO factories into `builder`.
+/// Register every enabled connector's and transformer's factories into
+/// `builder`.
 ///
-/// Covers the Parquet, JSON, CSV, Channel, and TCP source and sink factories,
-/// all gated on `feature = "io"`. Supply the runtime separately through
-/// [`ServiceBuilder::with_runtime`] or `pipeline.wasm` in the config.
+/// A crate reaches the registry only when its feature is on. Supply the runtime
+/// separately through [`ServiceBuilder::with_runtime`] or `pipeline.wasm` in the
+/// config.
 ///
 /// # Example
 ///
@@ -50,20 +67,58 @@ use super::builder::ServiceBuilder;
 /// # }
 /// ```
 pub fn register_builtin_factories(builder: ServiceBuilder) -> ServiceBuilder {
-    #[cfg(not(feature = "io"))]
-    let builder = builder;
+    // Transformers first: a connector factory resolves its `format` key against
+    // the registry, so the format has to be in it by the time config is built.
+    #[cfg(feature = "transformer-arrow-ipc")]
+    let builder = builder.register_transformer(ArrowIpcTransformerFactory);
 
-    #[cfg(feature = "io")]
+    #[cfg(feature = "transformer-avro")]
+    let builder = builder.register_transformer(AvroTransformerFactory);
+
+    #[cfg(feature = "transformer-csv")]
+    let builder = builder.register_transformer(CsvTransformerFactory);
+
+    #[cfg(feature = "transformer-ndjson")]
+    let builder = builder.register_transformer(NdjsonTransformerFactory);
+
+    #[cfg(feature = "transformer-parquet")]
+    let builder = builder.register_transformer(ParquetTransformerFactory);
+
+    #[cfg(feature = "connector-channel")]
     let builder = builder
-        .register_source(ParquetSourceFactory)
-        .register_source(JsonSourceFactory)
-        .register_source(CsvSourceFactory)
         .register_source(ChannelSourceFactory)
-        .register_source(TcpSourceFactory)
-        .register_sink(ParquetSinkFactory)
-        .register_sink(JsonSinkFactory)
-        .register_sink(CsvSinkFactory)
-        .register_sink(ChannelSinkFactory);
+        .register_sink(ChannelSinkFactory)
+        .with_channel_bridge(std::sync::Arc::new(
+            pcs_connector_channel::ChannelRegistry::default(),
+        ));
+
+    #[cfg(feature = "connector-file")]
+    let builder = builder
+        .register_source(FileSourceFactory)
+        .register_sink(FileSinkFactory);
+
+    #[cfg(feature = "connector-kafka")]
+    let builder = builder
+        .register_source(KafkaSourceFactory)
+        .register_sink(KafkaSinkFactory);
+
+    #[cfg(feature = "connector-nats")]
+    let builder = builder
+        .register_source(NatsSourceFactory)
+        .register_sink(NatsSinkFactory);
+
+    #[cfg(feature = "connector-postgresql")]
+    let builder = builder
+        .register_source(PostgresSourceFactory)
+        .register_sink(PostgresSinkFactory);
+
+    #[cfg(feature = "connector-s3")]
+    let builder = builder
+        .register_source(S3SourceFactory)
+        .register_sink(S3SinkFactory);
+
+    #[cfg(feature = "connector-tcp")]
+    let builder = builder.register_source(TcpSourceFactory);
 
     builder
 }

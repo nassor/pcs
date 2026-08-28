@@ -8,12 +8,12 @@
     "node": ">=24.12"
   },
   "scripts": {
-    "build": "jco componentize score.ts --wit ../../../../crates/pcs-guest/wit --world-name pcs-pipeline --disable http --disable fetch-event -o score-ts.wasm",
-    "types": "jco types ../../../../crates/pcs-guest/wit --world-name pcs-pipeline -o types",
+    "build": "jco componentize score.ts --wit ../../../../crates/pcs-processor/wit --world-name pcs-pipeline --disable http --disable fetch-event -o score-ts.wasm",
+    "types": "jco types ../../../../crates/pcs-processor/wit --world-name pcs-pipeline -o types",
     "typecheck": "npm run types && tsc"
   },
   "dependencies": {
-    "@nassor/pcs-arrow-ipc": "file:../../../../packages/arrow-ipc-ts"
+    "@nassor/pcs-sdk": "file:../../../../packages/pcs-sdk-ts"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "1.30.0",

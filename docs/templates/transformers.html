@@ -1,0 +1,384 @@
+{% extends "base.html" %}
+
+{% block title %}Transformers — PCS{% endblock %}
+{% block description %}The five byte formats PCS ships: csv, ndjson, parquet, avro and arrow-ipc. The transformer node that declares one, the capability matrix, the trait signatures, and how to register your own. One page per format.{% endblock %}
+{% block og_title %}Transformers — PCS{% endblock %}
+{% block og_description %}A connector moves bytes, a transformer gives them meaning. A declared transformer node picks csv, ndjson, parquet, avro or arrow-ipc.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Moving data</div>
+<h1>Transformers</h1>
+
+<p class="page-lede">
+    A connector moves bytes. A transformer turns them into Arrow <code>RecordBatch</code> and
+    back. Five formats ship with PCS, <code>csv</code>, <code>ndjson</code>,
+    <code>parquet</code>, <code>avro</code> and <code>arrow-ipc</code>, and a
+    <code>transformer</code> node picks one by name.
+</p>
+
+<dl class="page-facts">
+    <dt>In one line</dt>
+    <dd>Transport and byte format are <strong>separate crates, chosen separately</strong></dd>
+    <dt>You need</dt>
+    <dd>The transformer crate for a Rust pipeline; on <code>pcs-service</code>, its <code>transformer-*</code> feature as well</dd>
+    <dt>Read this if</dt>
+    <dd>You are declaring a <code>transformer</code> node, or teaching PCS a format it does not ship</dd>
+</dl>
+
+<h2 id="pages">One page each</h2>
+
+<div class="next-steps-grid">
+    {% for page in section.pages %}
+    <a href="{{ page.permalink }}" class="next-card">
+        <span class="next-card-label">{{ section.title }}</span>
+        <h3>{{ page.title }}</h3>
+        {% if page.description %}<p>{{ page.description }}</p>{% endif %}
+    </a>
+    {% endfor %}
+</div>
+
+<h2 id="split">Connector against transformer</h2>
+
+<p>
+    A connector owns a transport. <code>FileSource</code> opens the path, drives one OS thread
+    and pushes batches down a bounded channel of four, so the file is never materialised in
+    full. <code>TcpIngestSource</code> owns the listener and the frame length prefix,
+    <code>KafkaSource</code> owns the consumer group. None of them reads a byte's meaning.
+</p>
+
+<p>
+    A transformer owns a byte format. It knows nothing about paths, sockets or topics, so
+    <code>NdjsonTransformer</code> decodes the same rows whether the bytes arrived from a disk,
+    a socket or a Kafka topic. The contract lives in <code>pcs-transformer</code>, below every
+    connector, and each format is its own crate.
+</p>
+
+<div class="dgm animate-in">
+    <div class="dgm-scroll"><svg viewBox="0 0 660 196" role="img" aria-labelledby="tf-a-title tf-a-desc">
+        <title id="tf-a-title">Bytes entering a file connector, decoded by a transformer, arriving at a Dataset as a batch</title>
+        <desc id="tf-a-desc">
+            A CSV file of bytes enters FileSource, which owns the file handle, one OS thread and
+            a channel of four batches. Inside that connector, CsvTransformer opens a BatchReader
+            over the handle and hands back one RecordBatch per call to next_batch. The connector
+            forwards each batch to the Dataset, whose columns are typed Int64 and Float64.
+            Naming a different transformer replaces the inner box and nothing else.
+        </desc>
+        <text class="t-title" x="0" y="14">One file, one format</text>
+        <text class="t-sm" x="0" y="30">path = "orders.csv", transformer = "orders_csv"</text>
+        <!-- the bytes on disk, and the transport that opens them -->
+        <g class="anim anim-1">
+            <rect class="blk blk-data" x="0" y="52" width="112" height="88" rx="8"/>
+            <rect class="hd hd-data" x="0" y="52" width="112" height="22" rx="8"/>
+            <rect class="hd hd-data" x="0" y="64" width="112" height="10"/>
+            <text class="t-lbl t-data" x="10" y="67">orders.csv</text>
+            <text class="t-sm" x="10" y="92">id,price</text>
+            <text class="t-sm" x="10" y="106">1,99.50</text>
+            <text class="t-sm" x="10" y="120">2,240.00</text>
+            <path class="arw arw-data" d="M112 96 H150" marker-end="url(#tf-d)"/>
+            <text class="t-sm" x="114" y="88">bytes</text>
+            <rect class="blk blk-data" x="158" y="44" width="316" height="132" rx="8"/>
+            <rect class="hd hd-data" x="158" y="44" width="316" height="22" rx="8"/>
+            <rect class="hd hd-data" x="158" y="56" width="316" height="10"/>
+            <text class="t-lbl t-data" x="168" y="59">FileSource</text>
+            <text class="t-sm" x="168" y="82">one OS thread, channel of 4</text>
+            <text class="t-sm" x="168" y="168">the transport: open, read, send</text>
+        </g>
+        <!-- the format boundary, the only box the transformer key moves -->
+        <g class="anim anim-2">
+            <rect class="blk blk-bnd" x="178" y="90" width="276" height="66" rx="8"/>
+            <rect class="hd hd-bnd" x="178" y="90" width="276" height="22" rx="8"/>
+            <rect class="hd hd-bnd" x="178" y="102" width="276" height="10"/>
+            <text class="t-lbl t-bnd" x="188" y="105">CsvTransformer</text>
+            <text class="t-sm" x="188" y="126">open_reader(File, declared)</text>
+            <text class="t-sm" x="188" y="146">BatchReader::next_batch</text>
+        </g>
+        <!-- the decoded batch, and where it lands -->
+        <g class="anim anim-3">
+            <path class="arw arw-data" d="M474 110 H540" marker-end="url(#tf-d)"/>
+            <text class="t-sm t-data" x="478" y="102">RecordBatch</text>
+            <rect class="blk blk-data" x="548" y="44" width="106" height="132" rx="8"/>
+            <rect class="hd hd-data" x="548" y="44" width="106" height="22" rx="8"/>
+            <rect class="hd hd-data" x="548" y="56" width="106" height="10"/>
+            <text class="t-lbl t-data" x="558" y="59">Dataset</text>
+            <rect class="row" x="556" y="78" width="90" height="18" rx="3"/>
+            <text class="t-sm" x="562" y="91">id    Int64</text>
+            <rect class="row" x="556" y="100" width="90" height="18" rx="3"/>
+            <text class="t-sm" x="562" y="113">price Float64</text>
+            <path class="ln" d="M556 128 H646"/>
+            <text class="t-sm t-data" x="562" y="144">row_count = 2</text>
+            <text class="t-sm" x="562" y="166">appended whole</text>
+        </g>
+        <defs>
+            <marker id="tf-d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--data)"/>
+            </marker>
+        </defs>
+    </svg>
+    </div>
+    <div class="dgm-key">
+        <span class="k-data"><i></i> bytes and batches</span>
+        <span class="k-boundary"><i></i> the format boundary</span>
+    </div>
+    <figcaption class="dgm-cap">
+        Point <code>transformer</code> at a <code>parquet</code> node instead and only the inner
+        box changes. The handle, the thread, the channel and the <code>Dataset</code> stay
+        exactly as they are.
+    </figcaption>
+</div>
+
+<h2 id="keys">Declaring a transformer</h2>
+
+<p>
+    A workflow declares each byte format it needs as its own <code>transformer</code> node. The
+    node's leading argument is its id, <code>format</code> names the registered format, and an
+    <code>options</code> child is the table handed to that format's factory. Every source or
+    sink that moves bytes names one declared transformer through its own
+    <code>transformer</code> key.
+</p>
+
+<p>
+    There is no default and no format sniffing: a file connector does not read the extension,
+    and Kafka, NATS and TCP each name a transformer like everything else.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>KDL</span><em>options belongs to the format, the transformer key to the node; both nodes sit inside one workflow</em></div>
+    <pre><code class="language-kdl">transformer "orders_csv" format="csv" {
+    options has_headers=#true
+}
+
+source "orders_in" type="FileSource" component="Order" transformer="orders_csv" {
+    config path="/data/orders.csv" {
+        schema_fields "id" type="Int64" nullable=#false
+    }
+}</code></pre>
+</div>
+
+<p>
+    Each format defines its own <code>options</code> keys, and its page lists them with their
+    defaults. Omit the node and every option keeps its default. Two <code>transformer</code>
+    nodes may name the same <code>format</code> with different options, so one workflow reads
+    Confluent framed Avro on one topic and single-object Avro on another.
+</p>
+
+<h2 id="capabilities">What each format can do</h2>
+
+<p>
+    A transformer has two surfaces and need not implement both. The stream surface,
+    <code>open_reader</code> and <code>open_writer</code>, is what the file connector uses. The
+    message surface, <code>open_message_decoder</code> and <code>encode_messages</code>, is
+    what TCP and Kafka use. A surface a format does not implement is a configuration error
+    naming the format and the capability.
+</p>
+
+<p>
+    File and Kafka raise it while the connector is built, because both ask for the surface
+    there. TCP takes the transformer it is handed and asks for nothing, so a <code>csv</code>
+    transformer on a <code>tcp</code> source passes <code>pcs-service validate</code> and the
+    missing decoder is logged when a connection arrives, closing that one connection.
+</p>
+
+<table class="rule-table">
+    <thead>
+        <tr><th><code>format</code></th><th>Stream read</th><th>Stream write</th><th>Message codec</th><th>Message shape</th><th>Declared schema</th><th>Crate</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/transformers/csv.md') }}"><code>csv</code></a></strong></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td>no</td>
+            <td>none</td>
+            <td>required</td>
+            <td><code>pcs-transformer-csv</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/transformers/ndjson.md') }}"><code>ndjson</code></a></strong></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td><code>PerRow</code></td>
+            <td>optional</td>
+            <td><code>pcs-transformer-ndjson</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/transformers/parquet.md') }}"><code>parquet</code></a></strong></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td>no</td>
+            <td>none</td>
+            <td>refused</td>
+            <td><code>pcs-transformer-parquet</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/transformers/avro.md') }}"><code>avro</code></a></strong></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
+            <td><code>PerRow</code></td>
+            <td>refused reading a file, required writing and on messages</td>
+            <td><code>pcs-transformer-avro</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/transformers/arrow-ipc.md') }}"><code>arrow-ipc</code></a></strong></td>
+            <td>no</td>
+            <td>no</td>
+            <td><b>yes</b></td>
+            <td><code>PerBatch</code></td>
+            <td>required</td>
+            <td><code>pcs-transformer-arrow-ipc</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <code>arrow-ipc</code> has no stream surface, so it is a TCP or Kafka format only.
+    <code>csv</code> and <code>parquet</code> have no message codec, so a <code>csv</code>
+    transformer on a Kafka source or sink fails at build with
+    <code>KafkaSink: format 'csv' has no message codec</code>. <code>parquet</code> is the only
+    format that reports <code>estimated_rows</code>, summed from row-group metadata without
+    reading any data.
+</p>
+
+<p>
+    <code>MessageShape</code> decides how a batch splits on the way out.
+    <code>PerRow</code> emits one message per row, which is what a Kafka
+    <code>key_field</code> needs to have a key to pair each payload with.
+    <code>PerBatch</code> emits one message carrying the whole batch. On the message surface
+    <code>avro</code> reads single-object framing always, and Confluent framing when
+    <code>options schema_id</code> names the registry id, so one stream may carry both.
+</p>
+
+<p>
+    The <b>Declared schema</b> column is about a source. A <code>FileSink</code> requires
+    <code>schema_fields</code> whatever the format, because that is the schema the rows are
+    written with.
+</p>
+
+<h2 id="traits">The traits</h2>
+
+<p>
+    <code>pcs-transformer</code> holds five traits and one enum. Four of them are below, and
+    <code>TransformerFactory</code> is under <a href="#own">Writing your own</a>. Only
+    <code>format</code> has no default: a transformer implements the surfaces it has and
+    inherits an <code>unsupported</code> error for the rest. Both readers and writers are
+    synchronous, because the connector owns the thread and the async plumbing.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>every method with a default returns unsupported</em></div>
+    <pre><code class="language-rust">// pcs-transformer
+pub trait Transformer: Send + Sync + 'static {
+    fn format(&amp;self) -&gt; &amp;'static str;
+    fn open_reader(&amp;self, input: std::fs::File, declared: Option&lt;Arc&lt;Schema&gt;&gt;)
+        -&gt; Result&lt;Box&lt;dyn BatchReader&gt;, PcsError&gt;;      // defaults to `unsupported`
+    fn open_writer(&amp;self, output: Box&lt;dyn std::io::Write + Send&gt;, schema: Arc&lt;Schema&gt;)
+        -&gt; Result&lt;Box&lt;dyn BatchWriter&gt;, PcsError&gt;;      // defaults to `unsupported`
+    fn open_message_decoder(&amp;self, schema: Arc&lt;Schema&gt;)
+        -&gt; Result&lt;Box&lt;dyn MessageDecoder&gt;, PcsError&gt;;   // defaults to `unsupported`
+    fn encode_messages(&amp;self, batch: &amp;RecordBatch)
+        -&gt; Result&lt;Vec&lt;Vec&lt;u8&gt;&gt;, PcsError&gt;;              // defaults to `unsupported`
+    fn message_shape(&amp;self) -&gt; Option&lt;MessageShape&gt;;    // defaults to None
+}
+
+pub trait BatchReader: Send {
+    fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
+    fn next_batch(&amp;mut self) -&gt; Result&lt;Option&lt;RecordBatch&gt;, PcsError&gt;;
+    fn estimated_rows(&amp;self) -&gt; Option&lt;usize&gt;;          // defaults to None
+}
+
+pub trait BatchWriter: Send {
+    fn write_batch(&amp;mut self, batch: &amp;RecordBatch) -&gt; Result&lt;(), PcsError&gt;;
+    fn finish(self: Box&lt;Self&gt;) -&gt; Result&lt;(), PcsError&gt;;
+}
+
+pub trait MessageDecoder: Send {
+    fn push(&amp;mut self, payload: &amp;[u8]) -&gt; Result&lt;(), PcsError&gt;;
+    fn flush(&amp;mut self) -&gt; Result&lt;Option&lt;RecordBatch&gt;, PcsError&gt;;
+}
+
+pub enum MessageShape { PerRow, PerBatch }</code></pre>
+</div>
+
+<p>
+    Message encoding is <code>Transformer::encode_messages</code> itself, so there is no
+    encoder trait to implement. <code>BatchWriter::finish</code> consumes the writer, so a
+    format with a footer cannot be written to afterwards. <code>MessageDecoder::flush</code>
+    resets the decoder, so one decoder serves a whole TCP connection or Kafka consumer.
+</p>
+
+<h2 id="own">Writing your own</h2>
+
+<p>
+    An out-of-tree transformer is a crate that depends on <code>pcs-core</code> for
+    <code>PcsError</code> and <code>pcs-transformer</code> for the traits, and on nothing else
+    of PCS: no connector, no host. Implement <code>Transformer</code> for the codec and
+    <code>TransformerFactory</code> for the name a <code>format</code> key selects it with.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Rust</span><em>the factory reads options, the transformer it builds is shared</em></div>
+    <pre><code class="language-rust">// pcs-transformer
+pub trait TransformerFactory: Send + Sync + 'static {
+    fn format_name(&amp;self) -&gt; &amp;'static str;
+    fn build(&amp;self, options: &amp;ConfigValue) -&gt; Result&lt;Arc&lt;dyn Transformer&gt;, PcsError&gt;;
+}
+
+// in a custom binary
+let builder = register_builtin_factories(ServiceBuilder::new())
+    .register_transformer(ProtobufTransformerFactory);</code></pre>
+</div>
+
+<p>
+    <code>ServiceBuilder::register_transformer</code> installs it, and from then on
+    <code>transformer "p" format="protobuf"</code> resolves, with no
+    change to any connector. Registering a <code>format_name</code> that is already taken
+    replaces the earlier factory, so a custom <code>csv</code> can stand in for the built-in
+    one.
+</p>
+
+<h2 id="features">Features</h2>
+
+<p>
+    On <code>pcs-service</code>, one feature per transformer decides what
+    <code>register_builtin_factories</code> installs: <code>transformer-csv</code>,
+    <code>transformer-ndjson</code>, <code>transformer-parquet</code>,
+    <code>transformer-avro</code> and <code>transformer-arrow-ipc</code>.
+    <code>connector-kafka</code> and <code>connector-nats</code> each pull in
+    <code>transformer-ndjson</code> and <code>connector-tcp</code> pulls in
+    <code>transformer-arrow-ipc</code>, so any one of the three is runnable on its own.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Bash</span><em>connector-file implies no transformer, so pick one</em></div>
+    <pre><code class="language-bash">cargo build --features connector-file,transformer-csv,wasm</code></pre>
+</div>
+
+<div class="note note-warn">
+    <span class="note-label">Sharp edge</span>
+    <p>
+        A <code>format</code> the build does not carry fails loudly rather than falling back:
+        <code>transformer 'orders_json' names format 'parquet', which no transformer is
+        registered for (registered: csv, ndjson)</code>. The registry holds exactly what the
+        features compiled in, so the fix is a feature or a
+        <code>register_transformer</code> call.
+    </p>
+</div>
+
+<h2 id="next">Next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/connectors/_index.md') }}" class="next-card">
+        <span class="next-card-label">Moving data</span>
+        <h3>Connectors</h3>
+        <p>One page per connector: the crate to depend on, the constructor to call, and the config keys its node accepts.</p>
+    </a>
+    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
+        <span class="next-card-label">Service</span>
+        <h3>Service</h3>
+        <p>The binary that reads the config above, builds the factories, and owns the drain loop.</p>
+    </a>
+</div>
+
+{% endblock %}

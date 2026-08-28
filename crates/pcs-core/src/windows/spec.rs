@@ -11,7 +11,14 @@ use crate::error::PcsError;
 use super::hash::compute_key_hash;
 
 /// A window specification defining the geometry and boundaries of windows.
-#[derive(Debug, Clone)]
+///
+/// Serializes as an internally tagged object on the `kind` key
+/// (`{"kind":"tumbling","size_ms":30000}`), which is how a KDL `window` node
+/// reaches the host configuration and how the service topology describes a
+/// windowed processor node. `offset_ms` is optional on the wire and defaults
+/// to zero.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WindowSpec {
     /// Fixed-size, non-overlapping windows.
     /// Each record belongs to exactly one window.
@@ -20,6 +27,7 @@ pub enum WindowSpec {
         /// Window size in milliseconds.
         size_ms: i64,
         /// Alignment offset in milliseconds (default 0).
+        #[serde(default)]
         offset_ms: i64,
     },
     /// Gap-based session windows.
@@ -42,6 +50,7 @@ pub enum WindowSpec {
         /// Slide (advance) interval in milliseconds. Must be ≤ `size_ms`.
         slide_ms: i64,
         /// Alignment offset in milliseconds (default 0).
+        #[serde(default)]
         offset_ms: i64,
     },
 }
@@ -81,6 +90,48 @@ impl WindowSpec {
         (0..k)
             .map(|j| Self::assign_tumbling(ts - j * slide_ms, slide_ms, offset_ms))
             .collect()
+    }
+
+    /// Whether the geometry is sane enough to build windows from.
+    ///
+    /// Checks what the window maths needs to stay well-defined: a strictly
+    /// positive `size_ms`, a strictly positive `slide_ms` no larger than
+    /// `size_ms`, and a strictly positive session `gap_ms`. The host runs this
+    /// once at config load so a nonsense geometry is a configuration error,
+    /// not a division-by-zero at run time.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            WindowSpec::Tumbling { size_ms, .. } => {
+                if *size_ms <= 0 {
+                    return Err(format!(
+                        "tumbling window size_ms must be > 0, got {size_ms}"
+                    ));
+                }
+            }
+            WindowSpec::Session { gap_ms } => {
+                if *gap_ms <= 0 {
+                    return Err(format!("session window gap_ms must be > 0, got {gap_ms}"));
+                }
+            }
+            WindowSpec::Sliding {
+                size_ms, slide_ms, ..
+            } => {
+                if *size_ms <= 0 {
+                    return Err(format!("sliding window size_ms must be > 0, got {size_ms}"));
+                }
+                if *slide_ms <= 0 {
+                    return Err(format!(
+                        "sliding window slide_ms must be > 0, got {slide_ms}"
+                    ));
+                }
+                if slide_ms > size_ms {
+                    return Err(format!(
+                        "sliding window slide_ms ({slide_ms}) must be <= size_ms ({size_ms})"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -366,5 +417,92 @@ mod tests {
         // size=7, slide=3 → k = ceil(7/3) = 3
         let ids = WindowSpec::assign_sliding(5, 7, 3, 0);
         assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn validate_accepts_sane_geometries() {
+        WindowSpec::Tumbling {
+            size_ms: 1000,
+            offset_ms: 0,
+        }
+        .validate()
+        .expect("positive size");
+        WindowSpec::Session { gap_ms: 500 }
+            .validate()
+            .expect("positive gap");
+        WindowSpec::Sliding {
+            size_ms: 10_000,
+            slide_ms: 5_000,
+            offset_ms: 0,
+        }
+        .validate()
+        .expect("size >= slide");
+    }
+
+    #[test]
+    fn validate_rejects_nonsense_geometries() {
+        assert!(
+            WindowSpec::Tumbling {
+                size_ms: 0,
+                offset_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            WindowSpec::Tumbling {
+                size_ms: -100,
+                offset_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(WindowSpec::Session { gap_ms: 0 }.validate().is_err());
+        assert!(
+            WindowSpec::Sliding {
+                size_ms: 1_000,
+                slide_ms: 0,
+                offset_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        let err = WindowSpec::Sliding {
+            size_ms: 1_000,
+            slide_ms: 2_000,
+            offset_ms: 0,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("slide_ms"), "got: {err}");
+    }
+
+    /// The serde shape is what the KDL `window` node and the topology use:
+    /// internally tagged on `kind`, snake_case variants, `offset_ms` optional.
+    #[test]
+    fn spec_round_trips_through_its_internally_tagged_shape() {
+        let spec = WindowSpec::Tumbling {
+            size_ms: 30_000,
+            offset_ms: 0,
+        };
+        let json = serde_json::to_string(&spec).expect("serialize");
+        assert!(
+            json.contains(r#""kind":"tumbling""#) && json.contains(r#""size_ms":30000"#),
+            "got: {json}"
+        );
+        let back: WindowSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, spec);
+
+        let sliding: WindowSpec =
+            serde_json::from_str(r#"{"kind":"sliding","size_ms":60000,"slide_ms":10000}"#)
+                .expect("offset_ms is optional");
+        assert_eq!(
+            sliding,
+            WindowSpec::Sliding {
+                size_ms: 60_000,
+                slide_ms: 10_000,
+                offset_ms: 0,
+            }
+        );
     }
 }

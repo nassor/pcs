@@ -20,7 +20,7 @@
 
     <div class="hero-actions">
         <a class="btn" href="{{ get_url(path='@/native/tutorial.md') }}">Build a native pipeline</a>
-        <a class="btn btn-ghost" href="{{ get_url(path='@/guests/_index.md') }}">Write a WebAssembly guest</a>
+        <a class="btn btn-ghost" href="{{ get_url(path='@/processors/_index.md') }}">Write a WebAssembly processor</a>
     </div>
 
     <div class="badges">
@@ -30,6 +30,18 @@
     </div>
 </section>
 
+<h2 id="name">Where the name comes from</h2>
+
+<p>
+    PCS is <b>Pipeline Component System</b>, a nod to ECS, the Entity Component
+    System pattern from game development. ECS organises game entities as components
+    that systems act on each frame. PCS keeps the <code>Component</code> and the
+    <code>System</code> and swaps the entity for a data <code>Pipeline</code>, so a
+    frame of entities becomes a batch of Arrow columns. The field declarations come
+    from there too: an ECS scheduler groups systems by the components each one names,
+    and PCS does the same one level finer, per field.
+</p>
+
 <h2 id="two-ways">Two ways to run a pipeline</h2>
 
 <p>
@@ -38,15 +50,15 @@
 </p>
 
 <div class="next-steps-grid">
+    <a href="{{ get_url(path='@/processors/_index.md') }}" class="next-card">
+        <span class="next-card-label">WASM Processors</span>
+        <h3>You ship a <code>.wasm</code></h3>
+        <p><code>pcs-service</code> loads it at startup, in any language that targets WASI 0.2. Change the pipeline without rebuilding the host.</p>
+    </a>
     <a href="{{ get_url(path='@/native/_index.md') }}" class="next-card">
         <span class="next-card-label">Native</span>
         <h3>Your binary links the engine</h3>
         <p>You own <code>main</code> and call <code>pipeline.run()</code>. No wasmtime, no service, and a debugger on the same process.</p>
-    </a>
-    <a href="{{ get_url(path='@/guests/_index.md') }}" class="next-card">
-        <span class="next-card-label">WebAssembly guests</span>
-        <h3>You ship a <code>.wasm</code></h3>
-        <p><code>pcs-service</code> loads it at startup, in any language that targets WASI 0.2. Change the pipeline without rebuilding the host.</p>
     </a>
 </div>
 
@@ -215,7 +227,7 @@
 
 <p>
     Each one builds on the previous, so nothing is forward-referenced. All five apply to
-    both modes, because a guest runs the same <code>Pipeline</code> DAG inside the
+    both modes, because a processor runs the same <code>Pipeline</code> DAG inside the
     component. The sixth card is that boundary itself.
 </p>
 
@@ -245,17 +257,17 @@
         <h3>Distributed Runner</h3>
         <p>The same Pipeline against claimed row ranges across nodes, checkpointed through Raft.</p>
     </a>
-    <a href="{{ get_url(path='@/guests/_index.md') }}" class="concept-card">
+    <a href="{{ get_url(path='@/processors/_index.md') }}" class="concept-card">
         <div class="concept-num">&plus;</div>
-        <h3>WebAssembly guests</h3>
-        <p>The contract is a WIT world, not an SDK. A recipe per language, and a worked example chaining six guests in Go, Python, TypeScript, Kotlin, C#, and Rust over one schema.</p>
+        <h3>WASM Processors</h3>
+        <p>The contract is a WIT world, not an SDK. A recipe per language, and a worked example chaining six processors in Go, Python, TypeScript, Kotlin, C#, and Rust over one schema.</p>
     </a>
 </div>
 
 <h2 id="deploy">How a pipeline ships</h2>
 
 <p>
-    This is the <a href="{{ get_url(path='@/guests/_index.md') }}">WebAssembly guest</a>
+    This is the <a href="{{ get_url(path='@/processors/_index.md') }}">WebAssembly processor</a>
     path. You do not deploy a binary containing your pipeline; you deploy
     <code>pcs-service</code> once and hand it components. A native pipeline skips all of
     this and ships as your own binary.
@@ -339,21 +351,29 @@
 
 <h2 id="start">Start here</h2>
 
+<p>
+    In a hurry, start with the two Quick Start pages:
+    <a href="{{ get_url(path='@/quickstart/installation.md') }}">Installation</a> puts the
+    binary on your PATH, and
+    <a href="{{ get_url(path='@/quickstart/running-it.md') }}">Running it!</a> takes a live
+    NATS stream through a Go processor and a C# processor into PostgreSQL.
+</p>
+
 <div class="next-steps-grid">
+    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
+        <span class="next-card-label">Deploy</span>
+        <h3>Service</h3>
+        <p>The config schema, the load-time validation gates, and the HTTP control plane.</p>
+    </a>
+    <a href="{{ get_url(path='@/processors/_index.md') }}" class="next-card">
+        <span class="next-card-label">WASM Processors</span>
+        <h3>Ship a component</h3>
+        <p>The WIT contract, then a recipe per language: Rust, Go, Python, TypeScript.</p>
+    </a>
     <a href="{{ get_url(path='@/native/tutorial.md') }}" class="next-card">
         <span class="next-card-label">Native, 15 minutes</span>
         <h3>Build your first pipeline</h3>
         <p>One component, four systems, one resource, and the stage plan PCS derives instead of you writing it.</p>
-    </a>
-    <a href="{{ get_url(path='@/guests/_index.md') }}" class="next-card">
-        <span class="next-card-label">WebAssembly guests</span>
-        <h3>Ship a component</h3>
-        <p>The WIT contract, then a recipe per language: Rust, Go, Python, TypeScript.</p>
-    </a>
-    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
-        <span class="next-card-label">Deploy</span>
-        <h3>Service</h3>
-        <p>The TOML schema, the load-time validation gates, and the HTTP control plane.</p>
     </a>
     <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
         <span class="next-card-label">Operate</span>
@@ -361,6 +381,24 @@
         <p>Standalone and clustered deployment, tuning, failure modes, and recovery.</p>
     </a>
 </div>
+
+<h2 id="prior-art">Prior art</h2>
+
+<p>
+    <a href="https://github.com/conduitio/conduit">Conduit</a> is the strongest
+    influence on this project. It streams data between stores in Go, builds a pipeline
+    from source and destination connectors plus processors, keeps the plugin contract
+    language-agnostic so a connector can be written in anything, runs standalone
+    processors as WebAssembly, and either embeds in your own binary or runs as a
+    service you hand a config to. Every one of those shapes is here, with a WIT world
+    in place of the gRPC interface.
+</p>
+
+<p>
+    The unit of work is what differs. A Conduit pipeline carries records; a PCS
+    pipeline carries Arrow batches, and works out its execution order from the columns
+    each system declares.
+</p>
 
 <div class="note">
     <span class="note-label">Where this project is</span>

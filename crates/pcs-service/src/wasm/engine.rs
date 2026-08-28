@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use wasmtime::Engine;
 
-/// Epoch tick interval for guest deadline enforcement.
+/// Epoch tick interval for processor deadline enforcement.
 const EPOCH_TICK: Duration = Duration::from_millis(100);
 
 /// Host-side wasmtime [`Engine`] with epoch interruption enabled.
 ///
 /// Cheap to clone: wasmtime wraps `Arc<Engine>` internally. A background tokio
-/// task increments the epoch every 100 ms so guests past their deadline are
+/// task increments the epoch every 100 ms so processors past their deadline are
 /// interrupted cleanly. Create one with [`WasmEngine::new`] at service startup
 /// and share it.
 #[derive(Clone)]

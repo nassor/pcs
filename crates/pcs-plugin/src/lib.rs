@@ -1,8 +1,8 @@
-//! `pcs-plugin`: guest SDK for PCS native plugins.
+//! `pcs-plugin`: processor SDK for PCS native plugins.
 //!
 //! A native plugin is a shared library the host loads with `dlopen` or
 //! `LoadLibrary`, exporting the C ABI that `pcs-plugin-abi` defines. It runs the
-//! same [`Pipeline`] a WebAssembly guest would, against the same Arrow IPC wire
+//! same [`Pipeline`] a WebAssembly processor would, against the same Arrow IPC wire
 //! format, without a wasm toolchain and without the sandbox.
 //!
 //! # Authoring a plugin
@@ -24,12 +24,12 @@
 //! ```
 //!
 //! `cargo build --release` on that crate produces the shared library. Point
-//! `[pipeline.plugin]` in service TOML at it, or load it directly with
+//! a `plugin` node in the service config at it, or load it directly with
 //! `pcs_service::plugin::NativePluginRuntime::open`.
 //!
-//! # Choosing between a plugin and a guest
+//! # Choosing between a plugin and a processor
 //!
-//! A WebAssembly guest is sandboxed, portable, and preemptible: the host bounds
+//! A WebAssembly processor is sandboxed, portable, and preemptible: the host bounds
 //! it with a wasmtime epoch deadline and a trap cannot take the service down. A
 //! native plugin has none of that. It runs in-process with full host
 //! privileges, cannot be interrupted, and a memory error in it is a memory
@@ -38,11 +38,11 @@
 //! What it buys is the absence of the sandbox: native threads, native
 //! extensions, no componentizer, and no copy through wasm linear memory. Reach
 //! for a plugin when the workload needs something WASI 0.2 does not offer, and
-//! for a guest otherwise.
+//! for a processor otherwise.
 //!
 //! # Config
 //!
-//! Values from the service TOML `[pipeline.plugin.config]` table are read
+//! Values from the `config` node inside the service config's `plugin` node are read
 //! through the host's `get_config` callback, which the host answers on every
 //! call including `describe`. [`export_plugin!`] emits `pcs_config_get` and
 //! `pcs_config_parse` into the plugin crate.
@@ -57,14 +57,14 @@
 //! pcs_plugin::export_plugin!(build, state = Counter);
 //! ```
 //!
-//! The macro decodes the previous batch's rows into a [`GuestState`]`<Counter>`
+//! The macro decodes the previous batch's rows into a [`ProcessorState`]`<Counter>`
 //! resource on the batch dataset, runs the pipeline, then serialises whatever
 //! the systems left there into the checkpoint. State is a resource rather than a
 //! registered component because [`Dataset`]'s Arrow IPC format requires every
 //! component to hold exactly the dataset's row count, while state rows are
 //! independent of batch rows, so state never appears in the plugin's output.
 //!
-//! Unlike a WebAssembly guest, a plugin's process memory does survive between
+//! Unlike a WebAssembly processor, a plugin's process memory does survive between
 //! calls, so a plugin *could* keep state in a global. It should not: the
 //! distributed runner may hand consecutive batches of the same partition to
 //! different processes, and only the checkpoint travels with the claim.
@@ -102,7 +102,18 @@ pub use pcs_core::{
 pub use arrow_array;
 pub use arrow_schema;
 
-pub use pcs_core::sdk::GuestState;
+pub use pcs_core::sdk::ProcessorState;
+pub use pcs_core::sdk::RouteDecision;
+
+/// The windowing primitives (`WindowSpec`, `WatermarkState`,
+/// `WindowedSystemBuilder`, ...), behind the `windows` feature.
+///
+/// A plugin that implements Beam-style windowing over the merged rows it
+/// receives keeps its open windows in its checkpoint state and uses these
+/// primitives for the window maths; the host tracks the node's watermark
+/// separately and reports it as `pcs_window_watermark_seconds`.
+#[cfg(feature = "windows")]
+pub use pcs_core::windows;
 
 /// A curated prelude for plugin crates.
 ///
@@ -120,7 +131,7 @@ pub mod __rt;
 /// Logging and metrics through the host.
 ///
 /// The plugin side of the ABI's host callbacks, and the native counterpart of
-/// the WIT `host-io` interface a WebAssembly guest imports. A call made outside
+/// the WIT `host-io` interface a WebAssembly processor imports. A call made outside
 /// a boundary call, or against a host that supplied no callback, is dropped
 /// rather than failing: observability must never be the reason a batch dies.
 pub mod host {

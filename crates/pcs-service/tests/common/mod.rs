@@ -91,6 +91,8 @@ pub struct ToxiproxyClient {
 
 impl ToxiproxyClient {
     pub fn new(api_port: u16) -> Self {
+        #[cfg(feature = "service")]
+        pcs_service::service::install_ring_provider();
         Self {
             http: reqwest::blocking::Client::new(),
             api_port,

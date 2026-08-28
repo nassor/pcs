@@ -4,11 +4,8 @@
 //! [`next_batch`](Source::next_batch) in a loop until `None` is returned
 //! (EOF), then appends each batch into the dataset.
 //!
-//! ## Example
-//!
-//! ```rust,ignore
-//! // See pcs-service io examples for ChannelSource usage.
-//! ```
+//! `pcs-connector-channel` is the smallest implementation: an mpsc channel with
+//! nothing else in the way.
 
 use std::sync::Arc;
 

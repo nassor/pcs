@@ -1,16 +1,16 @@
 # Toolchain pins, polyglot example
 
-Six guest components, six languages, six componentization toolchains. These are
-the versions CI installs in the `Polyglot Guests` job and the versions the
-committed build script is written against. `crates/pcs-guest/PINS.md` covers the
-Rust-side and host-side pins; this file covers everything the five non-Rust
+Six processor components, six languages, six componentization toolchains. These are
+the versions CI installs in the `Polyglot Processors` job and the versions
+`cargo xtask polyglot` is written against. `crates/pcs-processor/PINS.md` covers
+the Rust-side and host-side pins; this file covers everything the five non-Rust
 stages need.
 
 ## Required tools
 
 | Tool | Version | Language runtime | Install |
 | ---- | ------- | ---------------- | ------- |
-| `cargo-component`  | 0.21.1 | Rust 1.95.0                | `cargo install cargo-component --locked --version 0.21.1` |
+| `cargo` (Rust stage) | — | Rust 1.95.0 | none: `cargo build --target wasm32-wasip2` links a component itself |
 | `wasm-tools`       | 1.246.2 | —                         | `cargo install wasm-tools --locked --version 1.246.2` |
 | Rust target        | `wasm32-wasip2` | —                 | `rustup target add wasm32-wasip2` |
 | `componentize-go`  | 0.4.1  | Go 1.25.5+ (verified on 1.26.3) | `go install github.com/bytecodealliance/componentize-go@v0.4.1` |
@@ -26,40 +26,68 @@ pins Kotlin 2.4.0 and Gradle fetches the compiler. The C# stage needs no
 `dotnet workload`; its first build downloads wasi-sdk 29.0, about 535 MB, into
 `~/.wasi-sdk/`.
 
-Build everything with `bash scripts/build-polyglot.sh`; it fails with a distinct
-exit code per missing tool (2 cargo-component, 3 wasm-tools, 4 Go,
-5 componentize-go, 6 componentize-py, 7 Node/npm, 8 no artifact, 9 Gradle,
-10 wit-bindgen, 11 dotnet, 12 curl).
+Build everything with `cargo xtask polyglot`. Every tool the requested stages
+need is checked before any work, so a machine missing one toolchain hears about
+it in a second rather than after the other five stages have compiled. Each has
+its own exit code (3 wasm-tools, 4 Go, 5 componentize-go, 6 componentize-py,
+7 Node/npm, 8 no artifact, 9 Gradle, 10 wit-bindgen, 11 dotnet, 12 curl). The
+Rust stage has no check of its own: it is plain cargo.
 
 ## The WASI preview 1 adapter
 
 The Kotlin stage is the only one that needs a separate artifact:
 `wasi_snapshot_preview1.reactor.wasm` from the
-[wasmtime v47.0.3 release](https://github.com/bytecodealliance/wasmtime/releases/tag/v47.0.3),
+[wasmtime v48.0.1 release](https://github.com/bytecodealliance/wasmtime/releases/tag/v48.0.1),
 matching the wasmtime the workspace pins. Kotlin's Gradle build emits a WASI
 preview 1 core module, and `wasm-tools component new --adapt` needs the adapter
-to turn it into a component. The build script downloads it once into the
+to turn it into a component. `cargo xtask polyglot` downloads it once into the
 gitignored `examples/polyglot/generated/`; `PCS_WASI_ADAPTER` points at a
 different copy.
 
-## Codec packages
+## SIMD
 
-The five non-Rust stages consume `pcs-arrow-ipc`, the Arrow IPC codec in
-`packages/`, at the version in `packages/VERSION`. In-repo builds resolve it
-locally, not from a release:
+Only the Rust stage carries wasm SIMD. The workspace `.cargo/config.toml` sets
+`-C target-feature=+simd128` for `wasm32-wasip2`, so `settle-rs` ships `simd128`
+in its core module's `target_features` section. The other five toolchains expose
+no equivalent setting today:
 
-- Go: a `replace` in `stages/go-validate/go.mod`, re-applied by the build script
+| Stage | Toolchain | Why no SIMD knob |
+| ----- | --------- | ---------------- |
+| `validate-go` | componentize-go 0.4.1 | Go's compiler accepts exactly two `GOWASM` values, `satconv` and `signext`, both permanent no-ops. Any other value is rejected. |
+| `enrich-py` | componentize-py 0.25.0 | Ships a prebuilt WASI CPython inside a compiled native extension. No project file, config or environment variable reaches the build. |
+| `score-ts` | jco 1.30.0, componentize-js 0.22.0 | StarlingMonkey ships as a fixed prebuilt engine wasm. The upstream binary lists eight target features and `simd128` is not among them. |
+| `fee-kt` | Kotlin 2.4.0 `wasmWasi` | Kotlin/Wasm targets WasmGC, which has no vector types or intrinsics to lower, and no Gradle or compiler flag exposes Binaryen's SIMD passes. |
+| `tier-cs` | .NET 10, ILCompiler.LLVM 10.0.0-rc.1.26306.1 | `WasmEnableSIMD` belongs to the Mono browser-wasm pipeline and is inert here: setting it yields a byte-identical artifact. `IlcInstructionSet` reaches `ilc` but rejects a valid x64 name such as `avx2` exactly as it rejects garbage, so its instruction-set table holds no wasm entries. |
+
+`System.Runtime.Intrinsics.Wasm.PackedSimd` exists for C#, but it is a
+hand-written intrinsics API rather than a build setting, so using it means
+rewriting the stage's algorithms. `tier-cs` does not use it.
+
+## SDK packages
+
+The five non-Rust stages consume `pcs-sdk-*`, one zero-ceremony authoring SDK
+per language in `packages/`, at the version in `packages/VERSION`. Each SDK also
+carries the Arrow IPC codec, so there is nothing else to resolve. In-repo builds
+resolve the SDK locally, not from a release:
+
+- Go: a `replace` in `stages/go-validate/go.mod`, re-applied by the task
   after `componentize-go bindings` rewrites the file.
-- Python: `packages/arrow-ipc-py/src` on componentize-py's `-p` list.
-- TypeScript: a `file:` link in `stages/ts-score/package.json`, so the build
-  script runs `npm run build` in the package first to produce `dist/`.
-- Kotlin: `mavenLocal()`, so the build script runs `gradle publishToMavenLocal`
-  in the package first.
-- C#: a `ProjectReference` from `tier-cs.csproj`.
+- Python: `packages/pcs-sdk-py/src` on componentize-py's `-p` list.
+- TypeScript: a `file:` link in `stages/ts-score/package.json`, so the task
+  runs `npm run build` in the package first to produce `dist/`.
+- Kotlin: `mavenLocal()`, so the task runs `gradle publishToMavenLocal` in
+  `packages/pcs-sdk-kt` and then `packages/pcs-sdk-kt-ksp` before the stage
+  build.
+- C#: a `ProjectReference` from `tier-cs.csproj`, with the generator
+  referenced by a second `ProjectReference` using `OutputItemType="Analyzer"`.
 
-Bumping `packages/VERSION` means bumping the four manifests that carry a version
-and the Kotlin stage's `implementation("io.github.nassor:pcs-arrow-ipc:...")`
-line. `scripts/pack-arrow-ipc.sh` asserts they agree.
+Bumping `packages/VERSION` means bumping the five manifests that carry a version
+(`pcs-sdk-py/pyproject.toml`, `pcs-sdk-ts/package.json`,
+`pcs-sdk-kt/build.gradle.kts`, `pcs-sdk-kt-ksp/build.gradle.kts`,
+`pcs-sdk-cs/Pcs.Sdk.csproj`) and the Kotlin stage's
+`implementation("io.github.nassor:pcs-sdk-kt:...")` and
+`add("kspWasmWasi", "io.github.nassor:pcs-sdk-kt-ksp:...")` lines.
+`cargo xtask pack-sdk` asserts they all agree.
 
 ## Why these five and not others
 
@@ -87,13 +115,13 @@ seventh stage needs no host changes.
   template, `module wit_component` plus one `require`, every time it runs, and
   drops every other dependency. That is why
   `examples/polyglot/stages/go-validate/go.mod` is committed with that module
-  name, why intra-module imports read `wit_component/<pkg>`, and why the build
-  script re-applies the codec `require`/`replace` with `go mod edit` between
+  name, why intra-module imports read `wit_component/<pkg>`, and why the task
+  re-applies the codec `require`/`replace` with `go mod edit` between
   `bindings` and `build`. Do not "fix" it.
 - **Go native tests must be scoped inside the stage.** `go test ./...` fails
   there: the generated binding packages use `//go:wasmimport`, which does not
-  compile for the host target. The codec's own tests live in
-  `packages/arrow-ipc-go`, a separate module, where `go test ./...` works.
+  compile for the host target. The SDK's own tests, codec included, live in
+  `packages/pcs-sdk-go`, a separate module, where `go test ./...` works.
 
 ### Python
 
@@ -109,14 +137,14 @@ seventh stage needs no host changes.
 - **`python -m unittest discover` breaks in the stage after the bindings step.**
   The generated `componentize_py_async_support/` package imports
   `componentize_py_runtime`, which only exists inside the component, and
-  discovery imports every package it finds. The codec's own tests live in
-  `packages/arrow-ipc-py`, where discovery works.
+  discovery imports every package it finds. The SDK's own tests, codec included,
+  live in `packages/pcs-sdk-py`, where discovery works.
 
 ### TypeScript
 
 - **jco needs ES modules, a versioned import specifier, and two disable
   flags.** `"type": "module"` in `package.json`; the host-io import must be
-  `'pcs:pipeline/host-io@0.2.0'` (the unversioned form fails at wizer time);
+  `'pcs:pipeline/host-io@0.3.0'` (the unversioned form fails at wizer time);
   and `--disable http` must be paired with `--disable fetch-event`, or the
   component still imports `wasi:http/types` and refuses to instantiate against
   the PCS host. Do not disable `clocks`: `Date.now()` silently returns garbage
@@ -126,7 +154,7 @@ seventh stage needs no host changes.
   `jco componentize` bundles a `.ts` entrypoint automatically; a `.js` one
   needs an explicit `--bundle`.
 - **Do not type the WIT import through tsconfig `paths`.** jco's bundler reads
-  the same field, resolves `pcs:pipeline/host-io@0.2.0` to the declaration file
+  the same field, resolves `pcs:pipeline/host-io@0.3.0` to the declaration file
   and fails with `[MISSING_EXPORT] "getConfig" is not exported by
   "types/interfaces/pcs-pipeline-host-io.d.ts"`. The mapping belongs in an
   ambient `declare module` block, which the bundler never sees. `wit.d.ts` holds
@@ -138,14 +166,23 @@ seventh stage needs no host changes.
   skipped rather than reported, and `jco componentize` then dies on `Cannot
   find native binding`. The stage declares `"engines": { "node": ">=24.12" }`
   so an old runtime fails by name.
-- **Imports name `.ts` files.** Type stripping never rewrites a `.js` specifier
-  to `.ts`, so `score.ts` imports `./schema_gen.ts` and tsconfig sets
-  `allowImportingTsExtensions`. `erasableSyntaxOnly` keeps the sources inside
-  what stripping can handle: no enums, no namespaces, no parameter properties.
-- **The codec resolves as a bare specifier, not through tsconfig `paths`.**
-  `@nassor/pcs-arrow-ipc` ships an `exports` map and compiled `dist/*.js`,
-  because jco bundles with Rolldown under `platform: "neutral"`, where
-  `resolve.mainFields` is empty and a `main`-only package would not resolve.
+- **The stage no longer imports a generated schema file.** `score.ts` used to
+  import `./schema_gen.ts` by its real extension, because Node's type stripping
+  never rewrites a `.js` specifier to `.ts` — that is what
+  `allowImportingTsExtensions` was for. `@nassor/pcs-sdk`'s `component()` call
+  now declares `Order` and derives its schema fingerprint directly, so the only
+  import left is the bare `@nassor/pcs-sdk` specifier. None of the six stages
+  consume `examples/polyglot/generated/` any more; the Quick Start and
+  native-plugin builds are its only consumers, regenerated by `cargo run -p
+  pcs-service --features wasm --example polyglot_schema_emit -- emit`, not the
+  polyglot driver. `erasableSyntaxOnly` still applies: no enums, no namespaces,
+  no parameter properties.
+- **The codec compiles into the SDK's `dist/`, not as a bare specifier.** The
+  absorbed codec is internal source (`src/arrow_ipc.ts`) compiled alongside
+  `core.ts` and re-exported by `src/index.ts`. The merged `@nassor/pcs-sdk`
+  package ships an `exports` map and compiled `dist/*.js`, because jco bundles
+  with Rolldown under `platform: "neutral"`, where `resolve.mainFields` is empty
+  and a `main`-only package would not resolve.
 
 ### Kotlin
 
@@ -159,19 +196,34 @@ seventh stage needs no host changes.
   from `github.com/Kotlin/wit-bindgen` branch `kotlin` builds from source and
   reports version 0.57.1. Its output is documented as non-deterministic, so
   `src/wasmWasiMain/kotlin/bindings/` is gitignored and regenerated every build.
-- **The guest object's name and package are dictated by the generator.**
+- **The processor object's name and package are dictated by the generator.**
   `--kotlin-imports 'impl.*'` puts `import impl.*` in the generated file, and the
   export trampoline calls `PipelineImpl.describe()` and `PipelineImpl.runBatch()`
   by those exact names.
+- **KSP 2.3.11 is pinned to match Kotlin 2.4.0, and there is no 2.4.x KSP
+  line.** The stage applies `id("com.google.devtools.ksp") version "2.3.11"`
+  beside the Kotlin plugin. KSP's own versioning started tracking the Kotlin
+  version at 2.3.0, and 2.3.11 is the newest release, so it is what pairs with
+  Kotlin 2.4.0 rather than a same-numbered KSP release.
+- **The KSP processor is what actually writes `impl.OrderCodec` and
+  `impl.PipelineImpl`.** The stage's symbol-processing configuration is
+  `kspWasmWasi`, the name Gradle derives from the `wasmWasi` target, and it
+  carries `io.github.nassor:pcs-sdk-kt-ksp`. Like any KSP processor it runs on
+  the JVM-hosted compiler regardless of the target it is inspecting; it reads
+  the stage's three annotations and generates the row accessor
+  (`impl.OrderCodec`) plus the `impl.PipelineImpl` export object the previous
+  caveat's trampoline resolves by name. The stage source itself is left holding
+  only the annotated declarations: an `@PcsComponent` data class, an
+  `@PcsTransform` function and an `@PcsProcessor` function.
 - **WASI preview 1 calls trap inside the finished component.** Kotlin/Wasm's
   `wasmWasi` target reaches the outside world through preview 1 imports, and
   every one of them traps once `component new --adapt` has wrapped the module:
   `kotlin.time.TimeSource.Monotonic`, `kotlin.random.Random` and `println` are
-  all unusable. A Kotlin guest may call only the imports the WIT world declares,
+  all unusable. A Kotlin processor may call only the imports the WIT world declares,
   which is `host-io` and nothing else. That is why the Kotlin stage reports
   `run-metrics.wall-ns` as 0 while the Go, Python and TypeScript stages report
   real timings. The failure mode is an opaque wasm trap with no log line, so
-  reach for this first when a Kotlin guest dies inside `run-batch`.
+  reach for this first when a Kotlin processor dies inside `run-batch`.
 - **The output needs Wasm GC, exceptions and function references.** Kotlin
   classes compile to Wasm GC types. wasmtime enables all three proposals by
   default from 47.0.0, and the workspace pins 47.0.3, so the PCS host needs no
@@ -215,23 +267,24 @@ seventh stage needs no host changes.
   29.0, about 535 MB, into `~/.wasi-sdk/`. The download URLs are hardcoded to
   `x86_64-{windows,linux,macos}`, so an arm64 machine cannot build this stage.
 - **The generated namespace carries a package version segment.** The world
-  `pcs-pipeline` and the package `pcs:pipeline@0.2.0` give
-  `PcsPipelineWorld.wit.Exports.pcs.pipeline.v0_2_0`, and the implementation
+  `pcs-pipeline` and the package `pcs:pipeline@0.3.0` give
+  `PcsPipelineWorld.wit.Exports.pcs.pipeline.v0_3_0`, and the implementation
   class must be `PipelineExportsImpl` there. The shared `types` interface lands
   under `wit.Imports`, not `wit.Exports`, even though an exported function
   returns its records.
 - **`result<T,E>` is an exception, not a return value.** `run-batch` returns
   `RunResult` directly and the error arm is
   `throw new WitException<RunError>(RunError.Permanent(message), 0)`.
-- **The default compile glob reaches into the test project.** The codec package's
-  csproj needs `<Compile Remove="tests/**" />`, or the host-only xunit sources
-  end up in the library.
+- **The default compile glob reaches into the test and generator projects.**
+  `Pcs.Sdk.csproj` carries `<Compile Remove="tests/**" />` and
+  `<Compile Remove="generator/**" />`, or the host-only xunit sources and the
+  netstandard2.0 generator end up in the library.
 
 ## Load-bearing crate pin
 
 `arrow-ipc = "=59.2.0"` in the workspace `Cargo.toml` is the host's Arrow IPC
-implementation, and the byte layout the five `pcs-arrow-ipc` packages target. A
-patch bump there can change the buffer layout the Go, Python, TypeScript, Kotlin
-and C# stages walk. The `polyglot_chain` integration test is the regression gate:
-it asserts exact per-column values produced by all six guests. See
-`crates/pcs-guest/PINS.md` for the full upgrade policy.
+implementation, and the byte layout the five `pcs-sdk` packages' codecs target.
+A patch bump there can change the buffer layout the Go, Python, TypeScript,
+Kotlin and C# stages walk. The `polyglot_chain` integration test is the
+regression gate: it asserts exact per-column values produced by all six
+processors. See `crates/pcs-processor/PINS.md` for the full upgrade policy.

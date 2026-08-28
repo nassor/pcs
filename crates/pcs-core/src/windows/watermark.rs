@@ -114,6 +114,37 @@ impl WatermarkState {
     }
 }
 
+/// The host-side watermark for one windowed processor node, as a [`Dataset`]
+/// resource.
+///
+/// The service runners track a watermark per processor node whose config
+/// declares a `window` block — the maximum event timestamp observed across all
+/// of the node's inbound data — and insert it into the batch dataset before
+/// calling the runtime. A native pipeline (or any in-process runtime) reads it
+/// through [`Dataset::get_resource`](crate::dataset::Dataset::get_resource) to
+/// see what the host believes about stream completeness.
+///
+/// Resources never cross the Arrow IPC boundary, so a WASM processor or a
+/// native plugin never sees this value; those runtimes derive their own
+/// watermark from the merged input rows instead. The host-side value is still
+/// what the dashboard and the `pcs_window_watermark_seconds` series report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowWatermark(pub i64);
+
+impl WindowWatermark {
+    /// The watermark in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn as_ms(self) -> i64 {
+        self.0
+    }
+
+    /// The watermark as fractional seconds since the Unix epoch.
+    #[must_use]
+    pub const fn as_seconds(self) -> f64 {
+        self.0 as f64 / 1000.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

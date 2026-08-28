@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+
+{% block title %}Connectors — PCS{% endblock %}
+{% block description %}One page per connector PCS ships: the crate, the pcs-service feature, the Rust constructor, and the config node. Channel, File, PostgreSQL, Kafka, NATS, TCP ingest, DataFusion SQL, S3.{% endblock %}
+{% block og_title %}Connectors — PCS{% endblock %}
+{% block og_description %}One page per connector: what to depend on, what to call, and what its config node accepts.{% endblock %}
+
+{% block content %}
+
+<div class="page-kicker">Moving data</div>
+<h1>Connectors</h1>
+
+<p class="page-lede">
+    Seven crates implement <code>Source</code> and <code>Sink</code>. Each one has its own page,
+    naming the crate to depend on, the constructor to call, and the keys its config node
+    accepts.
+</p>
+
+<dl class="page-facts">
+    <dt>In one line</dt>
+    <dd>One crate per transport, <strong>added only when you move bytes that way</strong></dd>
+    <dt>You need</dt>
+    <dd>The connector crate for a Rust pipeline; on <code>pcs-service</code>, its <code>connector-*</code> feature, plus a <code>transformer-*</code> feature wherever the connector carries a byte format</dd>
+    <dt>Read this if</dt>
+    <dd>You are choosing a transport. The page for the one you picked has its constructor signature, its config keys and the errors it raises</dd>
+</dl>
+
+<h2 id="pages">One page each</h2>
+
+<div class="next-steps-grid">
+    {% for page in section.pages %}
+    <a href="{{ page.permalink }}" class="next-card">
+        <span class="next-card-label">{{ section.title }}</span>
+        <h3>{{ page.title }}</h3>
+        {% if page.description %}<p>{{ page.description }}</p>{% endif %}
+    </a>
+    {% endfor %}
+</div>
+
+<h2 id="matrix">The eight at a glance</h2>
+
+<table class="rule-table">
+    <thead>
+        <tr><th>Connector</th><th>Config <code>type</code></th><th>Direction</th><th><code>format</code></th><th>Run mode</th><th>Feature</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/channel.md') }}">Channel</a></strong></td>
+            <td><code>ChannelSource</code>, <code>ChannelSink</code></td>
+            <td>source and sink</td>
+            <td>none</td>
+            <td>any</td>
+            <td><code>connector-channel</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/file.md') }}">File</a></strong></td>
+            <td><code>FileSource</code>, <code>FileSink</code></td>
+            <td>source and sink</td>
+            <td>required</td>
+            <td>any</td>
+            <td><code>connector-file</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/postgresql.md') }}">PostgreSQL</a></strong></td>
+            <td><code>PostgresSource</code>, <code>PostgresSink</code></td>
+            <td>source and sink</td>
+            <td>none</td>
+            <td>any</td>
+            <td><code>connector-postgresql</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/kafka.md') }}">Kafka</a></strong></td>
+            <td><code>KafkaSource</code>, <code>KafkaSink</code></td>
+            <td>source and sink</td>
+            <td>optional, <code>ndjson</code></td>
+            <td>stream, unless <code>stop_at_end = true</code></td>
+            <td><code>connector-kafka</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/nats.md') }}">NATS</a></strong></td>
+            <td><code>NatsSource</code>, <code>NatsSink</code></td>
+            <td>source and sink</td>
+            <td>optional, <code>ndjson</code></td>
+            <td>stream, unless <code>stop_at_end = true</code></td>
+            <td><code>connector-nats</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/tcp.md') }}">TCP ingest</a></strong></td>
+            <td><code>tcp</code></td>
+            <td>source</td>
+            <td>optional, <code>arrow-ipc</code></td>
+            <td>stream only</td>
+            <td><code>connector-tcp</code></td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/datafusion.md') }}">DataFusion SQL</a></strong></td>
+            <td>none</td>
+            <td>source</td>
+            <td>none</td>
+            <td>Rust only</td>
+            <td>none</td>
+        </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/s3.md') }}">S3</a></strong></td>
+            <td><code>S3Source</code>, <code>S3Sink</code></td>
+            <td>source and sink</td>
+            <td>required</td>
+            <td>any</td>
+            <td><code>connector-s3</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="two-paths">Two ways in</h2>
+
+<p>
+    A connector is reached either by calling its constructor in Rust and handing the result
+    to <code>Pipeline::add_source</code>, or by naming its <code>type</code> string in the
+    service config and letting the factory build it. The second path needs the connector's feature on
+    <code>pcs-service</code>, because <code>register_builtin_factories</code> only installs
+    what is compiled in.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>TOML</span><em>the dependency form is the same for all seven</em></div>
+    <pre><code class="language-toml"># In a clone of the repository.
+pcs-connector-file = { path = "crates/pcs-connector-file" }
+
+# Outside one. The crates are not published to crates.io.
+pcs-connector-file = { git = "https://github.com/nassor/pcs" }</code></pre>
+</div>
+
+<p>
+    Every connector depends on <code>pcs-core</code> with its <code>io</code> feature, so the
+    <code>Source</code> and <code>Sink</code> traits arrive with it. Nothing here depends on
+    <code>pcs-service</code>: the factory contract lives in <code>pcs-connector</code>, below
+    the host, so a connector compiles without wasmtime, axum or redb in the graph. Each page
+    above states the constructor, every config key and the errors that key can raise.
+</p>
+
+<h2 id="own">Writing your own</h2>
+
+<p>
+    An out-of-tree connector is a crate that depends on <code>pcs-core</code> for the traits
+    and <code>pcs-connector</code> for <code>SourceFactory</code> and
+    <code>SinkFactory</code>, and on nothing else of PCS. Both traits build through
+    <code>fn build(&amp;self, config: &amp;ConfigValue, ctx: &amp;ConnectorContext&lt;'_&gt;)</code>,
+    where <code>ctx</code> resolves the <code>format</code> key against the transformer registry
+    so no connector owns a list of formats. A custom binary then chains
+    <code>register_source</code> or <code>register_sink</code> onto
+    <code>register_builtin_factories</code>. Registering a <code>type_name</code> that is
+    already taken replaces the earlier factory.
+</p>
+
+<h2 id="next">Next</h2>
+
+<div class="next-steps-grid">
+    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
+        <span class="next-card-label">Concept 05</span>
+        <h3>Distributed Runner</h3>
+        <p>The other way rows arrive: partitions claimed from a shared store instead of pulled from a Source.</p>
+    </a>
+    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
+        <span class="next-card-label">Service</span>
+        <h3>Service</h3>
+        <p>The binary that owns the drain loop, reads the config above, and decides when finish() gets called.</p>
+    </a>
+</div>
+
+{% endblock %}

@@ -122,9 +122,10 @@ def page_records(html: str, url: str) -> list[dict]:
         return []
 
     name = SPACE.sub(" ", page.title).strip().split(" — ")[0].strip() or url
-    # The breadcrumb reads "Docs / Group"; only the group is worth indexing.
+    # The breadcrumb reads "Docs / Group" or "Docs / Group / Parent"; the group
+    # is the one worth indexing.
     crumb = [part.strip() for part in page.group.split("/") if part.strip()]
-    group = crumb[-1] if len(crumb) > 1 else ""
+    group = crumb[1] if len(crumb) > 1 else ""
 
     records = []
     for block in page.blocks:

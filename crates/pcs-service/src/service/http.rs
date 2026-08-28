@@ -1,13 +1,17 @@
 //! HTTP control-plane for the PCS service.
 //!
-//! Exposes four endpoints:
+//! Five endpoints, always present:
 //!
 //! | Endpoint    | Purpose |
 //! |-------------|---------|
+//! | `GET /`        | Redirect to the dashboard, or the list of mounted endpoints |
 //! | `GET /health`  | Liveness probe: checks watchdog counter freshness |
 //! | `GET /ready`   | Readiness probe: checks the `ready` flag |
 //! | `GET /metrics` | Prometheus metrics exposition |
 //! | `GET /status`  | Rich JSON status including cluster/standalone stats |
+//!
+//! Plus, when the inspector is enabled, the JSON API and dashboard from
+//! [`inspector_api`](super::inspector_api).
 //!
 //! ## Usage
 //!
@@ -17,7 +21,7 @@
 //! use std::sync::{Arc, atomic::{AtomicBool, AtomicU64}};
 //! use std::time::Instant;
 //! use pcs_service::service::http::{ServiceState, ServiceModeLabel, build_router, serve_http,
-//!                            spawn_watchdog, register_standard_metrics};
+//!                            spawn_watchdog};
 //! use pcs_service::service::config::HttpConfig;
 //! use tokio_util::sync::CancellationToken;
 //!
@@ -25,6 +29,7 @@
 //! async fn main() {
 //!     let registry = Arc::new(prometheus::Registry::new());
 //!     let otel_exporter = opentelemetry_prometheus::exporter()
+//!         .without_counter_suffixes()
 //!         .with_registry((*registry).clone())
 //!         .build()
 //!         .expect("build otel exporter");
@@ -33,7 +38,7 @@
 //!         .build();
 //!     opentelemetry::global::set_meter_provider(provider);
 //!
-//!     register_standard_metrics();
+//!     pcs_service::metrics::init();
 //!
 //!     let state = ServiceState {
 //!         node_id: 1,
@@ -45,6 +50,7 @@
 //!         ready: Arc::new(AtomicBool::new(false)),
 //!         cluster_probe: None,
 //!         standalone_stats: None,
+//!         inspector: None,
 //!     };
 //!
 //!     let cancel = CancellationToken::new();
@@ -62,7 +68,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+};
 use prometheus::{Registry, TextEncoder};
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -161,19 +173,40 @@ pub struct ServiceState {
     pub ready: Arc<AtomicBool>,
     /// Optional cluster-status probe supplied by the cluster runner.
     pub cluster_probe: Option<Arc<dyn ClusterProbe>>,
-    /// Optional standalone statistics supplied by the standalone runner.
-    pub standalone_stats: Option<Arc<RwLock<StandaloneStats>>>,
+    /// Per-workflow standalone statistics supplied by the standalone runner,
+    /// keyed by workflow id. `None` in cluster mode.
+    pub standalone_stats: Option<Vec<(String, Arc<RwLock<StandaloneStats>>)>>,
+    /// The in-process inspector, when telemetry capture is enabled.
+    ///
+    /// `None` disables `/api/*` and `/ui` entirely: the router does not merge
+    /// those routes, so they 404 rather than answering 403 for a feature the
+    /// operator switched off.
+    pub inspector: Option<crate::inspector::Inspector>,
 }
 
-/// Build the axum [`Router`] with all four control-plane routes and middleware.
+/// Build the axum [`Router`] with the origin and the four control-plane routes,
+/// plus the inspector's JSON API and dashboard when they are enabled.
+///
+/// The inspector routes are merged, not gated inside a handler, so a disabled
+/// inspector has no `/api/*` and no `/ui` at all.
 ///
 /// The router is not bound to a port here; call [`serve_http`] for that.
 pub fn build_router(state: ServiceState) -> Router {
-    Router::new()
+    let mut router = Router::new()
+        .route("/", get(handle_root))
         .route("/health", get(handle_health))
         .route("/ready", get(handle_ready))
         .route("/metrics", get(handle_metrics))
-        .route("/status", get(handle_status))
+        .route("/status", get(handle_status));
+
+    if let Some(inspector) = &state.inspector {
+        router = router.merge(crate::service::inspector_api::routes());
+        if inspector.ui_enabled() {
+            router = router.merge(crate::service::inspector_api::ui_routes());
+        }
+    }
+
+    router
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -182,83 +215,28 @@ pub fn build_router(state: ServiceState) -> Router {
         .with_state(state)
 }
 
-/// Describe all standard PCS metrics to the Prometheus registry.
-///
-/// Call once at service startup, before the first metric is recorded, so that
-/// help text and type information appear in `/metrics` even before any counter
-/// increments. Runners increment the counters and gauges; this function only
-/// registers descriptions.
-pub fn register_standard_metrics() {
-    let meter = opentelemetry::global::meter("pcs");
-    meter
-        .u64_counter("pcs_pipeline_runs_total")
-        .with_description("Total number of pipeline runs")
-        .build();
-    meter
-        .u64_counter("pcs_pipeline_errors_total")
-        .with_description("Total number of pipeline run errors")
-        .build();
-    meter
-        .f64_histogram("pcs_stage_duration_seconds")
-        .with_description("Stage execution duration in seconds")
-        .build();
-    meter
-        .u64_counter("pcs_source_batches_drained_total")
-        .with_description("Total source batches drained")
-        .build();
-    meter
-        .u64_counter("pcs_sink_batches_written_total")
-        .with_description("Total sink batches written")
-        .build();
-    meter
-        .u64_counter("pcs_rows_processed_total")
-        .with_description("Total rows processed through the pipeline")
-        .build();
-    meter
-        .f64_observable_gauge("pcs_liveness_counter")
-        .with_description("Watchdog liveness counter")
-        .build();
-    meter
-        .f64_observable_gauge("pcs_ready")
-        .with_description("Service ready state (1=ready)")
-        .build();
-    meter
-        .f64_observable_gauge("pcs_uptime_seconds")
-        .with_description("Service uptime in seconds")
-        .build();
-    // Cluster-specific (no-ops in standalone mode).
-    meter
-        .f64_observable_gauge("pcs_raft_commit_index")
-        .with_description("Raft commit index")
-        .build();
-    meter
-        .f64_observable_gauge("pcs_raft_term")
-        .with_description("Current Raft term")
-        .build();
-    meter
-        .f64_observable_gauge("pcs_raft_leader_id")
-        .with_description("Current Raft leader node ID")
-        .build();
-}
-
 /// Spawn the liveness watchdog task.
 ///
 /// Increments `state.liveness` by 1 every second. If the main service loop
 /// deadlocks the watchdog stops ticking, the `/health` counter goes stale, and
 /// the health-check orchestrator restarts the pod.
 ///
+/// The same tick is the single writer for `pcs_liveness_counter`, `pcs_ready`
+/// and `pcs_uptime_seconds`.
+///
 /// The task exits cleanly when `cancel` is cancelled.
 pub fn spawn_watchdog(state: ServiceState, cancel: CancellationToken) -> JoinHandle<()> {
-    let liveness_gauge = opentelemetry::global::meter("pcs")
-        .f64_gauge("pcs_liveness_counter")
-        .build();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let val = state.liveness.fetch_add(1, Ordering::Relaxed);
-                    liveness_gauge.record(val as f64 + 1.0, &[]);
+                    let val = state.liveness.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::metrics::instruments().service_gauges(
+                        val,
+                        state.ready.load(Ordering::Relaxed),
+                        state.started_at.elapsed().as_secs_f64(),
+                    );
                 }
                 _ = cancel.cancelled() => break,
             }
@@ -268,6 +246,53 @@ pub fn spawn_watchdog(state: ServiceState, cancel: CancellationToken) -> JoinHan
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+/// The always-present endpoints, as the plain-text index at `/` lists them.
+const PROBE_INDEX: &str = "\
+  GET /health   liveness
+  GET /ready    readiness
+  GET /metrics  Prometheus exposition
+  GET /status   node identity, uptime and runner counters
+";
+
+/// The inspector's JSON endpoints, listed when the dashboard is off.
+const API_INDEX: &str = "\
+  GET /api/topology  pipeline graph
+  GET /api/snapshot  current counters
+  GET /api/traces    recent spans
+  GET /api/logs      recent log records
+";
+
+/// `GET /`: the bare origin.
+///
+/// A browser pointed at the address the startup banner prints arrives here.
+/// Axum's fallback would answer it with a bodyless 404, which reads as a
+/// service that never bound the port, so the origin redirects to the dashboard
+/// when one is mounted and names the endpoints that are when it is not.
+async fn handle_root(State(state): State<ServiceState>) -> Response {
+    let api_mounted = match &state.inspector {
+        Some(inspector) if inspector.ui_enabled() => {
+            return Redirect::temporary("/ui").into_response();
+        }
+        Some(_) => true,
+        None => false,
+    };
+
+    let mut body = String::from("pcs-service\n\n");
+    body.push_str(PROBE_INDEX);
+    if api_mounted {
+        body.push_str(API_INDEX);
+        body.push_str(
+            "\nThe dashboard is off: [observability.inspector] ui = true serves it at /ui.\n",
+        );
+    } else {
+        body.push_str(
+            "\nThe inspector is off: [observability.inspector] enabled = true serves the JSON API and the /ui dashboard.\n",
+        );
+    }
+
+    ([(CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
 
 /// How many seconds of liveness-counter lag before `/health` returns 503.
 const LIVENESS_STALE_SECONDS: u64 = 5;
@@ -377,6 +402,7 @@ struct ClusterStatusBody {
 
 #[derive(Serialize)]
 struct StandaloneStatusBody {
+    workflow_id: String,
     iterations: u64,
     rows_processed: u64,
     source_batches_drained: u64,
@@ -396,7 +422,7 @@ struct StatusBody {
     uptime_seconds: u64,
     build: BuildInfo,
     cluster: Option<ClusterStatusBody>,
-    standalone: Option<StandaloneStatusBody>,
+    standalone: Option<Vec<StandaloneStatusBody>>,
 }
 
 /// `GET /status`: rich operational status.
@@ -435,27 +461,28 @@ async fn handle_status(State(state): State<ServiceState>) -> impl IntoResponse {
 
     let standalone = if state.mode == ServiceModeLabel::Standalone {
         match &state.standalone_stats {
-            Some(stats_lock) => {
-                let stats = stats_lock.read().await;
-                Some(StandaloneStatusBody {
-                    iterations: stats.iterations,
-                    rows_processed: stats.rows_processed,
-                    source_batches_drained: stats.source_batches_drained,
-                    sink_batches_written: stats.sink_batches_written,
-                    iteration_errors: stats.iteration_errors,
-                    total_busy_micros: stats.total_busy_micros,
-                    max_item_micros: stats.max_item_micros,
-                })
+            Some(entries) => {
+                let mut body = Vec::with_capacity(entries.len());
+                for (workflow_id, stats_lock) in entries {
+                    let stats = stats_lock.read().await;
+                    body.push(StandaloneStatusBody {
+                        workflow_id: workflow_id.clone(),
+                        iterations: stats.iterations,
+                        rows_processed: stats.rows_processed,
+                        source_batches_drained: stats.source_batches_drained,
+                        sink_batches_written: stats.sink_batches_written,
+                        iteration_errors: stats.iteration_errors,
+                        total_busy_micros: stats.total_busy_micros,
+                        max_item_micros: stats.max_item_micros,
+                    });
+                }
+                Some(body)
             }
-            None => Some(StandaloneStatusBody {
-                iterations: 0,
-                rows_processed: 0,
-                source_batches_drained: 0,
-                sink_batches_written: 0,
-                iteration_errors: 0,
-                total_busy_micros: 0,
-                max_item_micros: 0,
-            }),
+            // Standalone mode but the runner has not supplied per-workflow
+            // stats yet (e.g. a `ServiceState` built without going through
+            // `serve.rs`): report no entries rather than guessing a
+            // workflow id.
+            None => Some(Vec::new()),
         }
     } else {
         None
@@ -541,6 +568,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(false)),
             cluster_probe: None,
             standalone_stats: None,
+            inspector: None,
         }
     }
 
@@ -553,6 +581,9 @@ mod tests {
         tokio::task::JoinHandle<PcsResult<()>>,
     ) {
         let cancel = CancellationToken::new();
+        // Every test in this module drives the server with a reqwest client,
+        // which 0.13 refuses to build without an installed crypto provider.
+        crate::service::install_ring_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
@@ -571,6 +602,61 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         (addr, cancel, handle)
+    }
+
+    #[tokio::test]
+    async fn test_root_redirects_to_ui_when_inspector_enabled() {
+        let mut state = make_state(ServiceModeLabel::Standalone);
+        state.inspector = Some(crate::inspector::Inspector::new(
+            &crate::inspector::InspectorConfig::default(),
+        ));
+
+        let (addr, cancel, _handle) = bind_server(state).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 307);
+        assert_eq!(resp.headers().get("location").unwrap(), "/ui");
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_root_lists_probe_endpoints_when_inspector_disabled() {
+        let state = make_state(ServiceModeLabel::Standalone);
+        // inspector is None by default.
+
+        let (addr, cancel, _handle) = bind_server(state).await;
+        let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("/health"));
+        assert!(body.contains("/status"));
+        assert!(!body.contains("/api/topology"));
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_root_lists_api_endpoints_when_ui_disabled() {
+        let mut state = make_state(ServiceModeLabel::Standalone);
+        state.inspector = Some(crate::inspector::Inspector::new(
+            &crate::inspector::InspectorConfig {
+                ui: false,
+                ..crate::inspector::InspectorConfig::default()
+            },
+        ));
+
+        let (addr, cancel, _handle) = bind_server(state).await;
+        let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("/api/topology"));
+        assert!(body.contains("/ui"));
+
+        cancel.cancel();
     }
 
     #[tokio::test]
@@ -665,7 +751,7 @@ mod tests {
         }));
 
         let mut state = make_state(ServiceModeLabel::Standalone);
-        state.standalone_stats = Some(stats);
+        state.standalone_stats = Some(vec![("w".to_string(), stats)]);
 
         let (addr, cancel, _handle) = bind_server(state).await;
         let resp = reqwest::get(format!("http://{addr}/status")).await.unwrap();
@@ -676,8 +762,9 @@ mod tests {
         assert_eq!(body["mode"], "standalone");
         assert!(body["cluster"].is_null());
         assert!(!body["standalone"].is_null());
-        assert_eq!(body["standalone"]["iterations"], 42);
-        assert_eq!(body["standalone"]["rows_processed"], 420_000);
+        assert_eq!(body["standalone"][0]["workflow_id"], "w");
+        assert_eq!(body["standalone"][0]["iterations"], 42);
+        assert_eq!(body["standalone"][0]["rows_processed"], 420_000);
 
         cancel.cancel();
     }

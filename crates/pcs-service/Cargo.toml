@@ -6,19 +6,53 @@ rust-version.workspace = true
 publish.workspace = true
 description = "The pcs-service binary: TOML configuration, factory registry, axum HTTP control plane, and built-in standalone & Raft cluster runners."
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
-# The binary ships with mimalloc by default. Opt out with `--no-default-features`
+# `cargo install pcs-service` must produce a runnable binary, so the default
+# bundle covers `service` (the `[[bin]]` target's required feature), the WASM
+# runtime, and the connectors and transformers the Quick Start stack needs.
+# The binary also ships with mimalloc; opt out with `--no-default-features`
 # plus the features you want.
-default = ["mimalloc"]
-tracing = ["dep:tracing", "pcs-core/tracing"]
-io = [
-    "dep:arrow-json",
-    "dep:arrow-csv",
-    "dep:parquet",
-    "pcs-core/io",
+#
+# `connector-kafka` stays opt-in: librdkafka-sys builds vendored C, so
+# defaulting it would break `cargo install` on a machine without cmake.
+# `distributed-raft` and `service-cluster` stay opt-in too — a cluster node is
+# a deliberate deployment choice, not a default.
+default = [
+    "mimalloc",
+    "service",
+    "wasm",
+    "windows",
+    "parquet-checkpoint",
+    "connector-channel",
+    "connector-file",
+    "connector-nats",
+    "connector-postgresql",
+    "connector-s3",
+    "connector-tcp",
+    "transformer-ndjson",
+    "transformer-csv",
+    "transformer-parquet",
+    "transformer-avro",
+    "transformer-arrow-ipc",
 ]
-datafusion = ["io", "dep:datafusion"]
+tracing = ["dep:tracing", "pcs-core/tracing"]
+# OpenTelemetry instruments for the service's own series. Split out of
+# `service` so a library embedder can compile the writers without the
+# HTTP control plane, exactly as the connector crates do.
+#
+# `pcs-inspector-wire` comes along for one item: the `SOURCE_ATTR`/
+# `PROCESSOR_ATTR`/`SINK_ATTR` attribute keys the per-node `pcs_processor_*`,
+# `pcs_rows_processed_total` and `pcs_sink_batches_written_total` series carry.
+# The dashboard reads those keys and cannot see this crate, so defining them in
+# the shared serde-only contract crate is what keeps the writer and the reader
+# from drifting.
+metrics = ["dep:opentelemetry", "dep:pcs-inspector-wire"]
+# Archival Parquet checkpoint store. Not a Source or Sink, so it stays here
+# rather than moving into a connector crate.
+parquet-checkpoint = ["distributed", "dep:parquet"]
 windows = ["pcs-core/windows"]
 distributed = [
     "dep:redb", "dep:uuid", "dep:serde_json", "dep:serde_bytes", "dep:hex",
@@ -35,27 +69,92 @@ plugin = [
     "dep:pcs-plugin-abi", "dep:libloading", "dep:base64", "dep:serde_json", "dep:sha3",
     "pcs-core/runtime",
 ]
+# In-process telemetry: time-bounded ring buffers fed by a `tracing` layer and
+# an in-memory OpenTelemetry metric exporter, read back through the control
+# plane's JSON API. Needs no collector, no scraper and no external storage.
+inspector = [
+    "tracing", "metrics",
+    "dep:pcs-inspector-wire",
+    "dep:tracing-subscriber",
+    "dep:opentelemetry_sdk",
+]
 # Generator for the cross-language conformance corpus in
 # packages/arrow-ipc-conformance/. `arrow-ipc/lz4` is enabled only here, so a
 # normal build still refuses a compressed record batch: the corpus needs to
 # WRITE one to prove every codec rejects it.
 conformance = ["arrow-ipc/lz4", "dep:serde_json"]
 service = [
-    "io", "distributed", "tracing",
-    "dep:toml",
+    "pcs-core/io", "distributed", "parquet-checkpoint", "tracing",
+    "inspector", "dep:pcs-config",
     "dep:axum", "dep:tower", "dep:tower-http", "dep:tokio-util",
     "dep:tracing-subscriber",
-    "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-prometheus",
+    "metrics", "dep:opentelemetry_sdk", "dep:opentelemetry-prometheus",
+    "dep:opentelemetry-otlp", "dep:tracing-opentelemetry",
     "dep:prometheus",
     "dep:serde_json",
-    "dep:clap", "dep:reqwest",
+    "dep:clap", "dep:reqwest", "dep:rustls",
 ]
+# One feature per connector crate. Each implies `service`: the only thing it
+# adds to the host is registration into the `service` Registry.
+connector-channel = ["service", "dep:pcs-connector-channel"]
+# The file connector needs no transformer feature of its own: a source/sink
+# node names its declared `transformer` explicitly, so the user picks which
+# formats the binary can honour.
+connector-file = ["service", "dep:pcs-connector-file"]
+# Kafka, NATS and TCP each pull in one transformer feature as a convenience
+# default so the feature alone is runnable; none of the three connectors
+# resolves a format implicitly anymore, every byte-carrying node names its
+# `transformer` explicitly.
+connector-kafka = ["service", "dep:pcs-connector-kafka", "transformer-ndjson"]
+connector-nats = ["service", "dep:pcs-connector-nats", "transformer-ndjson"]
+connector-postgresql = [
+    "service",
+    "dep:pcs-connector-postgresql",
+    "pcs-connector-postgresql/tracing",
+    "pcs-connector-postgresql/metrics",
+    "pcs-connector-postgresql/tls",
+]
+# Like `connector-file`, an S3 node names its `transformer` explicitly, so no
+# `transformer-*` feature is implied: the config picks the formats.
+connector-s3 = ["service", "dep:pcs-connector-s3", "pcs-connector-s3/tracing"]
+connector-tcp = [
+    "service", "dep:pcs-connector-tcp", "pcs-connector-tcp/tracing",
+    "transformer-arrow-ipc",
+]
+# One feature per transformer crate: which byte formats the `format` key can
+# name. Each implies `service`, like a connector feature, because registration
+# into the `service` Registry is all it adds.
+transformer-arrow-ipc = ["service", "dep:pcs-transformer-arrow-ipc"]
+transformer-avro = ["service", "dep:pcs-transformer-avro"]
+transformer-csv = ["service", "dep:pcs-transformer-csv"]
+transformer-ndjson = ["service", "dep:pcs-transformer-ndjson"]
+transformer-parquet = ["service", "dep:pcs-transformer-parquet"]
 service-cluster = ["service", "distributed-raft"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-pcs-core = { path = "../pcs-core" }
-pcs-plugin-abi = { path = "../pcs-plugin-abi", optional = true }
+pcs-core = { path = "../pcs-core", version = "0.1.0" }
+pcs-connector = { path = "../pcs-connector", version = "0.1.0" }
+# The transformer contract. Not optional: the Registry holds a
+# TransformerRegistry whatever connectors are compiled in.
+pcs-transformer = { path = "../pcs-transformer", version = "0.1.0" }
+pcs-plugin-abi = { path = "../pcs-plugin-abi", version = "0.1.0", optional = true }
+# The inspector's JSON contract. A separate crate rather than a module here
+# because the dashboard compiles it for wasm32-unknown-unknown, which this
+# crate's own dependency graph cannot target.
+pcs-inspector-wire = { path = "../pcs-inspector-wire", version = "0.1.0", optional = true }
+pcs-connector-channel = { path = "../pcs-connector-channel", version = "0.1.0", optional = true }
+pcs-connector-file = { path = "../pcs-connector-file", version = "0.1.0", optional = true }
+pcs-connector-kafka = { path = "../pcs-connector-kafka", version = "0.1.0", optional = true }
+pcs-connector-nats = { path = "../pcs-connector-nats", version = "0.1.0", optional = true }
+pcs-connector-postgresql = { path = "../pcs-connector-postgresql", version = "0.1.0", optional = true }
+pcs-connector-s3 = { path = "../pcs-connector-s3", version = "0.1.0", optional = true }
+pcs-connector-tcp = { path = "../pcs-connector-tcp", version = "0.1.0", optional = true }
+pcs-transformer-arrow-ipc = { path = "../pcs-transformer-arrow-ipc", version = "0.1.0", optional = true }
+pcs-transformer-avro = { path = "../pcs-transformer-avro", version = "0.1.0", optional = true }
+pcs-transformer-csv = { path = "../pcs-transformer-csv", version = "0.1.0", optional = true }
+pcs-transformer-ndjson = { path = "../pcs-transformer-ndjson", version = "0.1.0", optional = true }
+pcs-transformer-parquet = { path = "../pcs-transformer-parquet", version = "0.1.0", optional = true }
 
 async-trait   = { workspace = true }
 tokio         = { workspace = true }
@@ -76,34 +175,49 @@ libloading    = { workspace = true, optional = true }
 base64        = { workspace = true, optional = true }
 
 redb          = { version = "4.2.0", optional = true }
-openraft      = { git = "https://github.com/databendlabs/openraft", branch = "release-0.10", features = ["serde"], optional = true }
+# `version` is required for `cargo package`/`publish` (a bare git dependency
+# is rejected); it is a caret floor, not an exact pin, so it tolerates the
+# `release-0.10` branch moving forward to a newer 0.10.0-alpha.N build while
+# still requiring the git-resolved crate to actually be a 0.10.0 pre-release.
+# Switch to a plain `version` (dropping `git`/`branch`) once 0.10.0 stabilizes.
+openraft      = { git = "https://github.com/databendlabs/openraft", branch = "release-0.10", version = "0.10.0-alpha.34", features = ["serde"], optional = true }
 postcard      = { version = "1.1", default-features = false, features = ["alloc"], optional = true }
 hex           = { version = "0.4.3", optional = true }
-toml          = { version = "0.8", optional = true }
+pcs-config    = { path = "../pcs-config", version = "0.1.0", optional = true }
 axum          = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"], optional = true }
 tower         = { version = "0.5", optional = true }
-tower-http    = { version = "0.6", default-features = false, features = ["trace", "timeout", "limit"], optional = true }
+tower-http    = { version = "0.7", default-features = false, features = ["trace", "timeout", "limit"], optional = true }
 tokio-util    = { version = "0.7", features = ["rt"], optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "ansi"], optional = true }
 opentelemetry       = { version = "0.32", optional = true }
-opentelemetry_sdk   = { version = "0.32", features = ["metrics"], optional = true }
+opentelemetry_sdk   = { version = "0.32", features = ["metrics", "trace"], optional = true }
 opentelemetry-prometheus = { version = "0.32", optional = true }
 prometheus          = { version = "0.14", default-features = false, optional = true }
+# `reqwest-blocking-client` is the exporter default and the only client the
+# non-experimental `BatchSpanProcessor` supports: that processor owns an OS
+# thread and drives the exporter with `futures_executor::block_on`, so an async
+# client would have no reactor. It shares the `reqwest 0.13` tree the CLI's own
+# client below lives in; only `object_store 0.13.2` (through datafusion) still
+# holds the workspace on `reqwest 0.12`.
+opentelemetry-otlp  = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"], optional = true }
+# 0.33 is the release that depends on the pinned `opentelemetry 0.32` line.
+tracing-opentelemetry = { version = "0.33", optional = true }
 clap          = { version = "4", features = ["derive", "env"], optional = true }
-reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest       = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"], optional = true }
+# reqwest 0.13's `rustls-no-provider` refuses to build a Client until a crypto
+# provider is installed; `install_ring_provider` does that with the ring
+# backend the workspace already links through pcs-connector-postgresql. Same
+# feature set as that crate's TLS path, so the ring feature unifies.
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
-# Arrow sub-crates (always required for format impls)
+# Arrow sub-crates
 arrow-array   = { workspace = true }
 arrow-schema  = { workspace = true }
 arrow-ipc     = { workspace = true }
 
-# IO format deps
-arrow-json    = { workspace = true, optional = true }
-arrow-csv     = { workspace = true, optional = true }
+# Archival checkpoint store
 parquet       = { workspace = true, optional = true }
 
-# DataFusion integration
-datafusion    = { version = "55", default-features = false, features = ["sql", "parquet"], optional = true }
 mimalloc = { version = "0.1.52", optional = true }
 
 [[bin]]
@@ -113,79 +227,104 @@ required-features = ["service"]
 
 [[example]]
 name = "first_pipeline"
-path = "examples/first_pipeline.rs"
+path = "../../examples/native/first_pipeline.rs"
 
 [[example]]
 name = "scheduler_etl"
-path = "examples/scheduler_etl.rs"
+path = "../../examples/native/scheduler_etl.rs"
 
 [[example]]
 name = "scheduler_etl_parallel"
-path = "examples/scheduler_etl_parallel.rs"
+path = "../../examples/native/scheduler_etl_parallel.rs"
 
 [[example]]
 name = "scheduler_dag"
-path = "examples/scheduler_dag.rs"
-
-[[example]]
-name = "scheduler_parquet_etl"
-path = "examples/scheduler_parquet_etl.rs"
-required-features = ["io"]
+path = "../../examples/native/scheduler_dag.rs"
 
 [[example]]
 name = "distributed_scheduler"
-path = "examples/distributed_scheduler.rs"
+path = "../../examples/native/distributed_scheduler.rs"
 required-features = ["distributed"]
 
 [[example]]
-name = "datafusion_interop"
-path = "examples/datafusion_interop.rs"
-required-features = ["datafusion"]
-
-[[example]]
 name = "window_aggregation"
-path = "examples/window_aggregation.rs"
+path = "../../examples/native/window_aggregation.rs"
 required-features = ["windows"]
 
 [[example]]
 name = "distributed_windowed"
-path = "examples/distributed_windowed.rs"
+path = "../../examples/native/distributed_windowed.rs"
 required-features = ["distributed", "windows"]
 
 [[example]]
+name = "windowed_fan_in"
+path = "../../examples/native/windowed_fan_in.rs"
+# Two ChannelSources merged into one windowed processor: the fan-in merge and
+# the host-side watermark both live in the service runner.
+required-features = ["service", "windows", "connector-channel"]
+
+[[example]]
 name = "distributed_fulfillment"
-path = "examples/distributed_fulfillment/main.rs"
+path = "../../examples/distributed_fulfillment/main.rs"
 required-features = ["service-cluster"]
 
 [[example]]
 name = "polyglot_orders"
-path = "examples/polyglot_orders.rs"
+path = "../../examples/polyglot/polyglot_orders.rs"
+required-features = ["wasm"]
+
+[[example]]
+name = "polyglot_schema_emit"
+path = "../../examples/polyglot/schema_emit.rs"
 required-features = ["wasm"]
 
 [[example]]
 name = "native_plugin"
-path = "examples/native_plugin.rs"
+path = "../../examples/plugins/native_plugin.rs"
 required-features = ["plugin"]
 
 [[example]]
 name = "conformance_vectors"
-path = "examples/conformance_vectors.rs"
+path = "../../examples/conformance/conformance_vectors.rs"
 required-features = ["conformance"]
 
 [[example]]
 name = "stream_latency"
-path = "examples/stream_latency.rs"
+path = "../../examples/native/stream_latency.rs"
 required-features = ["service"]
+
+[[example]]
+name = "quickstart_publish"
+path = "../../examples/quickstart/quickstart_publish.rs"
+# `async-nats` reaches this example through pcs-connector-nats, so the entry
+# names the connector feature rather than a dev-dependency: `cargo check
+# --examples` stays green whatever features are selected.
+required-features = ["connector-nats"]
+
+[[example]]
+name = "branching_publish"
+path = "../../examples/branching/branching_publish.rs"
+# `async-nats` reaches this example through pcs-connector-nats, so the entry
+# names the connector feature rather than a dev-dependency: `cargo check
+# --examples` stays green whatever features are selected.
+required-features = ["connector-nats"]
+
+[[example]]
+name = "windowed_publish"
+path = "../../examples/windowing/windowed_publish.rs"
+# Same connector-feature convention as branching_publish.
+required-features = ["connector-nats"]
+
+[[example]]
+name = "multi_workflow_publish"
+path = "../../examples/multi_workflow/multi_workflow_publish.rs"
+# Same connector-feature convention as branching_publish.
+required-features = ["connector-nats"]
 
 [[bench]]
 name = "distributed"
 harness = false
 required-features = ["distributed"]
-
-[[bench]]
-name = "vs_datafusion_q6"
-harness = false
-required-features = ["datafusion"]
 
 [dev-dependencies]
 criterion     = { workspace = true }
@@ -195,7 +334,27 @@ postcard      = { workspace = true }
 anyhow        = { workspace = true }
 sha3          = { workspace = true }
 libc          = { workspace = true }
-pcs-polyglot-order = { path = "../../examples/polyglot/order-schema" }
+# `tests/stream_mode.rs`, `examples/native/stream_latency.rs` and the service
+# unit tests drive these two directly, so they are dev-dependencies as well as
+# optional ones.
+pcs-connector-channel = { path = "../pcs-connector-channel" }
+pcs-connector-tcp = { path = "../pcs-connector-tcp" }
+# `tests/kafka_service.rs` constructs `KafkaSink` directly to seed fixtures.
+pcs-connector-kafka = { path = "../pcs-connector-kafka" }
+# `tests/nats_service.rs` constructs `NatsSink` directly to seed fixtures.
+pcs-connector-nats = { path = "../pcs-connector-nats" }
+# `tests/s3_service.rs` constructs `S3Sink`/`S3Source` directly to seed and
+# read back fixtures.
+pcs-connector-s3 = { path = "../pcs-connector-s3" }
+# `tests/stream_mode.rs` and `tests/kafka_service.rs` construct a transformer
+# directly to hand to `TcpIngestSource` and the Kafka pair;
+# `tests/file_connector.rs` and `tests/avro_connector.rs` read the Parquet and
+# Avro output their configs wrote.
+pcs-transformer-arrow-ipc = { path = "../pcs-transformer-arrow-ipc" }
+pcs-transformer-avro = { path = "../pcs-transformer-avro" }
+pcs-transformer-csv = { path = "../pcs-transformer-csv" }
+pcs-transformer-ndjson = { path = "../pcs-transformer-ndjson" }
+pcs-transformer-parquet = { path = "../pcs-transformer-parquet" }
 serde_json    = { workspace = true }
 arrow-array   = { workspace = true }
 arrow-buffer  = { workspace = true }
@@ -206,9 +365,16 @@ uuid          = { workspace = true }
 redb          = { version = "4.2.0" }
 openraft      = { git = "https://github.com/databendlabs/openraft", branch = "release-0.10", features = ["serde"] }
 tokio-util    = { workspace = true }
-datafusion    = { version = "55", default-features = false, features = ["sql", "parquet"] }
-reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+reqwest       = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "blocking"] }
 testcontainers = "0.28"
+# Only the postgres integration tests use this, to seed and read back fixtures.
+tokio-postgres = "0.7.18"
+# Only tests/kafka_service.rs uses this directly, to poll broker readiness.
+rdkafka        = { version = "0.39", features = ["cmake-build"] }
+# Only tests/nats_service.rs uses this directly, to poll server readiness.
+# `default-features = false` matches pcs-connector-nats, so the two share one
+# feature resolution rather than pulling the kv and object-store surfaces in.
+async-nats     = { version = "0.50.0", default-features = false, features = ["jetstream", "ring"] }
 tracing       = { workspace = true }
 opentelemetry_sdk = { version = "0.32", features = ["metrics"] }
 opentelemetry-prometheus = { version = "0.32" }

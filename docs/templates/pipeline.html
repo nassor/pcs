@@ -401,7 +401,7 @@ assert_eq!(pipeline.stage_count(), Some(3));</code></pre>
     any sources and sinks, and leaves <code>self.data</code> untouched. One pipeline value
     can therefore be the plan for many independent batches, which is exactly how the
     <a href="{{ get_url(path='@/distributed.md') }}">distributed runner</a> and the WASM
-    guest apply a template to per-partition datasets.
+    processor apply a template to per-partition datasets.
 </p>
 
 <div class="code">
@@ -428,11 +428,10 @@ for mut batch in incoming_batches {
 <p>
     <code>run_with_io</code> drains every registered source into the dataset, calls
     <code>run()</code>, then drains the dataset to every sink and calls
-    <code>finish()</code> on each. <code>pcs-core</code> ships the
-    <code>Source</code> / <code>Sink</code> traits with <code>ChannelSource</code> and
-    <code>ChannelSink</code>; the Parquet, CSV, and JSON implementations live in
-    <code>pcs_service::io</code>. See <a href="{{ get_url(path='@/io.md') }}">Sources &amp;
-    Sinks</a>.
+    <code>finish()</code> on each. <code>pcs-core</code> ships the <code>Source</code> /
+    <code>Sink</code> traits: a connector like <code>pcs-connector-file</code> moves bytes, a
+    transformer like <code>pcs-transformer-csv</code> turns them into batches. See
+    <a href="{{ get_url(path='@/io.md') }}">Sources &amp; Sinks</a>.
 </p>
 
 <h2 id="stats">RunStats</h2>
@@ -644,7 +643,7 @@ impl System for CallPricingApi {
     <code>run_with_retries</code>, which waits with <code>tokio::time::sleep</code>. An
     all-parallel stage holding more than one system dispatches each onto a blocking
     thread, where the driver is <code>run_with_retries_blocking</code> and the wait is
-    <code>std::thread::sleep</code>. Guest builds compiled without the
+    <code>std::thread::sleep</code>. Processor builds compiled without the
     <code>runtime</code> feature have no async timer at all, so there the delays are
     skipped and retries fire immediately. Whichever path runs, the retry counts land in
     the same total.
@@ -716,7 +715,7 @@ impl System for CallPricingApi {
     <a href="{{ get_url(path='@/io.md') }}" class="next-card">
         <span class="next-card-label">Moving data</span>
         <h3>Sources &amp; Sinks</h3>
-        <p>Fill the dataset from Parquet, CSV, JSON, or a channel, and drain it back out.</p>
+        <p>Fill the dataset from Parquet, CSV, NDJSON, or a channel, and drain it back out.</p>
     </a>
 </div>
 

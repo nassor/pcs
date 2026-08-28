@@ -26,8 +26,15 @@ pub use pcs_core::{
 pub use pcs_core::{PcsError, PcsResult};
 pub use pcs_core::{RetryMode, SystemConfig};
 
-#[cfg(feature = "io")]
-pub mod io;
+// The service's own OpenTelemetry instruments. Not gated: the no-op impl keeps
+// every call site free of `#[cfg]`.
+pub mod metrics;
+
+// In-process telemetry. Sibling of `metrics`, not part of `service`, so a
+// library embedder can capture spans and samples without the axum control
+// plane.
+#[cfg(feature = "inspector")]
+pub mod inspector;
 
 #[cfg(feature = "distributed")]
 pub mod distributed;

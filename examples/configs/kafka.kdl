@@ -1,0 +1,110 @@
+// PCS standalone service configuration driving Kafka at both ends.
+//
+// Run:
+//   export KAFKA_BROKERS='localhost:9092'
+//   cargo run --features connector-kafka,wasm --bin pcs-service -- validate \
+//     --config examples/configs/kafka.kdl
+//   cargo run --features connector-kafka,wasm --bin pcs-service -- serve \
+//     --config examples/configs/kafka.kdl
+//
+// The source drains orders-raw once per cycle (stop_at_end #true) and the
+// sink writes the pipeline's output to orders-enriched.
+//
+// `validate` opens no broker connection: both factories parse and validate
+// their config and build their librdkafka client, but connect lazily. The
+// first drain cycle is where an unreachable broker, or a missing topic with
+// provision create=#false, surfaces.
+
+mode "standalone"
+
+node id=1 name="pcs-kafka" data_dir="${PCS_DATA_DIR:-/tmp/pcs-kafka}"
+
+// stop_at_end makes the source report EOF once every assigned partition is
+// drained, so the interval runner can drive it without the stream runner. A
+// live consumer (stop_at_end #false) never reaches EOF and instead needs
+// run_mode kind="stream" with exactly one declared source.
+run_mode kind="interval" interval_ms=2000
+
+// One workflow declares the whole DAG: the byte format each end speaks, the
+// source, the processor, the sink, and the explicit links between them.
+workflow "orders" {
+    // The transformer that decodes/encodes each message. "ndjson" is one JSON
+    // object per message, decoded against schema_fields below; "arrow-ipc" is
+    // one whole RecordBatch per message. Both need their transformer-*
+    // feature compiled in.
+    transformer "ndjson_fmt" format="ndjson"
+
+    // ---------------------------------------------------------------- source
+
+    // The processor's `describe()` supplies the component list, so `component`
+    // on this source and the sink below must name components it declares.
+    source "kafka_orders" type="KafkaSource" component="Order" transformer="ndjson_fmt" {
+        config {
+            brokers "${KAFKA_BROKERS:-localhost:9092}"
+            topic "orders-raw"
+            group_id "pcs-orders"
+            batch_size 1000
+            poll_timeout_ms 1000
+            auto_offset_reset "earliest"
+            // Commits the previous batch's offsets at the start of the next poll,
+            // so delivery is at-least-once: a crash between the two replays that
+            // batch.
+            commit_on_drain #true
+            stop_at_end #true
+
+            // Topics are created by default; set create=#false to opt out. A
+            // missing topic then surfaces as a broker error from the consumer
+            // instead of PCS silently provisioning one.
+            provision create=#true partitions=3 replication_factor=1 timeout_ms=10000 {
+                // Broker-side topic config for a topic this connector creates.
+                // config "retention.ms"="604800000"
+            }
+
+            // Every librdkafka property PCS itself does not name goes in a
+            // `properties` node, applied last so it overrides any default this
+            // connector sets. There is no second way to set the same thing.
+            // properties "session.timeout.ms"="45000"
+
+            schema_fields "id" type="int64" nullable=#false
+            schema_fields "status" type="utf8" nullable=#true
+            schema_fields "total" type="float64" nullable=#true
+        }
+    }
+
+    // ------------------------------------------------------------ processor
+
+    wasm "process_orders" module="pipelines/orders.wasm"
+
+    // ------------------------------------------------------------------ sink
+    //
+    // A different component than the source's: the processor declares both,
+    // reads Order and writes EnrichedOrder. A sink's schema_fields must match
+    // the component's RecordBatch field for field, in order.
+
+    sink "kafka_enriched" type="KafkaSink" component="EnrichedOrder" transformer="ndjson_fmt" {
+        config {
+            brokers "${KAFKA_BROKERS:-localhost:9092}"
+            topic "orders-enriched"
+            // The rendered value of this column becomes the message key.
+            // Row-per-message formats only: arrow-ipc emits one message per batch,
+            // so there is no one row to key.
+            key_field "id"
+            flush_timeout_ms 30000
+
+            provision create=#true partitions=3 replication_factor=1
+
+            schema_fields "id" type="int64" nullable=#false
+            schema_fields "status" type="utf8" nullable=#true
+            schema_fields "total" type="float64" nullable=#true
+        }
+    }
+
+    link from="kafka_orders" to="process_orders"
+    link from="process_orders" to="kafka_enriched"
+}
+
+// HTTP control plane. /metrics carries the connector's counters.
+http bind="127.0.0.1:0" disabled=#false
+
+// Use log_format="json" in production log aggregators.
+observability log_format="pretty" log_level="info"

@@ -30,7 +30,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::PcsError;
 use crate::PcsResult;
-use crate::distributed::consensus::driver::{ArrowRaftDriver, ArrowRaftDriverConfig};
+use crate::distributed::consensus::driver::{
+    ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
+};
 use crate::distributed::consensus::store::RedbSharedStore;
 use crate::distributed::runner::{DistributedRunner, RunnerConfig};
 use crate::distributed::strategy::CheckpointStrategy;
@@ -163,6 +165,14 @@ pub async fn run_cluster(
 
     wait_for_raft_settled(&handle, cluster.election_timeout_ms).await?;
 
+    // Bound to the returned handle's lifetime: `AbortOnDropHandle` stops the
+    // recorder on every exit path from `run_cluster`, including the fallible
+    // ones between here and `handle.shutdown()`.
+    let _raft_gauges = tokio_util::task::AbortOnDropHandle::new(spawn_raft_gauges(
+        handle.clone(),
+        cancel.child_token(),
+    ));
+
     let metrics = handle.metrics();
     stats.last_raft_term = Some(metrics.current_term);
     stats.last_leader_id = metrics.current_leader;
@@ -172,18 +182,29 @@ pub async fn run_cluster(
     let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clone());
 
     let producer_cancel = cancel.child_token();
-    // ServiceConfig::validate rejects sources in cluster mode, so built.sources
-    // is empty by the time run_cluster runs.
+    // ServiceConfig::validate rejects sources in cluster mode, so built.nodes
+    // contains no BuiltNodeKind::Source by the time run_cluster runs.
     debug_assert!(
-        built.sources.is_empty(),
-        "cluster runner received non-empty sources — validate() should have rejected this config"
+        built
+            .nodes
+            .iter()
+            .all(|n| !matches!(n.kind, super::builder::BuiltNodeKind::Source(_))),
+        "cluster runner received a source node — validate() should have rejected this config"
     );
     let source_task: Option<tokio::task::JoinHandle<()>> = None;
     let _ = producer_cancel; // unused until sources are wired
 
     // The clone-empty template gives each partition a fresh, schema-registered
-    // Dataset with no row data.
-    let runtime = built.into_runtime();
+    // Dataset with no row data. Config validation (rule 11) guarantees the
+    // workflow declared exactly one node and that it is a processor.
+    let mut nodes = built.nodes;
+    let node = nodes
+        .pop()
+        .expect("cluster mode config validation guarantees exactly one node");
+    let runtime = match node.kind {
+        super::builder::BuiltNodeKind::Processor { runtime, .. } => runtime,
+        _ => unreachable!("cluster mode config validation guarantees the one node is a processor"),
+    };
     let dataset_template = runtime.template_dataset();
 
     // Gate 3b: the persisted checkpoints on this node must belong to the same
@@ -195,6 +216,10 @@ pub async fn run_cluster(
 
     let runner_config = RunnerConfig {
         checkpoint_strategy: CheckpointStrategy::EveryStage,
+        // Cluster mode is guaranteed exactly one workflow by
+        // `ServiceConfig::validate`.
+        workflow_id: config.workflows[0].id.clone(),
+        processor_id: node.id.clone(),
         ..Default::default()
     };
 
@@ -244,6 +269,34 @@ pub async fn run_cluster(
     stats.total_duration_ms = start.elapsed().as_millis() as u64;
 
     Ok(stats)
+}
+
+/// Record `pcs_raft_commit_index`, `pcs_raft_term` and `pcs_raft_leader_id`
+/// once a second until `cancel` fires.
+///
+/// [`ArrowRaftDriverHandle::metrics`] is synchronous, so this needs no other
+/// plumbing. It exists because `/status` still reports `"cluster": null`: the
+/// gauges come from the driver handle, not from a populated `cluster_probe`.
+fn spawn_raft_gauges(
+    handle: ArrowRaftDriverHandle,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let m = handle.metrics();
+                    crate::metrics::instruments().raft(
+                        m.local_committed.map_or(0, |id| id.index),
+                        m.current_term,
+                        m.current_leader,
+                    );
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+    })
 }
 
 // ── Validation helpers ────────────────────────────────────────────────────────
@@ -393,8 +446,8 @@ mod tests {
     use crate::distributed::consensus::driver::{ArrowRaftDriver, ArrowRaftDriverConfig};
     use crate::distributed::consensus::store::RedbSharedStore;
     use crate::service::config::{
-        ClusterConfig, HttpConfig, NodeConfig, ObservabilityConfig, PeerSpec, PipelineSpec,
-        ServiceConfig, ServiceMode, StandaloneConfig,
+        ClusterConfig, HttpConfig, NodeConfig, ObservabilityConfig, PeerSpec, ServiceConfig,
+        ServiceMode, StandaloneConfig, WorkflowSpec,
     };
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -403,6 +456,19 @@ mod tests {
     fn free_addr() -> SocketAddr {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
+    }
+
+    /// Read the value of a single-sample Prometheus gauge line by series name.
+    ///
+    /// The exporter attaches an `otel_scope_name` label, so the name is followed
+    /// by `{...}` rather than a space.
+    #[cfg(feature = "metrics")]
+    fn gauge_value(text: &str, series: &str) -> Option<f64> {
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| l.strip_prefix(series))
+            .and_then(|rest| rest.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
     }
 
     fn single_peer_cluster_config(
@@ -429,28 +495,46 @@ mod tests {
                     snapshot_log_interval: 1000,
                 },
             },
-            pipeline: PipelineSpec {
+            workflows: vec![WorkflowSpec {
+                id: "cluster-test".to_string(),
+                name: None,
+                transformers: Vec::new(),
+                sources: Vec::new(),
                 #[cfg(feature = "wasm")]
-                wasm: None,
+                wasm: Vec::new(),
                 #[cfg(feature = "plugin")]
-                plugin: None,
-            },
-            sources: vec![],
-            sinks: vec![],
+                plugin: Vec::new(),
+                sinks: Vec::new(),
+                links: Vec::new(),
+            }],
             http: HttpConfig::default(),
             observability: ObservabilityConfig::default(),
         }
     }
 
     fn empty_built_service() -> crate::service::builder::BuiltService {
-        crate::service::builder::BuiltService::from_runtime(
-            Box::new(crate::pipeline::Pipeline::new("test")),
-            vec![],
-            vec![],
-            crate::service::registry::Registry::new(),
-        )
+        use crate::service::builder::{BuiltNode, BuiltNodeKind, BuiltService};
+        BuiltService {
+            workflow_id: "cluster-test".to_string(),
+            workflow_name: None,
+            nodes: vec![BuiltNode {
+                id: "p".to_string(),
+                name: None,
+                type_name: "native".to_string(),
+                component: None,
+                kind: BuiltNodeKind::Processor {
+                    runtime: Box::new(crate::pipeline::Pipeline::new("test")),
+                    kind: "native",
+                },
+                downstream: Vec::new(),
+                artifact: None,
+                #[cfg(feature = "windows")]
+                window: None,
+            }],
+            registry: std::sync::Arc::new(crate::service::registry::Registry::new()),
+            inspector: None,
+        }
     }
-
     #[test]
     fn test_inconsistent_data_dir_returns_error() {
         let dir = TempDir::new().unwrap();
@@ -594,6 +678,105 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// The one-second recorder must write all three Raft gauges from the driver
+    /// handle, with the bootstrapped node as the leader.
+    ///
+    /// `pcs_raft_leader_id` is `-1` for an unknown leader, so asserting `1`
+    /// proves the recorder read a settled `RaftMetrics` rather than a default.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_spawn_raft_gauges_records_all_three() {
+        use prometheus::TextEncoder;
+
+        let dir = TempDir::new().unwrap();
+        let addr = free_addr();
+        let driver_config = ArrowRaftDriverConfig {
+            node_id: 1,
+            listen_addr: addr,
+            peers: HashMap::new(),
+            heartbeat_interval_ms: 30,
+            election_timeout_min_ms: 100,
+            election_timeout_max_ms: 200,
+        };
+
+        let (handle, _task) = ArrowRaftDriver::start(
+            driver_config,
+            dir.path().join(RAFT_LOG_DB_FILE),
+            dir.path().join(APP_DB_FILE),
+        )
+        .await
+        .unwrap();
+
+        let cluster = ClusterConfig {
+            peers: vec![PeerSpec {
+                id: 1,
+                addr: addr.to_string(),
+            }],
+            bootstrap: true,
+            lease_ttl_ms: 10_000,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 50,
+            snapshot_log_interval: 1000,
+        };
+        bootstrap_cluster(
+            &handle,
+            &cluster,
+            1,
+            &addr.to_string(),
+            &dir.path().join(BOOTSTRAP_LOCK_FILE),
+        )
+        .await
+        .unwrap();
+        wait_for_raft_settled(&handle, cluster.election_timeout_ms)
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let gauges = spawn_raft_gauges(handle.clone(), cancel.child_token());
+
+        // A freshly bootstrapped node passes `wait_for_raft_settled` as a
+        // Learner, before it promotes itself, so the first tick legitimately
+        // sees no leader and records -1. Polling proves the recorder keeps
+        // publishing rather than firing once.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut text = String::new();
+        let mut leader = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            text = TextEncoder::new()
+                .encode_to_string(&crate::metrics::test_registry().gather())
+                .expect("encode prometheus text");
+            leader = gauge_value(&text, "pcs_raft_leader_id");
+            if leader == Some(1.0) {
+                break;
+            }
+        }
+        cancel.cancel();
+        let _ = gauges.await;
+
+        for series in [
+            "pcs_raft_commit_index",
+            "pcs_raft_term",
+            "pcs_raft_leader_id",
+        ] {
+            assert!(
+                text.contains(series),
+                "{series} should have been recorded:\n{text}"
+            );
+        }
+        assert_eq!(
+            leader,
+            Some(1.0),
+            "the single bootstrapped node must become the recorded leader:\n{text}"
+        );
+        assert!(
+            gauge_value(&text, "pcs_raft_term").is_some_and(|t| t >= 1.0),
+            "a leader implies a term of at least 1:\n{text}"
+        );
+
+        handle.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_standalone_mode_rejected() {
         let dir = TempDir::new().unwrap();
@@ -606,14 +789,18 @@ mod tests {
             mode: ServiceMode::Standalone {
                 config: StandaloneConfig::default(),
             },
-            pipeline: PipelineSpec {
+            workflows: vec![WorkflowSpec {
+                id: "w".to_string(),
+                name: None,
+                transformers: Vec::new(),
+                sources: Vec::new(),
                 #[cfg(feature = "wasm")]
-                wasm: None,
+                wasm: Vec::new(),
                 #[cfg(feature = "plugin")]
-                plugin: None,
-            },
-            sources: vec![],
-            sinks: vec![],
+                plugin: Vec::new(),
+                sinks: Vec::new(),
+                links: Vec::new(),
+            }],
             http: HttpConfig::default(),
             observability: ObservabilityConfig::default(),
         };

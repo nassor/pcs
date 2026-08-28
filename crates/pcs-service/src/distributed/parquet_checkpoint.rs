@@ -438,7 +438,7 @@ pub(crate) fn build_ipc_payload(batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
-#[cfg(all(test, feature = "io", feature = "distributed"))]
+#[cfg(all(test, feature = "parquet-checkpoint"))]
 mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int32Array};
@@ -479,7 +479,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let stage_idx = 3u32;
         let cp = make_checkpoint(claim_id, stage_idx, 10);
 
@@ -508,7 +508,7 @@ mod tests {
     async fn test_read_nonexistent_returns_none() {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
-        let result = store.load_checkpoint(Uuid::new_v4(), 0).await.unwrap();
+        let result = store.load_checkpoint(Uuid::now_v7(), 0).await.unwrap();
         assert!(result.is_none(), "expected None for missing checkpoint");
     }
 
@@ -518,7 +518,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let stage_idx = 1u32;
         let cp = make_checkpoint(claim_id, stage_idx, 5);
         store.archive_checkpoint(claim_id, &cp).unwrap();
@@ -544,7 +544,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let stage_idx = 0u32;
         let cp = make_checkpoint(claim_id, stage_idx, 10_000);
 
@@ -568,7 +568,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
 
         // Write stages 0, 1, 2 with different row counts.
         for stage in 0u32..3 {
@@ -600,7 +600,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let schema = simple_schema();
         let batch = simple_batch(schema, 20);
         let ipc = build_ipc_payload(&batch);
@@ -621,7 +621,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let schema = simple_schema();
         let batch = simple_batch(schema, 5);
         let ipc = build_ipc_payload(&batch);
@@ -647,7 +647,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ParquetCheckpointStore::new(dir.path()).unwrap();
 
-        let claim_id = Uuid::new_v4();
+        let claim_id = Uuid::now_v7();
         let schema = simple_schema();
         let batch = simple_batch(schema, 10);
         let ipc = build_ipc_payload(&batch);

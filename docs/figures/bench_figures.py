@@ -252,7 +252,7 @@ LATENCY = [
          ("p99", "2 µs", 2 * US, True), ("max", "6 µs", 6 * US, False)],
     ),
     (
-        "WASM guest · run_on_with_state · n = 1 000",
+        "WASM processor · run_on_with_state · n = 1 000",
         "bar-bnd",
         "t-bnd",
         [("mean", "179.4 µs", 179.4 * US, False), ("p50", "159 µs", 159 * US, False),
@@ -289,11 +289,11 @@ def fig_latency() -> str:
     )
     return figure(
         "lat",
-        "Per-item round trip latency, native path against a WebAssembly guest",
+        "Per-item round trip latency, native path against a WebAssembly processor",
         """
         Logarithmic, one gridline per ten-fold step. Native source to systems to sink, over
         10 000 items: mean 1.0 µs, p50 1 µs, p99 2 µs, max 6 µs. The same single-row round trip
-        through a WebAssembly guest calling run_on_with_state, over 1 000 items: mean 179.4 µs,
+        through a WebAssembly processor calling run_on_with_state, over 1 000 items: mean 179.4 µs,
         p50 159 µs, p99 420 µs, max 678 µs. Every WASM bar sits roughly two gridlines, two
         orders of magnitude, to the right of its native counterpart.
         """,
@@ -305,7 +305,7 @@ def fig_latency() -> str:
         ],
         cap="""
         Timed from the producer: send one single-row batch, wait for the transformed row to
-        arrive at the sink. Sample counts differ: 10 000 native, 1 000 through the guest. The
+        arrive at the sink. Sample counts differ: 10 000 native, 1 000 through the processor. The
         WASM tail is the thinly sampled half of the chart.
         """,
     )

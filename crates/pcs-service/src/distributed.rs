@@ -30,21 +30,22 @@
 pub mod accumulator_store;
 pub mod checkpoint;
 pub mod consensus;
-pub mod guest_state_store;
 pub mod partition;
+pub mod processor_state_store;
 pub mod runner;
 pub mod strategy;
 
 pub use checkpoint::{
-    ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, GUEST_STATE_STAGE_SENTINEL,
+    ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, PROCESSOR_STATE_STAGE_SENTINEL,
 };
 pub use consensus::RedbSharedStore;
 pub use partition::{BatchClaim, MAX_LOG_ENTRY_BYTES, PartitionSource};
 pub use runner::{DistributedRunner, KeyPartition, RunnerConfig};
 pub use strategy::CheckpointStrategy;
 
-// Parquet archival checkpoint store; requires both `distributed` and `io`.
-#[cfg(feature = "io")]
+// Parquet archival checkpoint store; requires both `distributed` and
+// `parquet-checkpoint`.
+#[cfg(feature = "parquet-checkpoint")]
 pub mod parquet_checkpoint;
-#[cfg(feature = "io")]
+#[cfg(feature = "parquet-checkpoint")]
 pub use parquet_checkpoint::ParquetCheckpointStore;

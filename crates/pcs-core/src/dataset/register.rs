@@ -108,7 +108,7 @@ impl Dataset {
     /// Register a component whose name is only known at runtime.
     ///
     /// For a host loading a pipeline implementation across a process boundary: a
-    /// WebAssembly guest's `describe` or a native plugin's manifest names its
+    /// WebAssembly processor's `describe` or a native plugin's manifest names its
     /// components as owned strings, while the registry keys on `&'static str`.
     ///
     /// The name is interned, so loading the same component repeatedly reuses one

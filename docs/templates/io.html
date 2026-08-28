@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Sources &amp; Sinks — PCS{% endblock %}
-{% block description %}Two traits move Arrow rows in and out of a Dataset: Source pulls RecordBatches until EOF, Sink takes one write per cycle. Parquet, CSV, NDJSON, in-memory channels, and DataFusion SQL.{% endblock %}
+{% block description %}Two traits move Arrow rows in and out of a Dataset: Source pulls RecordBatches until EOF, Sink takes one write per cycle. Local files in csv, ndjson, parquet or avro, in-memory channels, and DataFusion SQL.{% endblock %}
 {% block og_title %}Sources &amp; Sinks — PCS{% endblock %}
 {% block og_description %}Pull batches in with Source, push one batch out with Sink, and cast between the file's schema and the component's.{% endblock %}
 
@@ -19,9 +19,9 @@
     <dt>In one line</dt>
     <dd>How rows <strong>get into</strong> a Dataset and <strong>back out</strong> again</dd>
     <dt>You need</dt>
-    <dd>The <code>io</code> feature on <code>pcs-service</code>, which turns on <code>pcs-core/io</code>. Add <code>datafusion</code> for the SQL source</dd>
+    <dd>The <code>pcs-core/io</code> feature for the traits, plus a connector crate for the transport and a transformer crate for the format</dd>
     <dt>Read this if</dt>
-    <dd>Your Parquet file has an <code>Int32</code> column where the component declares <code>Int64</code>, or your second run says <em>write called after finish</em></dd>
+    <dd>Your Parquet file has an <code>Int32</code> column where the component declares <code>Int64</code>, or your second run says <em>write_batch called after finish</em></dd>
 </dl>
 
 <h2 id="cycle">The shape of a drain cycle</h2>
@@ -38,12 +38,13 @@
     <div class="dgm-scroll"><svg viewBox="0 0 660 392" role="img" aria-labelledby="io-a-title io-a-desc">
         <title id="io-a-title">A batch travelling from a Parquet file into a Dataset and out to a sink</title>
         <desc id="io-a-desc">
-            ParquetSource reads its schema from the file metadata and yields batches whose
-            columns are Int32 and Float32. A CastingSource converts each batch to the Int64
-            and Float64 types the component declares, then append_record_batch compares the
-            batch schema against the SchemaRegistry entry and either accepts the batch whole
-            or returns an error. On the way out, drain_dataset makes a single write_batch call
-            with the whole merged component, and finish writes the Parquet footer.
+            FileSource reads a parquet file through its transformer and yields batches
+            whose columns are Int32 and Float32. A CastingSource converts each batch to the
+            Int64 and Float64 types the component declares, then append_record_batch
+            compares the batch schema against the SchemaRegistry entry and either accepts
+            the batch whole or returns an error. On the way out, drain_dataset makes a
+            single write_batch call with the whole merged component, and finish writes the
+            Parquet footer.
         </desc>
 
         <text class="t-title" x="0" y="14">One drain cycle</text>
@@ -54,7 +55,7 @@
             <rect class="blk blk-data" x="0" y="44" width="176" height="96" rx="8"/>
             <rect class="hd hd-data" x="0" y="44" width="176" height="22" rx="8"/>
             <rect class="hd hd-data" x="0" y="58" width="176" height="8"/>
-            <text class="t-lbl t-data" x="12" y="59">ParquetSource</text>
+            <text class="t-lbl t-data" x="12" y="59">FileSource</text>
 
             <rect class="row" x="8" y="72" width="160" height="18" rx="3"/>
             <text class="t-sm" x="16" y="85">id      : Int32</text>
@@ -122,7 +123,7 @@
             <rect class="blk blk-data" x="538" y="44" width="116" height="228" rx="8"/>
             <rect class="hd hd-data" x="538" y="44" width="116" height="22" rx="8"/>
             <rect class="hd hd-data" x="538" y="58" width="116" height="8"/>
-            <text class="t-lbl t-data" x="548" y="59">ParquetSink</text>
+            <text class="t-lbl t-data" x="548" y="59">FileSink</text>
 
             <rect class="row" x="546" y="72" width="100" height="18" rx="3"/>
             <text class="t-sm" x="554" y="85">id : Int64</text>
@@ -185,8 +186,8 @@
 <h2 id="traits">The two traits</h2>
 
 <p>
-    Both live in <code>pcs-core</code> behind its <code>io</code> feature, and both are
-    re-exported from <code>pcs_service::io</code> so a service build needs one import path.
+    Both live in <code>pcs-core</code> behind its <code>io</code> feature. Every
+    implementation lives in a connector crate that depends on them.
     Each is a schema, a step, and a way to signal <em>done</em>.
 </p>
 
@@ -246,8 +247,8 @@ pub trait Sink: Send {
 use arrow_array::{Array, Float64Array, RecordBatch};
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use pcs_service::PcsError;
-use pcs_service::io::Source;
+use pcs_core::PcsError;
+use pcs_core::io::Source;
 
 struct RampSource {
     schema: Arc&lt;Schema&gt;,
@@ -283,7 +284,7 @@ impl Source for RampSource {
 
 <p>
     Aim for moderate batch sizes rather than one giant batch. The trait docs suggest around
-    64k rows. Every file-backed source that ships reads on a dedicated OS thread and hands
+    64k rows. <code>FileSource</code> reads on a dedicated OS thread and hands
     batches over a <code>tokio::sync::mpsc</code> channel with capacity 4, so
     <code>next_batch</code> awaits instead of blocking the executor and the file is never
     fully materialised.
@@ -388,8 +389,8 @@ pub async fn drain_dataset&lt;K: Sink + ?Sized&gt;(
             <text class="t-lbl t-ctl" x="12" y="206">Pipeline::run_with_io</text>
             <text class="t-sm" x="12" y="228">after every call, so a file sink is</text>
             <text class="t-sm" x="12" y="242">one shot: run it twice and</text>
-            <text class="t-sm" x="12" y="256">ParquetSink reports a write</text>
-            <text class="t-sm" x="12" y="270">after finish</text>
+            <text class="t-sm" x="12" y="256">FileSink reports write_batch</text>
+            <text class="t-sm" x="12" y="270">called after finish</text>
 
             <rect class="blk blk-ctl" x="336" y="192" width="318" height="92" rx="8"/>
             <rect class="hd hd-ctl" x="336" y="192" width="318" height="20" rx="8"/>
@@ -439,15 +440,19 @@ pub async fn drain_dataset&lt;K: Sink + ?Sized&gt;(
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>driving both ends by hand</em></div>
     <pre><code class="language-rust">use std::path::Path;
-use pcs_service::Component;
-use pcs_service::dataset::Dataset;
-use pcs_service::io::{ParquetSink, ParquetSource, Sink, drain_dataset, drain_into_dataset};
+use std::sync::Arc;
+use pcs_connector_file::{FileSink, FileSource};
+use pcs_core::Component;
+use pcs_core::dataset::Dataset;
+use pcs_core::io::{Sink, drain_dataset, drain_into_dataset};
+use pcs_transformer_parquet::ParquetTransformer;
 
 let mut data = Dataset::new();
 data.register_component::&lt;Trade&gt;()?;
 
-let mut src  = ParquetSource::from_path_async(Path::new("in.parquet")).await?;
-let mut sink = ParquetSink::from_path(Path::new("out.parquet"), Trade::schema())?;
+let parquet  = Arc::new(ParquetTransformer::new());
+let mut src  = FileSource::open_async(Path::new("in.parquet"), parquet.clone(), None).await?;
+let mut sink = FileSink::create(Path::new("out.parquet"), parquet, Trade::schema())?;
 
 let rows_in = drain_into_dataset(&amp;mut src, &amp;mut data, "Trade").await?;
 // ... run systems over `data` ...
@@ -475,8 +480,8 @@ pipeline.run_with_io().await?;</code></pre>
     <span class="note-label">Sharp edge</span>
     <p>
         <code>run_with_io</code> calls <code>finish()</code> on every registered sink at the
-        end of <b>every</b> call. With a <code>ParquetSink</code> that makes it a one-shot
-        API: the second call fails with <em>ParquetSink: write called after finish</em>. For a
+        end of <b>every</b> call. With a <code>FileSink</code> that makes it a one-shot
+        API: the second call fails with <em>FileSink: write_batch called after finish</em>. For a
         long-running loop, drive the drains yourself. That is what
         <code>run_standalone</code> does, deferring <code>finish()</code> to the final
         iteration.
@@ -505,12 +510,16 @@ pipeline.run_with_io().await?;</code></pre>
     <div class="code-cap"><span>Rust</span><em>CastOptions comes from the arrow-cast crate</em></div>
     <pre><code class="language-rust">use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use arrow_cast::CastOptions;
 use arrow_schema::DataType;
-use pcs_service::io::{CsvSource, CastingSource, build_target_schema};
+use pcs_connector_file::FileSource;
+use pcs_core::io::{CastingSource, build_target_schema};
+use pcs_transformer_csv::CsvTransformer;
 
 // The file says Int32 / Float32; the component declares Int64 / Float64.
-let file = CsvSource::from_path(Path::new("trades.csv"), file_schema.clone(), true)?;
+let csv  = Arc::new(CsvTransformer::new(true));   // true: the file has a header row
+let file = FileSource::open(Path::new("trades.csv"), csv, Some(file_schema.clone()))?;
 
 let mut overrides = HashMap::new();
 overrides.insert("id",    DataType::Int64);
@@ -555,7 +564,7 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
         A cast adapts <b>types</b>, never <b>shape</b>. If the component declares a column the
         file does not contain, no <code>CastingSource</code> configuration will help; write a
         small wrapping <code>Source</code> that builds the missing array and re-assembles the
-        batch. <code>crates/pcs-service/examples/scheduler_parquet_etl.rs</code> does exactly
+        batch. <code>examples/connectors/scheduler_parquet_etl.rs</code> does exactly
         that to pad a zero-filled output column.
     </p>
 </div>
@@ -563,16 +572,16 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
 <h2 id="builtins">What ships in the box</h2>
 
 <p>
-    The traits, the two drain functions, the cast helpers and the channel transport all live
-    in <code>pcs-core</code>. The file formats live in <code>pcs-service</code>, because they
-    are the ones that pull in <code>parquet</code>, <code>arrow-csv</code> and
-    <code>arrow-json</code>. Everything is re-exported from <code>pcs_service::io</code>, so a
-    service build has a single import path for the lot.
+    The traits, the two drain functions and the cast helpers live in
+    <code>pcs-core</code>. The factory contract lives in <code>pcs-connector</code>. A
+    connector crate carries bytes over one transport and a transformer crate turns bytes into
+    batches, so a build pulls in <code>parquet</code>, <code>arrow-csv</code> or
+    <code>tokio-postgres</code> only when it reads or writes that format.
 </p>
 
 <table class="rule-table">
     <thead>
-        <tr><th>Format</th><th>Source</th><th>Sink</th><th>Cargo feature</th></tr>
+        <tr><th>What</th><th>Source</th><th>Sink</th><th>Cargo feature</th></tr>
     </thead>
     <tbody>
         <tr>
@@ -586,90 +595,170 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
             <td><code>pcs-core/io</code></td>
         </tr>
         <tr>
+            <td><strong>Factory contract</strong></td>
+            <td colspan="2"><code>SourceFactory</code>, <code>SinkFactory</code>, <code>ConnectorContext</code>, <code>parse_schema_fields</code></td>
+            <td><code>pcs-connector</code></td>
+        </tr>
+        <tr>
+            <td><strong>Transformer contract</strong></td>
+            <td colspan="2"><code>Transformer</code>, <code>BatchReader</code>, <code>BatchWriter</code>, <code>MessageDecoder</code></td>
+            <td><code>pcs-transformer</code></td>
+        </tr>
+        <tr>
             <td><strong>Channel</strong></td>
             <td><code>ChannelSource</code></td>
             <td><code>ChannelSink</code></td>
-            <td><code>pcs-core/io</code></td>
+            <td><code>pcs-connector-channel</code></td>
         </tr>
         <tr>
-            <td><strong>Parquet</strong></td>
-            <td><code>ParquetSource</code></td>
-            <td><code>ParquetSink</code></td>
-            <td><code>pcs-service/io</code></td>
+            <td><strong>File</strong></td>
+            <td><code>FileSource</code></td>
+            <td><code>FileSink</code></td>
+            <td><code>pcs-connector-file</code></td>
         </tr>
         <tr>
-            <td><strong>CSV</strong></td>
-            <td><code>CsvSource</code></td>
-            <td><code>CsvSink</code></td>
-            <td><code>pcs-service/io</code></td>
+            <td><strong>PostgreSQL</strong></td>
+            <td><code>PostgresSource</code></td>
+            <td><code>PostgresSink</code></td>
+            <td><code>pcs-connector-postgresql</code></td>
         </tr>
         <tr>
-            <td><strong>NDJSON</strong></td>
-            <td><code>JsonSource</code></td>
-            <td><code>JsonSink</code></td>
-            <td><code>pcs-service/io</code></td>
+            <td><strong>Kafka</strong></td>
+            <td><code>KafkaSource</code></td>
+            <td><code>KafkaSink</code></td>
+            <td><code>pcs-connector-kafka</code></td>
+        </tr>
+        <tr>
+            <td><strong>NATS</strong></td>
+            <td><code>NatsSource</code></td>
+            <td><code>NatsSink</code></td>
+            <td><code>pcs-connector-nats</code></td>
+        </tr>
+        <tr>
+            <td><strong>TCP ingest</strong></td>
+            <td><code>TcpIngestSource</code></td>
+            <td>&mdash;</td>
+            <td><code>pcs-connector-tcp</code></td>
         </tr>
         <tr>
             <td><strong>DataFusion SQL</strong></td>
             <td><code>DataFusionSource</code></td>
             <td>&mdash;</td>
-            <td><code>pcs-service/datafusion</code></td>
+            <td><code>pcs-connector-datafusion</code></td>
         </tr>
         <tr>
-            <td><strong>TOML factories</strong></td>
-            <td colspan="2"><code>ParquetSourceFactory</code> and siblings, <code>register_builtin_factories</code></td>
+            <td><strong>Config registration</strong></td>
+            <td colspan="2"><code>Registry</code>, <code>register_builtin_factories</code></td>
             <td><code>pcs-service/service</code></td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    <code>pcs-service</code>'s <code>io</code> feature turns on <code>pcs-core/io</code> for
-    you, and <code>datafusion</code> is defined as <code>["io", "dep:datafusion"]</code>, so
-    asking for the SQL source gets you everything above it. The <code>service</code> feature
-    also implies <code>io</code>.
+    A <code>format</code> key names the transformer that turns a connector's bytes into
+    batches, and one crate implements each name. The
+    <a href="{{ get_url(path='@/transformers/_index.md') }}">transformers</a> page has the schema
+    rules and the options each one takes.
+</p>
+
+<table class="rule-table">
+    <thead>
+        <tr><th><code>format</code></th><th>Transformer</th><th>Crate</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><code>csv</code></td>
+            <td><code>CsvTransformer</code></td>
+            <td><code>pcs-transformer-csv</code></td>
+        </tr>
+        <tr>
+            <td><code>ndjson</code></td>
+            <td><code>NdjsonTransformer</code></td>
+            <td><code>pcs-transformer-ndjson</code></td>
+        </tr>
+        <tr>
+            <td><code>parquet</code></td>
+            <td><code>ParquetTransformer</code></td>
+            <td><code>pcs-transformer-parquet</code></td>
+        </tr>
+        <tr>
+            <td><code>avro</code></td>
+            <td><code>AvroTransformer</code></td>
+            <td><code>pcs-transformer-avro</code></td>
+        </tr>
+        <tr>
+            <td><code>arrow-ipc</code></td>
+            <td><code>ArrowIpcTransformer</code></td>
+            <td><code>pcs-transformer-arrow-ipc</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p>
+    <code>csv</code>, <code>ndjson</code>, <code>parquet</code> and <code>avro</code> read and
+    write a file stream. <code>arrow-ipc</code> has no stream surface, so it is a TCP, Kafka or
+    NATS format, and <code>ndjson</code> and <code>avro</code> work in both places.
+</p>
+
+<p>
+    On the host side one <code>pcs-service</code> feature per crate decides what reaches
+    the registry: <code>connector-channel</code>, <code>connector-file</code>,
+    <code>connector-kafka</code>, <code>connector-nats</code>,
+    <code>connector-postgresql</code>,
+    <code>connector-tcp</code>, <code>transformer-arrow-ipc</code>,
+    <code>transformer-avro</code>, <code>transformer-csv</code>,
+    <code>transformer-ndjson</code> and
+    <code>transformer-parquet</code>. Each implies <code>service</code>, and
+    <code>service</code> on its own registers nothing.
+    <code>connector-kafka</code> and <code>connector-nats</code> pull in
+    <code>transformer-ndjson</code> and
+    <code>connector-tcp</code> pulls in <code>transformer-arrow-ipc</code>, their default
+    formats. <code>connector-file</code> pulls in none: <code>format</code> is required
+    there, so you pick.
+</p>
+
+<p>
+    <code>DataFusionSource</code> has no factory: it needs a live
+    <code>SessionContext</code>, which a config file cannot express. Build it in Rust.
 </p>
 
 <p>Every constructor, since they are not uniform:</p>
 
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>signatures, not calls</em></div>
-    <pre><code class="language-rust">// Parquet: self-describing, so the source needs no schema.
-ParquetSource::from_path(&amp;Path)                       -&gt; Result&lt;Self&gt;
-ParquetSource::from_path_async(&amp;Path).await           -&gt; Result&lt;Self&gt;   // metadata read off-executor
-ParquetSink::from_path(&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;   // Snappy
+    <pre><code class="language-rust">// pcs-connector-file. open_async moves the open and the metadata read off the executor.
+FileSource::open      (&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
+FileSource::open_async(&amp;Path, Arc&lt;dyn Transformer&gt;, Option&lt;Arc&lt;Schema&gt;&gt;) -&gt; Result&lt;Self&gt;
+FileSink::create      (&amp;Path, Arc&lt;dyn Transformer&gt;, Arc&lt;Schema&gt;)         -&gt; Result&lt;Self&gt;
 
-// CSV: schema is required. `has_header` skips or writes the name row.
-CsvSource::from_path(&amp;Path, Arc&lt;Schema&gt;, has_header: bool) -&gt; Result&lt;Self&gt;
-CsvSink::from_path  (&amp;Path, Arc&lt;Schema&gt;, has_header: bool) -&gt; Result&lt;Self&gt;
+// The transformer each of those takes, one crate per format.
+CsvTransformer::new(has_headers: bool)   -&gt; Self   // csv
+NdjsonTransformer::new(infer_max: usize) -&gt; Self   // ndjson
+ParquetTransformer::new()                -&gt; Self   // parquet, Snappy
+ArrowIpcTransformer::new()               -&gt; Self   // arrow-ipc, messages only
+AvroTransformer::new(compression: Option&lt;CompressionCodec&gt;, schema_id: Option&lt;u32&gt;) // avro
 
-// NDJSON: one JSON object per line.
-JsonSource::from_path (&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
-JsonSource::with_infer(&amp;Path, Option&lt;usize&gt;)          -&gt; Result&lt;Self&gt;   // default 1024 rows
-JsonSource::from_bytes(&amp;[u8], Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
-JsonSink::from_path   (&amp;Path, Arc&lt;Schema&gt;)            -&gt; Result&lt;Self&gt;
-
-// Channel: returns the paired endpoint alongside the source or sink.
+// pcs-connector-channel. Returns the paired endpoint alongside the source or sink.
 ChannelSource::new(Arc&lt;Schema&gt;, buffer: usize) -&gt; (mpsc::Sender&lt;RecordBatch&gt;, Self)
 ChannelSink::new  (Arc&lt;Schema&gt;, buffer: usize) -&gt; (Self, mpsc::Receiver&lt;RecordBatch&gt;)</code></pre>
 </div>
 
 <p>
-    Only <code>JsonSource::with_infer</code> infers a schema; <code>CsvSource</code> and
-    <code>JsonSource::from_path</code> both require one, and the schema you pass governs the
-    column types regardless of what the text looks like. <code>estimated_rows</code> is
-    implemented by <code>ParquetSource</code> (summed from row-group metadata, no data read)
-    and forwarded by <code>CastingSource</code>; every other source returns
-    <code>None</code>.
+    Only <code>ndjson</code> infers a schema, and only when <code>schema_fields</code> is
+    absent: <code>csv</code> requires one, and <code>parquet</code> and <code>avro</code>
+    reject one, since the file carries its own. <code>FileSource</code> reports
+    <code>estimated_rows</code> under <code>parquet</code> alone, summed from row-group
+    metadata with no data read, and <code>CastingSource</code> forwards whatever it wraps.
+    Every other source returns <code>None</code>.
 </p>
 
 <p>
     <code>finish()</code> means different things per sink, and that matters when you decide
-    where to call it. <code>ParquetSink</code> closes the writer and writes the footer, after
-    which any further write is an error. <code>JsonSink</code> finalises the line-delimited
-    writer. <code>CsvSink</code> and <code>ChannelSink</code> have nothing to flush, so their
-    <code>finish</code> is a no-op. <code>CsvSink</code> relies on its
-    <code>BufWriter</code> flushing when dropped.
+    where to call it. <code>FileSink</code> hands it to the transformer:
+    <code>parquet</code> writes the footer and closes the writer, <code>csv</code>,
+    <code>ndjson</code> and <code>avro</code> flush their buffered writer. After any of them
+    a further <code>write_batch</code> is an error, and a second <code>finish</code> is a
+    no-op. <code>ChannelSink</code> has nothing to flush.
 </p>
 
 <h2 id="channel">The in-memory channel</h2>
@@ -682,7 +771,8 @@ ChannelSink::new  (Arc&lt;Schema&gt;, buffer: usize) -&gt; (Self, mpsc::Receiver
 
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>the sender and receiver are yours to hold</em></div>
-    <pre><code class="language-rust">use pcs_service::io::{ChannelSink, ChannelSource, Source};
+    <pre><code class="language-rust">use pcs_connector_channel::{ChannelSink, ChannelSource};
+use pcs_core::io::Source;
 
 let (tx, mut src)   = ChannelSource::new(schema.clone(), 8);
 let (mut sink, mut rx) = ChannelSink::new(schema.clone(), 8);
@@ -706,7 +796,7 @@ assert!(src.next_batch().await?.is_none());</code></pre>
 </p>
 
 <p>
-    One caveat if you reach these through TOML: <code>ChannelSourceFactory</code> and
+    One caveat if you reach these through the config file: <code>ChannelSourceFactory</code> and
     <code>ChannelSinkFactory</code> cannot hand the other endpoint back to you, so they build
     a pair whose sender is dropped immediately &mdash; an instant-EOF source. For real use,
     construct the channel yourself and pass the endpoint in programmatically.
@@ -715,17 +805,18 @@ assert!(src.next_batch().await?.is_none());</code></pre>
 <h2 id="datafusion">SQL results as a Source</h2>
 
 <p>
-    The <code>datafusion</code> feature adds one adapter, in one direction: a DataFusion
+    <code>pcs-connector-datafusion</code> adds one adapter, in one direction: a DataFusion
     query becomes a PCS <code>Source</code>. It streams lazily, pulling from DataFusion's
     execution stream one batch per <code>next_batch</code>, so a filter or aggregation runs in
     DataFusion and only the result crosses into the Dataset.
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>Rust</span><em>from crates/pcs-service/examples/datafusion_interop.rs</em></div>
+    <div class="code-cap"><span>Rust</span><em>from examples/connectors/datafusion_interop.rs</em></div>
     <pre><code class="language-rust">use datafusion::prelude::SessionContext;
-use pcs_service::dataset::Dataset;
-use pcs_service::io::{DataFusionSource, drain_into_dataset};
+use pcs_connector_datafusion::DataFusionSource;
+use pcs_core::dataset::Dataset;
+use pcs_core::io::drain_into_dataset;
 
 let ctx = SessionContext::new();
 ctx.register_table("sales", Arc::new(mem_table))?;
@@ -752,91 +843,99 @@ let rows = drain_into_dataset(&amp;mut src, &amp;mut data, "records").await?;</c
 <p>
     There is no adapter in the other direction. A <code>Dataset</code> is not exposed as a
     DataFusion <code>TableProvider</code>. Run the example with
-    <code>cargo run -p pcs-service --example datafusion_interop --features datafusion</code>.
+    <code>cargo run -p pcs-connector-datafusion --example datafusion_interop</code>.
 </p>
 
-<h2 id="config">Declaring IO in TOML</h2>
+<h2 id="config">Declaring IO in the config file</h2>
 
 <p>
-    The service reads <code>[[sources]]</code> and <code>[[sinks]]</code> tables and looks the
-    <code>type</code> string up in a <code>Registry</code> of factories. That registry starts
-    <b>empty</b>. Nothing is registered implicitly, so a config naming
-    <code>ParquetSource</code> fails with <em>no source factory registered for type</em>
-    until you install the built-ins.
+    Every <code>source</code> and <code>sink</code> node is declared inside the one
+    <code>workflow</code> block, and the service looks its <code>type</code> string up in a
+    <code>Registry</code> of factories. That registry starts <b>empty</b>. Nothing is
+    registered implicitly, so a config naming <code>FileSource</code> fails with <em>no source
+    factory registered for type</em> until you install the connectors and the transformers.
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>Rust</span><em>installs Parquet, JSON, CSV and Channel, both directions</em></div>
+    <div class="code-cap"><span>Rust</span><em>with_runtime names the processor node the native pipeline fills</em></div>
     <pre><code class="language-rust">use pcs_service::service::builder::ServiceBuilder;
 use pcs_service::service::factories::register_builtin_factories;
 
 let builder = register_builtin_factories(ServiceBuilder::new())
-    .with_runtime(Box::new(pipeline));</code></pre>
+    .with_runtime("enrich", Box::new(pipeline));</code></pre>
 </div>
 
 <div class="code">
-    <div class="code-cap"><span>TOML</span><em>target_component and source_component name a component, not a file</em></div>
-    <pre><code class="language-toml">[[sources]]
-name = "input"
-type = "ParquetSource"
-target_component = "Trade"
+    <div class="code-cap"><span>KDL</span><em>component names a component, not a file; transformer names a declared transformer node</em></div>
+    <pre><code class="language-kdl">workflow "trades" {
+    transformer "pq" format="parquet"
 
-[sources.config]
-path = "/data/trades.parquet"
+    source "input" type="FileSource" component="Trade" transformer="pq" {
+        config path="/data/trades.parquet"
+    }
 
-[[sinks]]
-name = "output"
-type = "ParquetSink"
-source_component = "Trade"
+    wasm "enrich"
 
-[sinks.config]
-path = "/data/out.parquet"
+    sink "output" type="FileSink" component="Trade" transformer="pq" {
+        config path="/data/out.parquet" {
+            schema_fields "id" type="Int64" nullable=#false
+            schema_fields "price" type="Float64" nullable=#false
+        }
+    }
 
-[[sinks.config.schema_fields]]
-name = "id"
-type = "Int64"
-nullable = false
-
-[[sinks.config.schema_fields]]
-name = "price"
-type = "Float64"
-nullable = false</code></pre>
+    link from="input" to="enrich"
+    link from="enrich" to="output"
+}</code></pre>
 </div>
 
 <p>
-    <code>[sources.config]</code> is an opaque TOML value handed straight to the factory, so
-    the accepted keys are the factory's business. <code>ParquetSource</code> wants only
-    <code>path</code>, because Parquet carries its own schema. Every other built-in also wants
-    <code>schema_fields</code>: a list of <code>{ name, type, nullable }</code>, where
-    <code>type</code> is one of the Arrow primitive names (<code>Int64</code>,
-    <code>Float64</code>, <code>Utf8</code>, <code>Boolean</code>, <code>Date32</code> and so
-    on) and <code>nullable</code> defaults to <code>true</code>. CSV additionally accepts
-    <code>has_headers</code>, and the channel factories accept <code>buffer</code>.
+    A <code>config</code> node is opaque, handed straight to the factory, so the accepted keys
+    are the factory's business. <code>FileSource</code> wants <code>path</code>, and takes
+    <code>schema_fields</code> as the format dictates: required for <code>csv</code>, optional
+    for <code>ndjson</code>, rejected for <code>parquet</code> and <code>avro</code>.
+    <code>FileSink</code> always wants <code>schema_fields</code>: one node per column, named by
+    its leading argument, where <code>type</code> is one of the Arrow primitive names
+    (<code>Int64</code>, <code>Float64</code>, <code>Utf8</code>, <code>Boolean</code>,
+    <code>Date32</code> and so on) and <code>nullable</code> defaults to <code>true</code>. The
+    channel factories accept <code>buffer</code>.
 </p>
 
 <p>
-    Two load-time checks then run before the first iteration.
-    <code>validate_io_coverage</code> confirms every <code>target_component</code> and
-    <code>source_component</code> appears in the runtime's
-    <code>declared_components()</code>, and reports all unresolved references in a single
-    error; a runtime that declares nothing opts out of the check. Separately, cluster mode
-    <b>rejects</b> <code>[[sources]]</code> outright: a cluster ingests through
-    <code>PartitionSource</code>, so declared sources would be silently ignored and the
-    pipeline would sit idle. That is a hard configuration error, not a warning.
+    Byte format is a node property, not a <code>config</code> key. Each format the workflow
+    needs is its own <code>transformer</code> node, whose <code>options</code> child reaches
+    that format's factory: <code>has_headers</code> for <code>csv</code>,
+    <code>infer_max</code> for <code>ndjson</code>, <code>compression</code> and
+    <code>schema_id</code> for <code>avro</code>. Every source or sink that moves bytes names
+    one by id through its own <code>transformer</code> key.
+</p>
+
+<p>
+    Two load-time gates then run before the first iteration. The workflow graph is validated
+    inline as part of <code>ServiceBuilder::build</code>: every <code>link</code> must carry a
+    component both ends agree on, with field-for-field identical Arrow schemas, and every
+    component a processor declares must be delivered by some inbound link. A runtime that
+    declares nothing opts its edges out of the component checks.
+</p>
+
+<p>
+    Cluster mode is narrower. It runs exactly one <code>wasm</code> or <code>plugin</code> node
+    with no <code>source</code>, <code>sink</code> or <code>link</code> at all, because a
+    cluster ingests through <code>PartitionSource</code> and a declared source would sit idle.
+    That is a hard configuration error, not a warning.
 </p>
 
 <h2 id="next">Next</h2>
 
 <div class="next-steps-grid">
-    <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
-        <span class="next-card-label">Concept 05</span>
-        <h3>Distributed Runner</h3>
-        <p>The other way rows arrive: partitions claimed from a shared store instead of pulled from a Source.</p>
+    <a href="{{ get_url(path='@/connectors/_index.md') }}" class="next-card">
+        <span class="next-card-label">Moving data</span>
+        <h3>Connectors</h3>
+        <p>One page per connector: the crate to depend on, the constructor to call, and the config keys its node accepts.</p>
     </a>
-    <a href="{{ get_url(path='@/service.md') }}" class="next-card">
-        <span class="next-card-label">Running at scale</span>
+    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
+        <span class="next-card-label">Service</span>
         <h3>Service</h3>
-        <p>The binary that owns the drain loop, reads the TOML above, and decides when finish() gets called.</p>
+        <p>The binary that owns the drain loop, reads the config above, and decides when finish() gets called.</p>
     </a>
 </div>
 

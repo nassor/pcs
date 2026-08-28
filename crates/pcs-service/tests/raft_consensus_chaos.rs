@@ -65,7 +65,7 @@ mod unit {
                 row_range_start: start,
                 row_range_end: end,
                 claim_id,
-                instance_id: uuid::Uuid::new_v4(),
+                instance_id: uuid::Uuid::now_v7(),
                 lease_ttl_millis: ttl,
                 now_at_propose: now,
             },
@@ -79,13 +79,13 @@ mod unit {
         let (db, _p) = temp_db();
         register_batch(&db, 1, 100);
 
-        let claim_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
         let cmd = ConsensusCommand::ClaimRowRange {
             batch_id: 1,
             row_range_start: 0,
             row_range_end: 50,
             claim_id,
-            instance_id: uuid::Uuid::new_v4(),
+            instance_id: uuid::Uuid::now_v7(),
             lease_ttl_millis: 30_000,
             now_at_propose: 1_000,
         };
@@ -120,7 +120,7 @@ mod unit {
     fn checkpoint_replay_idempotent() {
         let (db, _p) = temp_db();
         register_batch(&db, 1, 100);
-        let claim_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
         claim_range(&db, 1, 0, 100, claim_id, 0, 30_000);
 
         let cp_cmd = ConsensusCommand::Checkpoint {
@@ -160,8 +160,8 @@ mod unit {
     fn renew_claim_monotonic() {
         let (db, _p) = temp_db();
         register_batch(&db, 1, 100);
-        let claim_id = uuid::Uuid::new_v4();
-        let inst = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
+        let inst = uuid::Uuid::now_v7();
         // Claim at t=1000, ttl=60_000 → expires_at=61_000.
         apply(
             &db,
@@ -204,7 +204,7 @@ mod unit {
     fn reclaim_expired_frees_ranges() {
         let (db, _p) = temp_db();
         register_batch(&db, 1, 100);
-        let claim_id = uuid::Uuid::new_v4();
+        let claim_id = uuid::Uuid::now_v7();
         // Claim at t=0, ttl=100 → expires_at=100.
         claim_range(&db, 1, 0, 100, claim_id, 0, 100);
 
@@ -240,7 +240,7 @@ mod unit {
         assert_eq!(rec.lease_expires_at, 0);
 
         // The range must now be claimable.
-        let claim_id2 = uuid::Uuid::new_v4();
+        let claim_id2 = uuid::Uuid::now_v7();
         let r3 = claim_range(&db, 1, 0, 100, claim_id2, 200, 30_000);
         assert!(
             matches!(r3, ConsensusResponse::BatchClaimed { .. }),
@@ -254,13 +254,13 @@ mod unit {
         // db1 has batch 1 + claim c1.
         let (db1, _p1) = temp_db();
         register_batch(&db1, 1, 100);
-        let c1 = uuid::Uuid::new_v4();
+        let c1 = uuid::Uuid::now_v7();
         claim_range(&db1, 1, 0, 50, c1, 0, 30_000);
 
         // db2 has batch 3 + claim c4 (old state that must be replaced).
         let (db2, _p2) = temp_db();
         register_batch(&db2, 3, 50);
-        let c4 = uuid::Uuid::new_v4();
+        let c4 = uuid::Uuid::now_v7();
         claim_range(&db2, 3, 0, 50, c4, 0, 30_000);
 
         // Restore db1 snapshot into db2.
@@ -373,7 +373,7 @@ mod idempotency {
             .await
             .unwrap();
 
-        let instance_id = Uuid::new_v4();
+        let instance_id = Uuid::now_v7();
         let claim1 = store
             .claim_next_batch(instance_id)
             .await
@@ -382,7 +382,7 @@ mod idempotency {
         assert_eq!(claim1.batch_id, 1);
 
         // Second caller with a different instance sees no available batch.
-        let claim2 = store.claim_next_batch(Uuid::new_v4()).await.unwrap();
+        let claim2 = store.claim_next_batch(Uuid::now_v7()).await.unwrap();
         assert!(
             claim2.is_none(),
             "already-claimed range must not be re-issued: got {claim2:?}"
@@ -403,7 +403,7 @@ mod idempotency {
             .await
             .unwrap();
 
-        let instance_id = Uuid::new_v4();
+        let instance_id = Uuid::now_v7();
         let claim = store
             .claim_next_batch(instance_id)
             .await
@@ -419,7 +419,7 @@ mod idempotency {
         assert_eq!(reclaimed, 1, "exactly one expired claim must be freed");
 
         // The range is pending again, so a new runner can claim it.
-        let reclaim = store.claim_next_batch(Uuid::new_v4()).await.unwrap();
+        let reclaim = store.claim_next_batch(Uuid::now_v7()).await.unwrap();
         assert!(
             reclaim.is_some(),
             "reclaimed range must be claimable again after sweep"

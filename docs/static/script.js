@@ -30,15 +30,55 @@
   // blocks are the hand-written ones in templates/*.html, which carry the class
   // themselves.
   //
+  // Zola reports the name of the syntax it resolved the fence to, not the token
+  // the page wrote, so a ```bash fence arrives as `shellscript`. Prism knows
+  // that grammar as `bash`, so the two vocabularies need one small table.
+  //
   // This runs at deferred-script time, before Prism's own DOMContentLoaded
   // pass, so Prism sees the class on its first and only sweep.
   // --------------------------------------------------------------------------
+  const prismIds = { shellscript: 'bash' };
+
   document.querySelectorAll('pre > code[data-lang]').forEach((code) => {
-    const lang = code.dataset.lang;
+    const lang = prismIds[code.dataset.lang] || code.dataset.lang;
     if (lang && !code.classList.contains(`language-${lang}`)) {
       code.classList.add(`language-${lang}`);
     }
   });
+
+  // --------------------------------------------------------------------------
+  // Prism has no KDL component, so config fences would sit unhighlighted next
+  // to Rust and TOML. This grammar covers what the pages write: node names,
+  // property names, quoted and raw strings, `#`-prefixed literals, numbers and
+  // comments.
+  //
+  // Same window as the bridge above: the Prism scripts are deferred ahead of
+  // this one, so the language is registered before Prism's only sweep.
+  // --------------------------------------------------------------------------
+  if (window.Prism) {
+    const ident = /[^\s(){}\\/=";]+/.source;
+    window.Prism.languages.kdl = {
+      comment: [
+        { pattern: /\/\*[\s\S]*?(?:\*\/|$)/, greedy: true },
+        { pattern: /\/\/.*/, greedy: true },
+      ],
+      string: {
+        pattern: /"""[\s\S]*?"""|#+"[\s\S]*?"#+|"(?:\\[\s\S]|[^\\"])*"/,
+        greedy: true,
+      },
+      // Prism sees no line structure, so order carries the meaning: a name
+      // before `=` is a property, a `#` literal or a bare number is a value,
+      // and the word left over is a node name. Values on these pages are
+      // always quoted, so nothing else reaches the last rule.
+      'attr-name': RegExp(`${ident}(?==)`),
+      boolean: /#(?:true|false)\b/,
+      keyword: /#(?:null|inf|-inf|nan)\b/,
+      number: /[+-]?(?:0[xX][\da-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)/,
+      function: RegExp(ident),
+      operator: /=/,
+      punctuation: /[{};]/,
+    };
+  }
 
   document.addEventListener('DOMContentLoaded', () => {
     const root = document.documentElement;
@@ -122,6 +162,37 @@
         }
       }
     }
+
+    // A child page highlights itself; its parent entry is the trail to it, not
+    // the page you are on, so it gets a weaker marker.
+    if (activeLink) {
+      const sub = activeLink.closest('.nav-sublinks');
+      if (sub && sub.parentElement) {
+        const parentLink = sub.parentElement.querySelector(':scope > a');
+        if (parentLink) parentLink.classList.add('trail');
+      }
+    }
+
+    // Collapsible nav groups. A stored choice wins; without one, the group
+    // holding the active link stays open and the rest collapse. The server
+    // HTML ships fully expanded, so with scripting off every group is visible.
+    const GROUPS_KEY = 'pcs:nav-groups';
+    let savedGroups = {};
+    try { savedGroups = JSON.parse(localStorage.getItem(GROUPS_KEY)) || {}; } catch (e) {}
+    document.querySelectorAll('.nav-group').forEach((group) => {
+      const label = group.querySelector('.nav-group-label');
+      if (!label) return;
+      const name = label.querySelector('span').textContent.trim();
+      const isOpen = savedGroups[name] ?? Boolean(group.querySelector('.nav-links a.active'));
+      group.classList.toggle('collapsed', !isOpen);
+      label.setAttribute('aria-expanded', String(isOpen));
+      label.addEventListener('click', () => {
+        const nowOpen = group.classList.toggle('collapsed') === false;
+        label.setAttribute('aria-expanded', String(nowOpen));
+        savedGroups[name] = nowOpen;
+        try { localStorage.setItem(GROUPS_KEY, JSON.stringify(savedGroups)); } catch (e) {}
+      });
+    });
 
     // ------------------------------------------------------------------------
     // Keep the sidebar's scroll position across navigations.
@@ -528,6 +599,69 @@
         window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
       });
     }
+
+    // ------------------------------------------------------------------------
+    // A markdown fence renders as a bare `<pre>`, while the concept pages in
+    // templates/*.html hand-author the same snippet already wrapped in `.code`
+    // with a caption. This pass gives the markdown blocks that frame too: the
+    // language name comes from `data-lang`, and the fence's `name=` annotation
+    // arrives as `data-name` and becomes the short description beside it.
+    //
+    // Runs before the copy-button pass below, which then walks the moved
+    // `<pre>` elements in their new parents.
+    // ------------------------------------------------------------------------
+    const codeLabels = {
+      rust: 'Rust',
+      go: 'Go',
+      python: 'Python',
+      typescript: 'TypeScript',
+      ts: 'TypeScript',
+      kotlin: 'Kotlin',
+      csharp: 'C#',
+      cs: 'C#',
+      bash: 'Bash',
+      shellscript: 'Bash',
+      json: 'JSON',
+      xml: 'XML',
+      toml: 'TOML',
+      sql: 'SQL',
+      kdl: 'KDL',
+      wit: 'WIT',
+      text: 'Text',
+      plain: 'Text',
+    };
+
+    /** Human label for a fence language: the table above, else the token itself. */
+    function codeLabel(lang) {
+      if (!lang) return 'Code';
+      return codeLabels[lang] || lang.charAt(0).toUpperCase() + lang.slice(1);
+    }
+
+    document.querySelectorAll('pre').forEach((pre) => {
+      const code = pre.querySelector('code');
+      const parent = pre.parentElement;
+      // No `<code>` is not a snippet; a `.code` parent is already framed.
+      if (!code || !parent || parent.classList.contains('code')) return;
+
+      const caption = document.createElement('div');
+      caption.className = 'code-cap';
+
+      const label = document.createElement('span');
+      label.textContent = codeLabel(code.dataset.lang);
+      caption.appendChild(label);
+
+      if (code.dataset.name) {
+        const description = document.createElement('em');
+        description.textContent = code.dataset.name;
+        caption.appendChild(description);
+      }
+
+      const frame = document.createElement('div');
+      frame.className = 'code';
+      parent.insertBefore(frame, pre);
+      frame.appendChild(caption);
+      frame.appendChild(pre);
+    });
 
     document.querySelectorAll('pre').forEach((pre) => {
       const code = pre.querySelector('code');

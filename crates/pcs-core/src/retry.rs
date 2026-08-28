@@ -248,8 +248,8 @@ impl<'a> Attempts<'a> {
 
     /// The span covering the attempt about to run.
     ///
-    /// The only span `pcs-core` emits: a stage that looks slow is usually a
-    /// system being retried.
+    /// Innermost of the four spans `pcs-core` opens, below `system.execute`: a
+    /// stage that looks slow is usually a system being retried.
     #[cfg(feature = "tracing")]
     fn span(&self) -> tracing::Span {
         info_span!(
@@ -296,7 +296,7 @@ impl<'a> Attempts<'a> {
 /// [`PcsError::RetryExhausted`](crate::PcsError::RetryExhausted) once every
 /// attempt is consumed.
 ///
-/// Waits with `tokio::time::sleep` under the `runtime` feature. Guest builds
+/// Waits with `tokio::time::sleep` under the `runtime` feature. Processor builds
 /// have no async timer, so delays are skipped and retries are immediate; use
 /// [`run_with_retries_blocking`] from a blocking thread.
 ///
@@ -340,7 +340,7 @@ pub async fn run_with_retries<T>(
                 if let Some(delay) = attempts.failed(e)? {
                     #[cfg(feature = "runtime")]
                     tokio::time::sleep(delay).await;
-                    // Guest builds have no timer; retry immediately.
+                    // Processor builds have no timer; retry immediately.
                     #[cfg(not(feature = "runtime"))]
                     let _ = delay;
                 }

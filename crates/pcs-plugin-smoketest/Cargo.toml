@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+# CI fixture, not a library a downstream consumer would depend on.
+publish = false
 description = "Minimal pcs-plugin consumer used as the native plugin load fixture and Arrow IPC round-trip fixture."
 
 # This crate exists to verify:

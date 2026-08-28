@@ -18,7 +18,7 @@ aliases = ["/getting-started/"]
 </dl>
 
 Every piece of code below is quoted from
-`crates/pcs-service/examples/first_pipeline.rs`, which CI compiles. The last
+`examples/native/first_pipeline.rs`, which CI compiles. The last
 step runs it and shows the real output.
 
 ## 1. Clone and build
@@ -31,7 +31,7 @@ have cloned the repository and are running from its root.
 
 </div>
 
-```bash
+```bash,name=Clone the repository and build
 git clone https://github.com/nassor/pcs
 cd pcs
 cargo build
@@ -43,7 +43,7 @@ A `Component` is a plain Rust struct plus the Arrow schema for its fields. PCS
 stores one `RecordBatch` per component, so a field is a **column**, not a
 per-row lookup.
 
-```rust
+```rust,name=The Order component and its Arrow schema
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Order {
     id: u64,
@@ -73,7 +73,7 @@ impl Component for Order {
 `FieldRef` constants are how a system names a column without a string literal
 at every call site. Declare one per field:
 
-```rust
+```rust,name=One FieldRef constant per field
 impl Order {
     const ID: FieldRef<Order> = FieldRef::new("id");
     const CURRENCY: FieldRef<Order> = FieldRef::new("currency");
@@ -91,7 +91,7 @@ and the IPC round trip.
 A `System` is one transform plus the `meta()` that declares what it touches.
 `SeedOrders` appends the batch every later stage reads.
 
-```rust
+```rust,name=SeedOrders appends the first batch
 struct SeedOrders;
 
 #[async_trait]
@@ -160,7 +160,7 @@ runs them concurrently. You never wrote a stage list.
 Both implement `ParallelSystem`, which takes `&Dataset` and returns the columns
 it produced as a `WriteSet` rather than mutating in place.
 
-```rust
+```rust,name=ConvertCurrency writes usd_amount
 struct ConvertCurrency;
 
 #[async_trait]
@@ -190,7 +190,7 @@ impl ParallelSystem for ConvertCurrency {
 }
 ```
 
-```rust
+```rust,name=FlagExpress writes express
 struct FlagExpress;
 
 #[async_trait]
@@ -223,7 +223,7 @@ A `Resource` is a Rust singleton on the `Dataset`, keyed by type. Use one for
 configuration and lookup tables: values that are not columnar and do not need a
 row per entry.
 
-```rust
+```rust,name=The FxRates resource
 /// USD-base exchange rates, held as a resource rather than a column.
 struct FxRates {
     eur: f64,
@@ -248,8 +248,8 @@ impl FxRates {
 Install it with `with_resource(...)` at build time and claim it with
 `read_resource::<FxRates>()` in `meta()`, as `ConvertCurrency` does above.
 Resources are **not** serialised by `write_ipc`, so they never cross an Arrow
-IPC boundary. That is why a WebAssembly guest keeps configuration on the system
-struct instead.
+IPC boundary. That is why a WebAssembly processor keeps configuration on the
+system struct instead.
 
 ## 6. Summarise with a closure
 
@@ -257,7 +257,7 @@ A transform that does not need its own type can be a closure. `system_fn` pairs
 one `SystemMeta` with one `FnMut(&mut Dataset)`. This one writes a second
 resource for `main` to read:
 
-```rust
+```rust,name=The resource the summary writes
 struct Summary {
     rows: usize,
     express: usize,
@@ -265,7 +265,7 @@ struct Summary {
 }
 ```
 
-```rust
+```rust,name=The summary system built with system_fn
 fn make_summary_system() -> impl System {
     system_fn(
         SystemMeta::new("summary")
@@ -325,7 +325,7 @@ before `insert_resource` takes `&mut`.
 
 Register the component, install the resource, add the systems, run.
 
-```rust
+```rust,name=Assemble the pipeline and run it
 #[tokio::main]
 async fn main() -> Result<(), PcsError> {
     let mut pipeline = Pipeline::builder("first-pipeline")
@@ -358,11 +358,11 @@ async fn main() -> Result<(), PcsError> {
 }
 ```
 
-```bash
+```bash,name=Run the example
 cargo run -p pcs-service --example first_pipeline
 ```
 
-```text
+```text,name=Expected console output
 seeded 5 orders
 order 1      120.00 EUR ->     129.60 USD  express=false
 order 2     4300.00 USD ->    4300.00 USD  express=true
@@ -391,11 +391,11 @@ per-system retry.
 
 ## 9. Where to go next
 
-- [Sources & Sinks](@/io.md): read and write Parquet, CSV and JSON instead of
+- [Sources & Sinks](@/io.md): read and write Parquet, CSV and NDJSON instead of
   hardcoding a seed system.
 - [Scheduler](@/scheduler.md): several pipelines in one process, with dependency
   edges between them.
 - [Distributed Runner](@/distributed.md): the same pipeline against claimed row
   ranges across nodes, with checkpoints.
-- [WebAssembly guests](@/guests/_index.md): ship this same pipeline as a
+- [WASM Processors](@/processors/_index.md): ship this same pipeline as a
   component that `pcs-service` loads at runtime.

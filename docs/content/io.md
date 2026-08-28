@@ -1,5 +1,5 @@
 +++
 title = "Sources & Sinks"
-description = "Source and Sink traits with Parquet, CSV, JSON Lines, and in-memory channel transports for moving Arrow data into and out of pipelines."
+description = "Two traits move Arrow rows in and out of a Dataset: Source pulls RecordBatches until EOF, Sink takes one write per cycle. Local files in csv, ndjson, parquet or avro, in-memory channels, and DataFusion SQL."
 template = "io.html"
 +++

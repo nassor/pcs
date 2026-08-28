@@ -465,7 +465,7 @@ sched.add_pipeline_with_config(
 
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>pause the writer when its channel fills</em></div>
-    <pre><code class="language-rust">use pcs_core::io::channel_sink::ChannelSink;
+    <pre><code class="language-rust">use pcs_connector_channel::ChannelSink;
 use pcs_core::prelude::*;
 
 // The receiver is consumed elsewhere; four slots of headroom.

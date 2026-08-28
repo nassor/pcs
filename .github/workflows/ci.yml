@@ -22,6 +22,18 @@ jobs:
         toolchain: 1.95.0  # Rust minimum version
         components: rustfmt, clippy
 
+    # Only this job builds pcs-connector-kafka, which vendors librdkafka via
+    # rdkafka-sys's `cmake-build` feature. That build is configured with
+    # -DWITH_CURL=0, but the config.h cmake generates for POSIX targets uses
+    # `#cmakedefine01 WITH_OAUTHBEARER_OIDC`, which defines the macro as 0
+    # rather than leaving it undefined, and rdkafka_conf.c gates its
+    # `#include <curl/curl.h>` on `#ifdef WITH_OAUTHBEARER_OIDC`. The header is
+    # therefore compiled even with curl support off, so the --all-features
+    # clippy build needs libcurl's development headers present. Nothing links
+    # against libcurl; only the include has to resolve.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
     - name: Cache cargo registry
       uses: actions/cache@v5
       with:
@@ -40,39 +52,20 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-    # rustfmt walks every `mod` declaration ignoring `#[cfg(...)]`, so it needs
-    # `examples/wasm/order_processing/src/bindings.rs`,
-    # `crates/pcs-guest-smoketest/src/bindings.rs` and
-    # `examples/polyglot/stages/rust-settle/src/bindings.rs` on disk even though
-    # the host build never compiles them. cargo-component generates all three
-    # files as part of a wasm32-wasip2 build, and all three are gitignored, so
-    # they exist only once the component builds below have run.
+    # The processor components generate their WIT bindings in-macro, so nothing
+    # has to be produced on disk before `cargo fmt`. The one wasm build this job
+    # still needs is the smoketest artifact, which `tests/wasm_roundtrip.rs`
+    # hard-asserts exists.
     - name: Install wasm32-wasip2 target
       run: rustup target add wasm32-wasip2
 
-    - name: Install cargo-component
+    - name: Install cargo-nextest
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-component
+        tool: cargo-nextest@0.9.143
 
-    - name: Generate WASM bindings
-      run: cargo component build -p order-processing-wasm --target wasm32-wasip2
-
-    # `tests/wasm_roundtrip.rs` hard-asserts this artifact exists, so the
-    # component must be built before the test job runs.
     - name: Build smoketest WASM component
-      run: cargo component build --release -p pcs-guest-smoketest --target wasm32-wasip2
-
-    - name: Generate polyglot Rust stage bindings
-      run: cargo component build -p polyglot-settle-wasm --target wasm32-wasip2
-
-    # Generated bindings ship unformatted; normalize before the workspace-wide
-    # fmt check so `--check` only fails on hand-written code.
-    - name: Pre-format generated bindings
-      run: |
-        rustfmt examples/wasm/order_processing/src/bindings.rs
-        rustfmt crates/pcs-guest-smoketest/src/bindings.rs
-        rustfmt examples/polyglot/stages/rust-settle/src/bindings.rs
+      run: cargo build --release -p pcs-processor-smoketest --target wasm32-wasip2
 
     - name: Check formatting
       run: cargo fmt -q --all -- --check
@@ -89,14 +82,19 @@ jobs:
     - name: Check examples
       run: cargo check -q --examples
 
+    # `ci` profile: the full suite, including the Docker-backed
+    # connector/chaos tests the `default` profile skips for everyday local
+    # runs. The one #[ignore]d test (a ~70-100s chaos run) is deliberately
+    # excluded here; it runs alone in the `distributed_chaos` job below. See
+    # .config/nextest.toml for what each profile covers.
     - name: Run tests
-      run: cargo test -q --workspace --all-features
+      run: cargo nextest run --workspace --all-features --profile ci
 
     - name: Run doctests
       run: cargo test -q --workspace --all-features --doc
 
-  wasm_guest:
-    name: WASM Guest (wasm32-wasip2)
+  distributed_chaos:
+    name: Distributed Chaos
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -116,31 +114,89 @@ jobs:
       uses: actions/cache@v5
       with:
         path: target
-        key: ${{ runner.os }}-wasm-guest-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-distributed-chaos-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@0.9.143
+
+    # The only #[ignore]d test in crates/: a five-node Raft cluster behind
+    # Toxiproxy, chaos-injecting latency/bandwidth/reset-peer/partition
+    # faults for ~70-100s. Isolated in its own job so its runtime never sits
+    # on the `test` job's critical path. `--test` scopes discovery to this
+    # one binary so `--run-ignored ignored-only` can't pick up the unrelated
+    # `#[ignore]`d test in `pcs-service`'s lib unit tests
+    # (`test_second_init_returns_error`, a global-tracing-subscriber race).
+    - name: Full-stack distributed chaos test
+      run: cargo nextest run -p pcs-service --features distributed-raft --test distributed_integration_chaos --run-ignored ignored-only
+
+  wasm_processor:
+    name: WASM Processor (wasm32-wasip2)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-wasm-processor-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install component tooling
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+        tool: wasm-tools@1.246.2
 
     - name: Check pcs-core for wasm32-wasip2
-      run: bash scripts/check-wasm-guest.sh
+      run: cargo xtask check-wasm-processor
 
     # The arrow-ipc exact pin is load-bearing across the component boundary;
-    # crates/pcs-guest/PINS.md forbids relaxing it without this gate.
-    - name: Host-guest arrow-ipc round-trip
-      run: bash scripts/ci/guest_ipc_roundtrip.sh
+    # crates/pcs-processor/PINS.md forbids relaxing it without this gate.
+    - name: Host-processor arrow-ipc round-trip
+      run: cargo xtask processor-ipc-roundtrip
 
-    # cargo-component 0.21.1 emits under wasm32-wasip1 even for a
-    # --target wasm32-wasip2 build; the round-trip script above produced it.
+    # Produced by the round-trip task above.
     - name: Validate smoketest component
-      run: wasm-tools validate --features component-model target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+      run: wasm-tools validate --features component-model target/wasm32-wasip2/release/pcs_processor_smoketest.wasm
 
     - name: Print smoketest component world
-      run: wasm-tools component wit target/wasm32-wasip1/release/pcs_guest_smoketest.wasm
+      run: wasm-tools component wit target/wasm32-wasip2/release/pcs_processor_smoketest.wasm
+
+    # The processors are built with `-C target-feature=+simd128` from
+    # .cargo/config.toml, and a silently dropped rustflag costs real throughput
+    # in the Arrow encode/decode paths. Three assertions, cheapest first: the
+    # core module carries a target_features section, that section names simd128,
+    # and LLVM actually emitted vector instructions. Only the third one is the
+    # point of the flag; the section is present either way, so it cannot fail
+    # alone. The smoketest yields 12989 matching lines with the flag and 0
+    # without it, so the `-eq 0` threshold has no flake margin to worry about.
+    - name: Assert simd128 in the core module
+      run: |
+        WASM=target/wasm32-wasip2/release/pcs_processor_smoketest.wasm
+        wasm-tools objdump "$WASM" | grep -q 'custom "target_features"'
+        grep -qa simd128 "$WASM"
+        vec=$(wasm-tools print "$WASM" \
+          | grep -cE '(^|[^a-z0-9_])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.' || true)
+        echo "vector instruction lines in the core module: $vec"
+        if [ "$vec" -eq 0 ]; then
+          echo "::error::core module has no v128 instructions: the +simd128 rustflag in .cargo/config.toml did not reach this build. An exported RUSTFLAGS replaces config-file rustflags wholesale rather than extending them."
+          exit 1
+        fi
 
   polyglot:
-    name: Polyglot Guests
+    name: Polyglot Processors
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -168,7 +224,7 @@ jobs:
     - name: Install component tooling
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-component@0.21.1,wasm-tools@1.246.2
+        tool: wasm-tools@1.246.2,cargo-nextest@0.9.143
 
     # Versions are pinned in examples/polyglot/PINS.md; keep the two in sync.
     - uses: actions/setup-go@v6
@@ -198,7 +254,7 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
-    - name: Install guest componentizers
+    - name: Install processor componentizers
       run: |
         go install github.com/bytecodealliance/componentize-go@v0.4.1
         pip install componentize-py==0.25.0 build
@@ -207,11 +263,12 @@ jobs:
         # wit-bindgen fork with a Kotlin backend, built from the branch.
         cargo install wit-bindgen-cli --git https://github.com/Kotlin/wit-bindgen --branch kotlin
 
-    # The five native codec test suites need the generated fixtures, and they
-    # are the tests that localise a flatbuffer-offset bug to one language before
-    # the wasm chain turns it into an opaque byte diff.
+    # The five SDK test suites (each now also carrying its codec) need the
+    # generated fixtures, and they are the tests that localise a
+    # flatbuffer-offset bug to one language before the wasm chain turns it into
+    # an opaque byte diff.
     - name: Generate schema constants and fixtures
-      run: cargo run -p pcs-service --features wasm --example polyglot_orders -- emit
+      run: cargo run -p pcs-service --features wasm --example polyglot_schema_emit -- emit
 
     # The conformance corpus is committed so a codec's suite runs without a Rust
     # toolchain. Regenerating it here proves the committed vectors still match
@@ -222,44 +279,50 @@ jobs:
         cargo run -p pcs-service --features conformance --example conformance_vectors -- emit
         git diff --exit-code -- packages/arrow-ipc-conformance
 
-    - name: Go codec tests
-      working-directory: packages/arrow-ipc-go
+    - name: Go SDK+codec tests
+      working-directory: packages/pcs-sdk-go
       run: go test ./...
 
-    - name: Python codec tests
-      working-directory: packages/arrow-ipc-py
+    - name: Python SDK+codec tests
+      working-directory: packages/pcs-sdk-py
       run: PYTHONPATH=src python -m unittest discover -s tests
 
-    - name: TypeScript codec tests
-      working-directory: packages/arrow-ipc-ts
+    - name: TypeScript SDK+codec tests
+      working-directory: packages/pcs-sdk-ts
       run: |
         npm ci
         npm run typecheck
         npm run build
         npm test
 
-    - name: Kotlin codec tests
-      working-directory: packages/arrow-ipc-kt
+    - name: Kotlin SDK+codec tests
+      working-directory: packages/pcs-sdk-kt
       run: gradle jvmTest
 
-    - name: C# codec tests
-      working-directory: packages/arrow-ipc-cs
+    - name: C# SDK+codec tests
+      working-directory: packages/pcs-sdk-cs
       run: dotnet test tests
 
     # Keeps the packaging honest between releases: every manifest still agrees
     # with packages/VERSION and every artifact still builds. Every toolchain it
     # needs is already installed above.
-    - name: Pack the Arrow codec packages
-      run: bash scripts/pack-arrow-ipc.sh
+    - name: Pack the SDK packages
+      run: cargo xtask pack-sdk
 
     - name: Build all six components
-      run: bash scripts/build-polyglot.sh
+      run: cargo xtask polyglot
 
     - name: Six-language chain regression
-      run: cargo test -p pcs-service --features wasm --test polyglot_chain -- --nocapture
+      run: cargo nextest run -p pcs-service --features wasm --test polyglot_chain --no-capture
 
     - name: Run the polyglot driver
       run: cargo run -p pcs-service --features wasm,tracing --example polyglot_orders
+
+    # The Quick Start's C# stage is not built by any other job, so a WIT
+    # world change here would break the tutorial silently. Every toolchain
+    # it needs is already installed above.
+    - name: Build the Quick Start components
+      run: cargo xtask quickstart
 
   security_audit:
     name: Security Audit

@@ -1,7 +1,7 @@
 //! Turning a runtime's declared component schemas into a template [`Dataset`].
 //!
 //! Both pipeline runtimes that live outside this crate's process boundary need
-//! this. A WebAssembly guest reports `component-descriptor` records with
+//! this. A WebAssembly processor reports `component-descriptor` records with
 //! `arrow-schema-ipc` bytes; a native plugin reports the same pairs as
 //! base64 in its JSON manifest. Once decoded they are the same
 //! `(name, schema ipc bytes)` list, and both runtimes build their

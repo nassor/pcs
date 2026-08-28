@@ -160,8 +160,8 @@ mod tests {
     fn test_serde_command_round_trip_via_json() {
         use crate::distributed::consensus::types::ConsensusCommand;
         let cmd = ConsensusCommand::AckClaim {
-            claim_id: uuid::Uuid::new_v4(),
-            instance_id: uuid::Uuid::new_v4(),
+            claim_id: uuid::Uuid::now_v7(),
+            instance_id: uuid::Uuid::now_v7(),
         };
         let json = serde_json::to_vec(&cmd).unwrap();
         let decoded: ConsensusCommand = serde_json::from_slice(&json).unwrap();
@@ -261,8 +261,8 @@ mod tests {
         use uuid::Uuid;
 
         let cmd = ConsensusCommand::AckClaim {
-            claim_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
         };
         let envelope = RpcEnvelope::ProposalForward {
             command: cmd.clone(),

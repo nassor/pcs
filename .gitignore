@@ -3,11 +3,18 @@
 /docs/public
 **/.DS_Store
 
+# The dashboard crate is outside the workspace, so it has its own target dir,
+# and `cargo xtask ui` caches the Tailwind standalone binary next to it. The
+# bundle itself is committed under /crates/pcs-service/assets/ui/, which is
+# what pcs-service embeds.
+/crates/pcs-service-ui/target
+/crates/pcs-service-ui/.tools
+
 # Avoid IDE files
 .idea/
 .vscode/
 
 # Local Benchmarks
 performance-improvement.md
-
+.agents/skills/rust-*
 **/__pycache__/

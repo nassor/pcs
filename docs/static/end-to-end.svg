@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 560" role="img" aria-labelledby="e2e-title e2e-desc">
   <title id="e2e-title">PCS end to end: write, build, run, scale</title>
   <desc id="e2e-desc">
-    You write Component, System, and Pipeline structs. cargo component build turns the
+    You write Component, System, and Pipeline structs. A wasm32-wasip2 cargo build turns the
     pipeline into pipeline.wasm, a wasm32-wasip2 component. pcs-service loads the component
-    named in config.toml and drives Arrow IPC batches from sources through the host to
+    named in pcs.kdl and drives Arrow IPC batches from sources through the host to
     sinks. Optionally the host coordinates a Raft cluster with row-range leases and
     checkpoints.
   </desc>
@@ -86,7 +86,7 @@
 
   <!-- build edge -->
   <path class="arw s-d" d="M444 150 H634" marker-end="url(#m-d)"/>
-  <text class="t-lab t-mid" x="540" y="138">cargo component build</text>
+  <text class="t-lab t-mid" x="540" y="138">cargo build (wasip2)</text>
 
   <!-- ============ 2 · YOU BUILD ============ -->
   <rect class="panel" x="620" y="28" width="232" height="212" rx="12"/>
@@ -107,7 +107,7 @@
 
   <!-- boundary crossing: wasm → host -->
   <path class="arw s-b dash" d="M736 182 V266 H326 V378" marker-end="url(#m-b)"/>
-  <text class="t-lab t-mid f-b" x="531" y="258">named in config.toml</text>
+  <text class="t-lab t-mid f-b" x="531" y="258">named in pcs.kdl</text>
 
   <!-- ============ 3 · PCS-SERVICE RUNS ============ -->
   <rect class="panel" x="28" y="300" width="596" height="232" rx="12"/>

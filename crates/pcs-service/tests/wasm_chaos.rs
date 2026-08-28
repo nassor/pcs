@@ -1,7 +1,7 @@
-// A guest trap releases the claim instead of acking it.
+// A processor trap releases the claim instead of acking it.
 //
 // Uses a `MockTrapRuntime` instead of a real WASM component: the mock can be told
-// to fail on an exact call index, which a real guest cannot do without carrying
+// to fail on an exact call index, which a real processor cannot do without carrying
 // its own failure counter through `run-batch`'s state blob. The runner sees only
 // a `PcsError`, so the release-not-ack path is identical either way.
 //
@@ -27,7 +27,7 @@ use uuid::Uuid;
 ///
 /// The error message mirrors the format produced by `WasmPipelineRuntime` so
 /// assertions match the wording documented in the WIT spec:
-/// `"guest trap (run-batch): ..."`.
+/// `"processor trap (run-batch): ..."`.
 struct MockTrapRuntime {
     call_count: Arc<AtomicUsize>,
     trap_on_call: usize,
@@ -54,7 +54,7 @@ impl PipelineRuntime for MockTrapRuntime {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.trap_on_call {
             return Err(PcsError::SystemExecution(
-                "guest trap (run-batch): unreachable executed".to_string(),
+                "processor trap (run-batch): unreachable executed".to_string(),
             ));
         }
         Ok(())
@@ -159,7 +159,7 @@ impl CheckpointStore for CountingSource {
 }
 
 fn temp_db_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("pcs_wasm_chaos_{}.redb", Uuid::new_v4()))
+    std::env::temp_dir().join(format!("pcs_wasm_chaos_{}.redb", Uuid::now_v7()))
 }
 
 async fn seed_batch(store: &RedbSharedStore, batch_id: u64) {
@@ -195,8 +195,8 @@ async fn test_trap_releases_not_acks() {
     let err = result.expect_err("expected Err from trapping runtime");
     let msg = err.to_string();
     assert!(
-        msg.contains("guest trap (run-batch)"),
-        "error message must reference guest trap; got: {msg}"
+        msg.contains("processor trap (run-batch)"),
+        "error message must reference processor trap; got: {msg}"
     );
     assert_eq!(
         release_count.load(Ordering::SeqCst),

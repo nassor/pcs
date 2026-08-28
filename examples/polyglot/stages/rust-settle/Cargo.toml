@@ -4,26 +4,31 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
-description = "Stage 6 of the polyglot example: the Rust guest that writes `settlement` and keeps a cross-batch ledger."
+# A sample processor component, not a library a downstream consumer would
+# depend on.
+publish = false
+description = "Stage 6 of the polyglot example: the Rust processor that writes `settlement` and keeps a cross-batch ledger."
 
-# This is a guest pipeline component, NOT a binary. cargo-component wraps the
-# cdylib into a valid Component Model component targeting the pcs-pipeline
-# world from pcs-guest's WIT package.
+# This is a processor pipeline component, NOT a binary. `cargo build --target wasm32-wasip2`
+# links the cdylib straight into a Component Model component exporting the
+# pcs-pipeline world from pcs-processor's WIT package.
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-pcs-guest          = { path = "../../../../crates/pcs-guest" }
-pcs-polyglot-order = { path = "../../order-schema" }
-serde              = { workspace = true }
-# cargo-component generates src/bindings.rs against the WIT target and
-# requires this runtime crate at link time.
-wit-bindgen-rt     = { version = "0.44.0", features = ["bitflags"] }
+pcs-processor = { path = "../../../../crates/pcs-processor" }
+# `#[derive(Component)]` requires `Serialize`/`Deserialize` alongside it, and
+# serde's own expansion names the literal `serde` crate at the call site, so it
+# is a direct dependency rather than a re-export.
+serde         = { workspace = true }
 
-[package.metadata.component]
-package = "pcs:polyglot-settle"
+# The bindings generator, invoked by the `#[processor]` expansion. Gated on
+# wasm32 because that expansion is: the host build of this crate is an empty
+# cdylib and has no use for the generator or its proc-macro dependency tree.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = { workspace = true }
 
-[package.metadata.component.target]
-path = "../../../../crates/pcs-guest/wit"
-world = "pcs-pipeline"
+# Drives the pipeline's async `run_on` from the synchronous host tests, the same
+# way the `#[processor]` expansion drives it inside `run-batch`.
+[dev-dependencies]
+pollster = "0.4"

@@ -307,13 +307,43 @@ button { font: inherit; color: inherit; }
 
 .nav-group + .nav-group { margin-top: var(--s5); }
 
+/* The group label is a disclosure button: same type as the old static label,
+   with the chevron as the only added affordance. */
 .nav-group-label {
-    padding: 0 var(--s3) var(--s2);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s2);
+    width: 100%;
+    padding: var(--s1) var(--s3) var(--s2);
+    background: none;
+    border: 0;
+    cursor: pointer;
+    font-family: inherit;
     font-size: var(--step--1);
     font-weight: 600;
     letter-spacing: -0.005em;
+    text-align: left;
     color: var(--foreground);
+    transition: color var(--fast) var(--ease);
 }
+.nav-group-label:hover { color: var(--foreground); }
+.nav-group-label:hover .nav-chevron { color: var(--foreground); }
+
+.nav-chevron {
+    flex: none;
+    width: 12px;
+    height: 12px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    color: var(--muted-foreground);
+    transition: transform var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+.nav-group.collapsed .nav-chevron { transform: rotate(-90deg); }
+.nav-group.collapsed .nav-links { display: none; }
 
 .nav-links { list-style: none; padding: 0; }
 .nav-links li { margin: 0; }
@@ -335,6 +365,23 @@ button { font: inherit; color: inherit; }
     color: var(--foreground);
     font-weight: 500;
 }
+
+/* A subsection: the pages under a nav entry, hung off one rail and set in the
+   mono face, because each one is an identifier you type into config. */
+.nav-sublinks {
+    list-style: none;
+    margin: var(--s1) 0 var(--s2) var(--s3);
+    padding: 0 0 0 var(--s3);
+    border-left: 1px solid var(--border);
+}
+.nav-sublinks a {
+    padding: 0.2rem var(--s2);
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+}
+
+/* The entry above the page being read: named, not selected. */
+.nav-links a.trail { color: var(--foreground); }
 
 .nav-note {
     margin: var(--s6) var(--s3) 0;
@@ -506,6 +553,19 @@ hr { border: 0; height: 1px; background: var(--border); margin: var(--s7) 0; }
     width: 14px;
     height: 1.5px;
     background: currentColor;
+}
+
+/* A subsection page names its parent instead of its nav group and links up to
+   it, so it never reads like the index it sits under. */
+.page-parent { margin-bottom: var(--s3); }
+.page-parent:hover { color: var(--foreground); border-color: var(--ring); }
+.page-parent svg {
+    width: 11px;
+    height: 11px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
 }
 
 .page-lede {

@@ -1,21 +1,20 @@
 //! `pcs-service validate`: validate a config file without starting the service.
 //!
-//! Runs three validation gates:
+//! Runs two validation gates:
 //!
-//! **Gate 1 (structural)**: parses the TOML and verifies every field. TOML
-//! typos, missing required fields, and keys the service cannot honour
-//! (`pipeline.systems`, `pipeline.wasm.watch`) fail here.
+//! **Gate 1 (structural)**: parses the KDL and verifies every field. Syntax
+//! errors, missing required fields, and keys the service cannot honour
+//! (`workflow.systems`, a `watch` property on `wasm`) fail here.
 //!
-//! **Gate 2 (world match)**: builds the service with the built-in factory
+//! **Gate 2 (build + graph)**: builds the service with the built-in factory
 //! registry, compiling any WASM module and checking its WIT world through
-//! wasmtime instantiation.
-//!
-//! **Gate 3 (semantic)**: verifies that every source `target_component` and
-//! sink `source_component` names a component the runtime handles.
+//! wasmtime instantiation, then validates every declared `link` end to end:
+//! matching components and field-for-field identical Arrow schemas
+//! ([`validate_workflow_graph`](pcs_service::service::validation::validate_workflow_graph)).
 //!
 //! The schema-fingerprint gate
 //! ([`validate_schema_fingerprint`](pcs_service::service::validation::validate_schema_fingerprint))
-//! is not run here. It compares the pipeline against persisted state in
+//! is not run here. It compares the workflow against persisted state in
 //! `node.data_dir`, which exists only once the cluster runner has opened it, so
 //! `pcs-service serve` applies it at cluster startup.
 //!
@@ -34,45 +33,28 @@
 //! | Config is structurally valid but some types are unknown (default mode) | 0 (warnings printed to stderr) |
 //! | Unknown types present and `--strict` is set | 1 |
 //! | Config fails structural validation | 1 |
-//! | Gate 3 semantic mismatch (source/sink targets missing from runtime) | 1 |
+//! | Workflow graph mismatch (link component/schema disagreement) | 1 |
 
 use pcs_service::PcsError;
 use pcs_service::service::ServiceBuilder;
 use pcs_service::service::config::{ServiceConfig, ServiceMode};
 use pcs_service::service::factories::register_builtin_factories;
-use pcs_service::service::validate_io_coverage;
 
 use crate::cli::{GlobalOpts, ValidateArgs};
 
 /// Entry point for the `validate` subcommand.
 pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsError> {
-    let config_path = global
-        .config
-        .as_ref()
-        .ok_or_else(|| PcsError::configuration("--config is required for validate"))?;
+    let config = ServiceConfig::load(&global.config)?;
 
-    let config = ServiceConfig::load(config_path)?;
-
-    // Building with the built-in registry also compiles any WASM module and
-    // verifies its WIT world. Unknown type names surface as configuration
-    // errors naming the missing factory.
+    // Building with the built-in registry also compiles any WASM module,
+    // verifies its WIT world, and validates the workflow graph. Unknown type
+    // names surface as configuration errors naming the missing factory.
     let builder = register_builtin_factories(ServiceBuilder::new());
-    #[cfg(feature = "wasm")]
-    let has_wasm = config.pipeline.wasm.is_some();
-    #[cfg(not(feature = "wasm"))]
-    let has_wasm = false;
-    let builder = if !has_wasm {
-        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new(
-            "pcs-service",
-        )))
-    } else {
-        builder
-    };
-    let build_result = builder.build(&config);
+    let build_result = builder.build_all(&config);
 
     // Unknown-type errors become warnings; every other error is fatal
     // regardless of --strict.
-    let (unknown_warnings, built_service) = match build_result {
+    let (unknown_warnings, built) = match build_result {
         Ok(built) => (vec![], Some(built)),
         Err(ref e) if is_unknown_factory_error(e) => (vec![e.message().to_string()], None),
         Err(e) => {
@@ -83,14 +65,8 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
         }
     };
 
-    // Gate 3: source and sink targets must be covered by the runtime's
-    // declared component list. Only reachable when the build succeeded.
-    if let Some(ref built) = built_service {
-        let declared = built.runtime.declared_components();
-        validate_io_coverage(&declared, &config).map_err(|e| {
-            PcsError::configuration(format!("semantic validation failed: {}", e.message()))
-        })?;
-        println!("OK: all IO targets covered by runtime declared components");
+    if built.is_some() {
+        println!("OK: workflow graph validated (components and schemas agree end to end)");
     }
 
     println!("OK: config is structurally valid");
@@ -105,19 +81,28 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
             ServiceMode::Cluster { .. } => "cluster",
         }
     );
-    #[cfg(feature = "wasm")]
-    println!(
-        "  pipeline: {}",
-        match &config.pipeline.wasm {
-            Some(spec) => spec.module.as_str(),
-            None => "(runtime supplied programmatically)",
+    for workflow in &config.workflows {
+        println!("  workflow: {}", workflow.id);
+        #[cfg(feature = "wasm")]
+        if !workflow.wasm.is_empty() {
+            println!(
+                "  processors: {}",
+                workflow
+                    .wasm
+                    .iter()
+                    .map(|spec| spec
+                        .module
+                        .as_deref()
+                        .unwrap_or("(runtime supplied programmatically)"))
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            );
         }
-    );
-    println!("  sources:  {}", config.sources.len());
-    println!("  sinks:    {}", config.sinks.len());
+        println!("  sources:  {}", workflow.sources.len());
+        println!("  sinks:    {}", workflow.sinks.len());
+    }
     println!("  http.bind: {}", config.http.bind);
     println!("  log_level: {}", config.observability.log_level);
-
     if unknown_warnings.is_empty() {
         println!("OK: all declared types resolved in built-in registry");
     } else {
@@ -146,7 +131,7 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
 /// Returns `true` if the error is specifically a missing factory registration
 /// (as opposed to a factory build failure or schema error).
 fn is_unknown_factory_error(e: &PcsError) -> bool {
-    // ServiceBuilder::build formats missing-factory errors as
+    // ServiceBuilder::build_all formats missing-factory errors as
     // "no source/sink factory registered for type '...'".
     e.category() == "configuration"
         && (e.message().contains("no source factory registered")
@@ -156,11 +141,37 @@ fn is_unknown_factory_error(e: &PcsError) -> bool {
 #[cfg(all(test, feature = "service"))]
 mod tests {
     use super::*;
+    use pcs_connector::{ConfigMap, ConfigValue};
     use pcs_service::service::config::{
-        HttpConfig, NodeConfig, ObservabilityConfig, PipelineSpec, ServiceConfig, ServiceMode,
-        SinkSpec, SourceSpec, StandaloneConfig,
+        HttpConfig, LinkSpec, NodeConfig, ObservabilityConfig, ServiceConfig, ServiceMode,
+        SinkSpec, SourceSpec, StandaloneConfig, WorkflowSpec,
     };
     use std::path::PathBuf;
+
+    fn make_workflow(sources: Vec<SourceSpec>, sinks: Vec<SinkSpec>) -> WorkflowSpec {
+        let links = sources
+            .iter()
+            .flat_map(|s| {
+                sinks.iter().map(move |k| LinkSpec {
+                    from: s.id.clone(),
+                    to: k.id.clone(),
+                    branch: None,
+                })
+            })
+            .collect();
+        WorkflowSpec {
+            id: "test".to_string(),
+            name: None,
+            transformers: Vec::new(),
+            sources,
+            #[cfg(feature = "wasm")]
+            wasm: Vec::new(),
+            #[cfg(feature = "plugin")]
+            plugin: Vec::new(),
+            sinks,
+            links,
+        }
+    }
 
     fn make_config(sources: Vec<SourceSpec>, sinks: Vec<SinkSpec>) -> ServiceConfig {
         ServiceConfig {
@@ -172,9 +183,7 @@ mod tests {
             mode: ServiceMode::Standalone {
                 config: StandaloneConfig::default(),
             },
-            pipeline: PipelineSpec::default(),
-            sources,
-            sinks,
+            workflows: vec![make_workflow(sources, sinks)],
             http: HttpConfig::default(),
             observability: ObservabilityConfig::default(),
         }
@@ -183,10 +192,8 @@ mod tests {
     #[test]
     fn test_builtin_only_config_validates_cleanly() {
         let config = make_config(vec![], vec![]);
-        let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder =
-            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
-        let result = builder.build(&config);
+        let builder = register_builtin_factories(ServiceBuilder::new());
+        let result = builder.build_all(&config);
         assert!(
             result.is_ok(),
             "empty config should build cleanly: {:?}",
@@ -199,20 +206,20 @@ mod tests {
         let config = make_config(
             vec![],
             vec![SinkSpec {
-                name: "sink1".to_string(),
-                type_name: "PostgresSink".to_string(), // not built-in
-                source_component: "orders".to_string(),
-                config: toml::Value::Table(toml::Table::new()),
+                id: "sink1".to_string(),
+                name: None,
+                type_name: "ClickHouseSink".to_string(), // not built-in
+                transformer: None,
+                component: "orders".to_string(),
+                config: ConfigValue::Object(ConfigMap::new()),
             }],
         );
-        let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder =
-            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
-        let err = builder.build(&config).unwrap_err();
+        let builder = register_builtin_factories(ServiceBuilder::new());
+        let err = builder.build_all(&config).unwrap_err();
         assert_eq!(err.category(), "configuration");
         assert!(
             is_unknown_factory_error(&err),
-            "PostgresSink should be classified as unknown factory: {err}"
+            "ClickHouseSink should be classified as unknown factory: {err}"
         );
     }
 
@@ -220,20 +227,20 @@ mod tests {
     fn test_unknown_source_type_is_unknown_factory_error() {
         let config = make_config(
             vec![SourceSpec {
-                name: "src1".to_string(),
-                type_name: "KafkaSource".to_string(), // not built-in
-                target_component: "orders".to_string(),
-                config: toml::Value::Table(toml::Table::new()),
+                id: "src1".to_string(),
+                name: None,
+                type_name: "MongoSource".to_string(), // not built-in
+                transformer: None,
+                component: "orders".to_string(),
+                config: ConfigValue::Object(ConfigMap::new()),
             }],
             vec![],
         );
-        let pipeline = pcs_service::pipeline::Pipeline::new("test");
-        let builder =
-            register_builtin_factories(ServiceBuilder::new()).with_runtime(Box::new(pipeline));
-        let err = builder.build(&config).unwrap_err();
+        let builder = register_builtin_factories(ServiceBuilder::new());
+        let err = builder.build_all(&config).unwrap_err();
         assert!(
             is_unknown_factory_error(&err),
-            "KafkaSource should be classified as unknown factory: {err}"
+            "MongoSource should be classified as unknown factory: {err}"
         );
     }
 

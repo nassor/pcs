@@ -1,7 +1,7 @@
 //! The three callbacks a native plugin may call back through.
 //!
 //! These are the C ABI counterpart of the `host-io` WIT interface the WASM
-//! guest imports, and they route to the same places: `tracing` for log lines
+//! processor imports, and they route to the same places: `tracing` for log lines
 //! and metrics, the load-time config map for `get_config`.
 
 use std::collections::HashMap;
@@ -171,12 +171,13 @@ fn emit_log(plugin: &str, level: u32, module: &str, message: &str) {
     }
 }
 
-/// Record one metric value.
+/// Record one metric value as a `trace` event.
 ///
-/// The host service layer exports metrics to prometheus. Without it,
-/// trace-level logging keeps them visible instead of dropping them. The runtime
-/// reports per-batch metrics through here too, so a plugin's own metrics and
-/// the ones it reports from `run_batch` land in the same place.
+/// The C ABI `metric` callback (plugin-chosen names) writes no Prometheus
+/// series: the six `pcs_processor_*` names are host-reserved for the per-batch
+/// numbers the runtime reports. Those numbers land here as trace events too,
+/// and `NativePluginRuntime::report_metrics` records the series on top,
+/// exactly like the wasm host.
 pub(crate) fn record_metric(plugin: &str, name: &str, value: f64) {
     #[cfg(feature = "tracing")]
     {

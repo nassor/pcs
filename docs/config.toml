@@ -13,6 +13,16 @@ output_dir = "public"
 [markdown]
 render_emoji = false
 
+# Class mode keeps the inline `style` attribute off `<pre>`, so the site's own
+# light/dark rules and the `data-theme` toggle still paint the code frame.
+# Zola writes a `giallo.css` for the theme below; no page links it, because the
+# Prism `.token.*` rules in `styles.css` colour the tokens. The section exists
+# so a fence annotation such as ```rust,name=The build script reaches the page
+# as `data-name`, which `script.js` renders as the frame caption.
+[markdown.highlighting]
+theme = "ayu-dark"
+style = "class"
+
 [extra]
 github_repo = "https://github.com/nassor/pcs"
 crates_io = "https://crates.io/crates/pcs"
@@ -20,20 +30,19 @@ docs_rs = "https://docs.rs/pcs"
 
 # The reading order, declared once. `base.html` renders the sidebar, the
 # breadcrumb and the previous/next pager from this list, so all three agree.
+# A group collapses in the sidebar, so a hub item keeps its children here
+# rather than hiding them behind the hub page alone.
 [[extra.nav]]
-label = "Start"
+label = "Quick Start"
 [[extra.nav.items]]
 title = "What PCS is"
 path = "/"
-
-[[extra.nav]]
-label = "Native"
 [[extra.nav.items]]
-title = "Overview"
-path = "@/native/_index.md"
+title = "Installation"
+path = "@/quickstart/installation.md"
 [[extra.nav.items]]
-title = "Build your first pipeline"
-path = "@/native/tutorial.md"
+title = "Running it!"
+path = "@/quickstart/running-it.md"
 
 [[extra.nav]]
 label = "Core concepts"
@@ -51,60 +60,135 @@ title = "Scheduler"
 path = "@/scheduler.md"
 
 [[extra.nav]]
-label = "WebAssembly guests"
+label = "Service"
 [[extra.nav.items]]
 title = "Overview"
-path = "@/guests/_index.md"
+path = "@/service/_index.md"
 [[extra.nav.items]]
-title = "The WIT contract"
-path = "@/guests/wit-contract.md"
+title = "Configuration"
+path = "@/service/configuration.md"
 [[extra.nav.items]]
-title = "A Rust guest"
-path = "@/guests/rust.md"
+title = "Observability"
+path = "@/service/observability.md"
 [[extra.nav.items]]
-title = "A Go guest"
-path = "@/guests/go.md"
+title = "Live dashboard"
+path = "@/service/dashboard.md"
 [[extra.nav.items]]
-title = "A Python guest"
-path = "@/guests/python.md"
+title = "Branching"
+path = "@/service/branching.md"
 [[extra.nav.items]]
-title = "A TypeScript guest"
-path = "@/guests/typescript.md"
+title = "Windowing"
+path = "@/service/windowing.md"
 [[extra.nav.items]]
-title = "A Kotlin guest"
-path = "@/guests/kotlin.md"
-[[extra.nav.items]]
-title = "A C# guest"
-path = "@/guests/csharp.md"
-[[extra.nav.items]]
-title = "Six languages, one pipeline"
-path = "@/guests/six-languages.md"
+title = "Operating pcs-service"
+path = "@/operations/running-pcs.md"
 
 [[extra.nav]]
 label = "Moving data"
 [[extra.nav.items]]
 title = "Sources & Sinks"
 path = "@/io.md"
+[[extra.nav.items]]
+title = "Connectors"
+path = "@/connectors/_index.md"
+[[extra.nav.items.children]]
+title = "Channel"
+path = "@/connectors/channel.md"
+[[extra.nav.items.children]]
+title = "File"
+path = "@/connectors/file.md"
+[[extra.nav.items.children]]
+title = "PostgreSQL"
+path = "@/connectors/postgresql.md"
+[[extra.nav.items.children]]
+title = "Kafka"
+path = "@/connectors/kafka.md"
+[[extra.nav.items.children]]
+title = "NATS"
+path = "@/connectors/nats.md"
+[[extra.nav.items.children]]
+title = "TCP ingest"
+path = "@/connectors/tcp.md"
+[[extra.nav.items.children]]
+title = "DataFusion SQL"
+path = "@/connectors/datafusion.md"
+[[extra.nav.items.children]]
+title = "S3"
+path = "@/connectors/s3.md"
+[[extra.nav.items]]
+title = "Transformers"
+path = "@/transformers/_index.md"
+[[extra.nav.items.children]]
+title = "csv"
+path = "@/transformers/csv.md"
+[[extra.nav.items.children]]
+title = "ndjson"
+path = "@/transformers/ndjson.md"
+[[extra.nav.items.children]]
+title = "parquet"
+path = "@/transformers/parquet.md"
+[[extra.nav.items.children]]
+title = "avro"
+path = "@/transformers/avro.md"
+[[extra.nav.items.children]]
+title = "arrow-ipc"
+path = "@/transformers/arrow-ipc.md"
+
+[[extra.nav]]
+label = "WASM Processors"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/processors/_index.md"
+[[extra.nav.items]]
+title = "The WIT contract"
+path = "@/processors/wit-contract.md"
+[[extra.nav.items]]
+title = "Processors"
+path = "@/processors/languages.md"
+[[extra.nav.items.children]]
+title = "Rust"
+path = "@/processors/rust.md"
+[[extra.nav.items.children]]
+title = "Go"
+path = "@/processors/go.md"
+[[extra.nav.items.children]]
+title = "Python"
+path = "@/processors/python.md"
+[[extra.nav.items.children]]
+title = "TypeScript"
+path = "@/processors/typescript.md"
+[[extra.nav.items.children]]
+title = "Kotlin"
+path = "@/processors/kotlin.md"
+[[extra.nav.items.children]]
+title = "C#"
+path = "@/processors/csharp.md"
+
+[[extra.nav]]
+label = "Native"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/native/_index.md"
+[[extra.nav.items]]
+title = "Build your first pipeline"
+path = "@/native/tutorial.md"
+[[extra.nav.items]]
+title = "Native plugins"
+path = "@/native/plugins.md"
 
 [[extra.nav]]
 label = "Running at scale"
 [[extra.nav.items]]
 title = "Distributed Runner"
 path = "@/distributed.md"
-[[extra.nav.items]]
-title = "Service"
-path = "@/service.md"
-[[extra.nav.items]]
-title = "Operating pcs-service"
-path = "@/operations/running-pcs.md"
 
 [[extra.nav]]
 label = "Reference"
 [[extra.nav.items]]
-title = "Host to guest wire format"
+title = "Host to processor wire format"
 path = "@/reference/wire-format.md"
 [[extra.nav.items]]
-title = "The Arrow codec packages"
+title = "The SDK packages"
 path = "@/reference/arrow-ipc-packages.md"
 [[extra.nav.items]]
 title = "Tracing"

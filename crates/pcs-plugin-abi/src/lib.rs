@@ -1,8 +1,8 @@
 //! The C ABI a PCS native plugin exports.
 //!
 //! A native plugin is a shared library that a host loads with `dlopen` or
-//! `LoadLibrary`. It mirrors the `pcs:pipeline@0.2.0` WIT world that a
-//! WebAssembly guest implements: two exported entry points, four vtable calls,
+//! `LoadLibrary`. It mirrors the `pcs:pipeline@0.3.0` WIT world that a
+//! WebAssembly processor implements: two exported entry points, four vtable calls,
 //! three host callbacks, Arrow IPC bytes as the data plane, and one opaque
 //! checkpoint blob as the only channel for state that crosses a batch boundary.
 //!
@@ -77,7 +77,7 @@
 //! # No preemption
 //!
 //! A native plugin runs in-process with full host privileges and has no
-//! equivalent of the wasmtime epoch deadline that bounds a WebAssembly guest.
+//! equivalent of the wasmtime epoch deadline that bounds a WebAssembly processor.
 //! A plugin that wedges wedges its caller, and one that corrupts memory takes
 //! the host with it. Plugin paths are operator-trusted.
 
@@ -97,7 +97,12 @@ use core::ffi::c_void;
 /// against minor 0 still loads and behaves exactly as before: its own
 /// exported functions remain compiled nounwind either way, so only a plugin
 /// rebuilt against minor 1 gains anything from the host's new catch.
-pub const PCS_ABI_VERSION: u32 = 0x0001_0001;
+///
+/// `0x0001_0002`: minor 2 appended `routes`/`has_routes` to [`PcsRunResult`].
+/// Layout grows by 32 bytes; a minor-1 plugin leaves the new trailing fields
+/// zeroed, which the host reads as "no routing decision", so it loads and
+/// behaves exactly as before.
+pub const PCS_ABI_VERSION: u32 = 0x0001_0002;
 
 /// Extract the major half of an ABI version.
 #[must_use]
@@ -315,6 +320,12 @@ pub struct PcsRunResult {
     pub has_checkpoint: i32,
     /// Per-batch metrics.
     pub metrics: PcsRunMetrics,
+    /// UTF-8 JSON array of branch names this batch's output is delivered to.
+    /// Plugin-owned; read only when [`PcsRunResult::has_routes`] is non-zero.
+    /// A null buffer means no routing decision (legacy multicast).
+    pub routes: PcsBuffer,
+    /// Non-zero when [`PcsRunResult::routes`] carries a JSON list.
+    pub has_routes: i32,
 }
 
 impl PcsRunResult {
@@ -336,6 +347,8 @@ impl PcsRunResult {
                 systems_run: 0,
                 retries: 0,
             },
+            routes: PcsBuffer::null(),
+            has_routes: 0,
         }
     }
 }
@@ -485,7 +498,7 @@ mod tests {
         assert_eq!(size_of::<PcsRunMetrics>(), 32);
         assert_eq!(align_of::<PcsRunMetrics>(), 8);
 
-        assert_eq!(size_of::<PcsRunResult>(), 88);
+        assert_eq!(size_of::<PcsRunResult>(), 120);
         assert_eq!(align_of::<PcsRunResult>(), 8);
 
         assert_eq!(size_of::<PcsHostV1>(), 32);
@@ -508,7 +521,7 @@ mod tests {
     #[test]
     fn version_compatibility_matches_the_documented_rule() {
         assert_eq!(abi_major(PCS_ABI_VERSION), 1);
-        assert_eq!(abi_minor(PCS_ABI_VERSION), 1);
+        assert_eq!(abi_minor(PCS_ABI_VERSION), 2);
 
         assert!(abi_is_compatible(PCS_ABI_VERSION));
         // A newer minor may need vtable slots this host cannot fill. Accepting
@@ -516,7 +529,7 @@ mod tests {
         // parameterised host version to test, which `check_abi_version` in the
         // host's loader provides.
         assert!(abi_is_compatible(0x0001_0000));
-        assert!(!abi_is_compatible(0x0001_0002));
+        assert!(!abi_is_compatible(0x0001_0003));
         assert!(!abi_is_compatible(0x0001_ffff));
         // A different major is a layout change either way.
         assert!(!abi_is_compatible(0x0002_0000));

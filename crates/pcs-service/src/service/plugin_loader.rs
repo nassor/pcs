@@ -56,7 +56,14 @@ pub fn load_plugin_runtime(
     spec: &PluginSpec,
     base_dir: Option<&Path>,
 ) -> PcsResult<NativePluginRuntime> {
-    let path = resolve_library_path(&spec.library, base_dir);
+    let library = spec.library.as_deref().ok_or_else(|| {
+        PcsError::configuration(format!(
+            "plugin node '{}' declares no 'library'; supply a runtime through \
+             ServiceBuilder::with_runtime instead",
+            spec.id
+        ))
+    })?;
+    let path = resolve_library_path(library, base_dir);
 
     if !path.exists() {
         return Err(PcsError::configuration(format!(
@@ -88,10 +95,31 @@ mod tests {
 
     fn spec(library: &str, sha3_256: Option<&str>) -> PluginSpec {
         PluginSpec {
-            library: library.to_string(),
+            id: "p".to_string(),
+            name: None,
+            library: Some(library.to_string()),
             sha3_256: sha3_256.map(str::to_string),
             config: HashMap::new(),
+            #[cfg(feature = "windows")]
+            window: None,
         }
+    }
+
+    #[test]
+    fn test_no_library_declared_is_a_configuration_error() {
+        let missing = PluginSpec {
+            id: "p".to_string(),
+            name: None,
+            library: None,
+            sha3_256: None,
+            config: HashMap::new(),
+            #[cfg(feature = "windows")]
+            window: None,
+        };
+        let err = load_plugin_runtime(&missing, None).unwrap_err();
+        assert_eq!(err.category(), "configuration");
+        assert!(err.to_string().contains("'p'"), "{err}");
+        assert!(err.to_string().contains("with_runtime"), "{err}");
     }
 
     #[test]

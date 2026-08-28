@@ -7,7 +7,7 @@
 //! - `Counter` is the data plane. Its `id` field passes through untouched, so a
 //!   byte difference there indicates `arrow-ipc` drift between host and plugin.
 //! - `Total` is the cross-batch state, declared via
-//!   `export_plugin!(build, state = Total)`. It lives in a `GuestState<Total>`
+//!   `export_plugin!(build, state = Total)`. It lives in a `ProcessorState<Total>`
 //!   resource, not a registered component, so it never appears in the output
 //!   IPC.
 //! - `advance` writes `seen` as `(total + row + 1) * multiplier`, then adds the
@@ -25,10 +25,10 @@
 
 use std::sync::Arc;
 
-use pcs_plugin::GuestState;
 use pcs_plugin::arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use pcs_plugin::arrow_schema::{DataType, Field, Schema};
 use pcs_plugin::prelude::*;
+use pcs_plugin::{ProcessorState, RouteDecision};
 
 /// Config key holding the factor applied to every `seen` value.
 const MULTIPLIER_KEY: &str = "smoketest.multiplier";
@@ -112,8 +112,8 @@ impl System for AdvanceSystem {
         // The macro installs the state resource before any system runs, so its
         // absence is an SDK bug rather than a recoverable condition.
         let total = dataset
-            .get_resource::<GuestState<Total>>()
-            .ok_or_else(|| PcsError::generic("smoketest: GuestState<Total> resource missing"))?
+            .get_resource::<ProcessorState<Total>>()
+            .ok_or_else(|| PcsError::generic("smoketest: ProcessorState<Total> resource missing"))?
             .rows
             .first()
             .map_or(0, |t| t.total);
@@ -143,8 +143,10 @@ impl System for AdvanceSystem {
         dataset.replace_batch::<Counter>(new_batch)?;
 
         let state = dataset
-            .get_resource_mut::<GuestState<Total>>()
-            .ok_or_else(|| PcsError::generic("smoketest: GuestState<Total> resource missing"))?;
+            .get_resource_mut::<ProcessorState<Total>>()
+            .ok_or_else(|| {
+                PcsError::generic("smoketest: ProcessorState<Total> resource missing")
+            })?;
         let advanced = total + rows as i64;
         match state.rows.first_mut() {
             Some(existing) => existing.total = advanced,
@@ -172,7 +174,24 @@ pub fn build() -> Pipeline {
         .register_component::<Counter>()
         .expect("register Counter");
     pipeline.add_system(AdvanceSystem);
+
+    // The `smoketest.route` config key ("a" or "a,b") installs a
+    // `RouteDecision` resource, so the host delivers this batch's output only
+    // to the links whose branch it names. Absent = legacy multicast.
+    if let Some(route) = pcs_config_get(ROUTE_KEY) {
+        let branches: Vec<String> = route.split(',').map(str::to_string).collect();
+        pipeline.add_system(system_fn(
+            SystemMeta::new("route_batch"),
+            move |data: &mut Dataset| {
+                data.insert_resource(RouteDecision(branches.clone()));
+                Ok(())
+            },
+        ));
+    }
     pipeline
 }
+
+/// Config key selecting the branch names this fixture's output is delivered to.
+const ROUTE_KEY: &str = "smoketest.route";
 
 pcs_plugin::export_plugin!(build, state = Total);

@@ -1,0 +1,96 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.github.nassor",
+    "module": "pcs-sdk-kt-ksp",
+    "version": "0.1.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.jvm.version": 21,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "pcs-sdk-kt-ksp-0.1.0.jar",
+          "url": "pcs-sdk-kt-ksp-0.1.0.jar",
+          "size": 25258,
+          "sha512": "7ea2c796ffb9035fa233a9214cfbfda0a35e2182cfab548dd8f785aab0a0dd636d285d08af8bb64c16694f878d3da5b23629b154d40f4a5a5b0dd6bbe076d2a1",
+          "sha256": "a7bc29bd53adfbd0382357c541dfb93112e44ad05300df157e9cad0e1f51b0a5",
+          "sha1": "e2dd52a2ddb26fde87e371a770e10248570d5c8f",
+          "md5": "32f0eda9521627a879c629a132b6c806"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.jvm.version": 21,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "dependencies": [
+        {
+          "group": "com.google.devtools.ksp",
+          "module": "symbol-processing-api",
+          "version": {
+            "requires": "2.3.11"
+          }
+        },
+        {
+          "group": "io.github.nassor",
+          "module": "pcs-sdk-kt",
+          "version": {
+            "requires": "0.1.0"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "pcs-sdk-kt-ksp-0.1.0.jar",
+          "url": "pcs-sdk-kt-ksp-0.1.0.jar",
+          "size": 25258,
+          "sha512": "7ea2c796ffb9035fa233a9214cfbfda0a35e2182cfab548dd8f785aab0a0dd636d285d08af8bb64c16694f878d3da5b23629b154d40f4a5a5b0dd6bbe076d2a1",
+          "sha256": "a7bc29bd53adfbd0382357c541dfb93112e44ad05300df157e9cad0e1f51b0a5",
+          "sha1": "e2dd52a2ddb26fde87e371a770e10248570d5c8f",
+          "md5": "32f0eda9521627a879c629a132b6c806"
+        }
+      ]
+    }
+  ]
+}

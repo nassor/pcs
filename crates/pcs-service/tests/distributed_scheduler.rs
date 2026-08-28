@@ -69,7 +69,7 @@ fn make_order_ipc(orders: &[(u64, f64, &str)]) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_distributed_runner_processes_single_batch() {
-    let db_path = std::env::temp_dir().join(format!("pcs_dist_test_{}.redb", uuid::Uuid::new_v4()));
+    let db_path = std::env::temp_dir().join(format!("pcs_dist_test_{}.redb", uuid::Uuid::now_v7()));
     let store = RedbSharedStore::single_node(&db_path).unwrap();
 
     let ipc_bytes = make_order_ipc(&[(1, 100.0, "USD"), (2, 250.0, "EUR"), (3, 75.5, "GBP")]);
@@ -112,7 +112,7 @@ async fn test_distributed_runner_processes_single_batch() {
 #[tokio::test]
 async fn test_distributed_runner_processes_multiple_batches() {
     let db_path =
-        std::env::temp_dir().join(format!("pcs_dist_multi_{}.redb", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("pcs_dist_multi_{}.redb", uuid::Uuid::now_v7()));
     let store = RedbSharedStore::single_node(&db_path).unwrap();
 
     for batch_id in 0..3u64 {
@@ -149,7 +149,7 @@ async fn test_distributed_runner_processes_multiple_batches() {
 #[tokio::test]
 async fn test_distributed_runner_no_batches_returns_zero() {
     let db_path =
-        std::env::temp_dir().join(format!("pcs_dist_empty_{}.redb", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("pcs_dist_empty_{}.redb", uuid::Uuid::now_v7()));
     let store = RedbSharedStore::single_node(&db_path).unwrap();
 
     let mut pipeline = Pipeline::new("distributed-empty");

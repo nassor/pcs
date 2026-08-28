@@ -16,7 +16,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use opentelemetry_prometheus::exporter;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tokio::sync::RwLock;
 
 use pcs_service::PcsError;
@@ -24,19 +24,13 @@ use pcs_service::service::config::{LogFormat, ServiceConfig, ServiceMode};
 use pcs_service::service::factories::register_builtin_factories;
 use pcs_service::service::http::{ServiceModeLabel, ServiceState};
 use pcs_service::service::standalone::StandaloneStats;
-use pcs_service::service::{
-    ServiceBuilder, ShutdownCoordinator, register_standard_metrics, serve_http, spawn_watchdog,
-    validate_io_coverage,
-};
+use pcs_service::service::{ServiceBuilder, ShutdownCoordinator, serve_http, spawn_watchdog};
 
 use crate::cli::{GlobalOpts, LogFormatArg, ServeArgs};
 
 /// Entry point for the `serve` subcommand.
 pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> {
-    let config_path = global
-        .config
-        .as_ref()
-        .ok_or_else(|| PcsError::configuration("--config is required for serve"))?;
+    let config_path = &global.config;
     let mut config = ServiceConfig::load(config_path)?;
 
     if let Some(node_id) = args.node_id {
@@ -51,6 +45,9 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
             LogFormatArg::Json => LogFormat::Json,
         };
     }
+    if let Some(endpoint) = &global.otlp_endpoint {
+        config.observability.otlp_endpoint = Some(endpoint.clone());
+    }
     if let Some(port) = args.port {
         // Replace only the port portion of the existing bind address.
         let existing = &config.http.bind;
@@ -61,44 +58,51 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
         config.http.bind = format!("{host}:{port}");
     }
 
-    // Logging must be initialised before any tracing call.
-    pcs_service::service::init_logging(&config.observability)?;
+    // Logging must be initialised before any tracing call. The inspector is
+    // built here too, because its capture layer joins the same subscriber.
+    let (telemetry, inspector) =
+        pcs_service::service::init_logging(&config.observability, config.node.id)?;
     tracing::info!(node_id = config.node.id, "pcs-service starting");
 
     let prometheus_registry = Arc::new(prometheus::Registry::new());
     let otel_exporter = exporter()
+        // Instrument names already carry the `_total` convention, so the
+        // exporter must not append a second one.
+        .without_counter_suffixes()
         .with_registry((*prometheus_registry).clone())
         .build()
         .map_err(|e| PcsError::generic(format!("failed to build OTel exporter: {e}")))?;
-    let provider = SdkMeterProvider::builder()
-        .with_reader(otel_exporter)
-        .build();
-    opentelemetry::global::set_meter_provider(provider);
-    register_standard_metrics();
+    // Both readers live on one provider: `with_reader` is additive and each
+    // reader gets its own aggregation pipeline, so the inspector's cumulative
+    // temporality cannot disturb the Prometheus reader's.
+    let mut provider_builder = SdkMeterProvider::builder().with_reader(otel_exporter);
+    if let Some(inspector) = &inspector {
+        provider_builder = provider_builder.with_reader(
+            PeriodicReader::builder(inspector.metric_exporter())
+                .with_interval(config.observability.inspector.sample_interval())
+                .build(),
+        );
+    }
+    // `metrics::init()` forces the instrument LazyLock, so it must follow the
+    // provider install: instruments bind to whichever provider is current when
+    // they are first built.
+    opentelemetry::global::set_meter_provider(provider_builder.build());
+    pcs_service::metrics::init();
 
     // Forks of this binary register their own runtime and IO factories here:
-    // register_builtin_factories(ServiceBuilder::new()).with_runtime(...).
+    // register_builtin_factories(ServiceBuilder::new()).with_runtime(id, ...).
     let builder = register_builtin_factories(ServiceBuilder::new());
-    #[cfg(feature = "wasm")]
-    let has_wasm = config.pipeline.wasm.is_some();
-    #[cfg(not(feature = "wasm"))]
-    let has_wasm = false;
-    let builder = if !has_wasm {
-        builder.with_runtime(Box::new(pcs_service::pipeline::Pipeline::new(
-            "pcs-service",
-        )))
-    } else {
-        builder
+    // The builder publishes the topology into the inspector once it knows the
+    // runtime and the source/sink sets.
+    let builder = match inspector.clone() {
+        Some(inspector) => builder.with_inspector(inspector),
+        None => builder,
     };
-    let built = builder.build(&config)?;
-
-    // Gate 3: IO targets must be covered by the runtime's declared components.
-    {
-        let declared = built.runtime.declared_components();
-        validate_io_coverage(&declared, &config).map_err(|e| {
-            PcsError::configuration(format!("semantic validation failed: {}", e.message()))
-        })?;
-    }
+    // `ServiceBuilder::build_all` validates each workflow's graph (rule:
+    // matching components and field-for-field identical Arrow schemas end to
+    // end) before returning, so a config/runtime mismatch fails here rather
+    // than on the first pipeline iteration.
+    let built = builder.build_all(&config)?;
 
     let coord = ShutdownCoordinator::new(Duration::from_secs(30));
 
@@ -108,8 +112,18 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
         ServiceMode::Standalone { .. } => ServiceModeLabel::Standalone,
         ServiceMode::Cluster { .. } => ServiceModeLabel::Cluster,
     };
-    let standalone_stats: Option<Arc<RwLock<StandaloneStats>>> = match &config.mode {
-        ServiceMode::Standalone { .. } => Some(Arc::new(RwLock::new(StandaloneStats::default()))),
+    let standalone_stats: Option<Vec<(String, Arc<RwLock<StandaloneStats>>)>> = match &config.mode {
+        ServiceMode::Standalone { .. } => Some(
+            built
+                .iter()
+                .map(|b| {
+                    (
+                        b.workflow_id.clone(),
+                        Arc::new(RwLock::new(StandaloneStats::default())),
+                    )
+                })
+                .collect(),
+        ),
         ServiceMode::Cluster { .. } => None,
     };
 
@@ -124,6 +138,7 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
         // No cluster probe: in cluster mode /status reports "cluster": null.
         cluster_probe: None,
         standalone_stats: standalone_stats.clone(),
+        inspector,
     };
 
     let watchdog_handle = spawn_watchdog(state.clone(), coord.child());
@@ -157,6 +172,11 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
         http_bind_addr
     };
     println!("pcs-service listening on {resolved_addr}");
+    if state.inspector.as_ref().is_some_and(|i| i.ui_enabled()) {
+        println!("dashboard at http://{resolved_addr}/ui");
+    } else {
+        println!("endpoints at http://{resolved_addr}/");
+    }
 
     let http_config = config.http.clone();
     let http_state = state.clone();
@@ -174,35 +194,59 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
     // The runner runs inline rather than under tokio::spawn: BuiltService holds
     // a Box<dyn Sink> that is Send but not Sync, and running inline avoids the
     // Future: Send bound.
-    let runner_cancel = coord.child();
+    //
+    // One cancel-child token per built workflow, taken before `coord` itself
+    // is consumed by `wait_for_signal()` below. This works uniformly for
+    // standalone mode (N workflows) and cluster mode (exactly one, guaranteed
+    // by `ServiceConfig::validate`).
+    let items: Vec<_> = built
+        .into_iter()
+        .map(|b| {
+            let cancel_child = coord.child();
+            (b, cancel_child)
+        })
+        .collect();
     let runner_config = config.clone();
     let runner_stats = standalone_stats.clone();
 
     let runner_fut = async move {
         match runner_config.mode {
-            ServiceMode::Standalone { .. } => pcs_service::service::run_standalone(
-                built,
-                &runner_config,
-                runner_cancel,
-                runner_stats,
-            )
-            .await
-            .map(|_| ()),
+            ServiceMode::Standalone { .. } => {
+                let runner_futs = items.into_iter().map(|(b, cancel_child)| {
+                    let stats = runner_stats.as_ref().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(id, _)| *id == b.workflow_id)
+                            .map(|(_, lock)| lock.clone())
+                    });
+                    let cfg = runner_config.clone();
+                    async move {
+                        pcs_service::service::run_standalone(b, &cfg, cancel_child, stats)
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                let results = futures::future::join_all(runner_futs).await;
+                results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+            }
             #[cfg(feature = "service-cluster")]
             ServiceMode::Cluster { .. } => {
-                pcs_service::service::run_cluster(built, &runner_config, runner_cancel)
+                let (b, cancel_child) = items
+                    .into_iter()
+                    .next()
+                    .expect("cluster mode config validation guarantees exactly one workflow");
+                pcs_service::service::run_cluster(b, &runner_config, cancel_child)
                     .await
                     .map(|_| ())
             }
-            // `service`-only build: the TOML parses so operators get a clear
+            // `service`-only build: the config parses so operators get a clear
             // message instead of a cryptic parse error, but cluster mode needs
             // the Raft stack.
             #[cfg(not(feature = "service-cluster"))]
             ServiceMode::Cluster { .. } => {
                 // Drop the runner-only inputs explicitly so the async move
                 // closure still captures them.
-                drop(built);
-                drop(runner_cancel);
+                drop(items);
                 drop(runner_stats);
                 Err(PcsError::configuration(
                     "config requests `mode: cluster`, but this binary was built \
@@ -241,6 +285,8 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
         tracing::error!("shutdown budget exceeded; forcing exit");
         std::process::exit(1);
     }
+    // Flush spans while no task is still emitting, then log the last line.
+    telemetry.shutdown().await;
     tracing::info!("pcs-service stopped cleanly");
 
     // Cancellation from a clean shutdown signal is not an error.

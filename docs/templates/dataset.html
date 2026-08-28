@@ -412,8 +412,9 @@ assert_eq!(restored.rows(), data.rows());</code></pre>
     <span class="note-label">Two things IPC does not carry</span>
     <p>
         <b>Resources</b> are absent from the payload, so re-attach them after decoding.
-        Every component in the stream must hold <b>exactly the row count</b> the alive
-        bitmap declares, or <code>read_ipc</code> rejects the stream as corrupt.
+        Every component in the stream must hold <b>at most the row count</b> the alive
+        bitmap declares — fewer rows is a windowing processor's reduced result
+        component — or <code>read_ipc</code> rejects the stream as corrupt.
     </p>
 </div>
 

@@ -25,9 +25,19 @@ pub struct Cli {
 /// Options that apply to every subcommand.
 #[derive(clap::Args, Debug, Clone)]
 pub struct GlobalOpts {
-    /// Path to the service config TOML file.
-    #[arg(long, short = 'c', env = "PCS_CONFIG", global = true)]
-    pub config: Option<PathBuf>,
+    /// Path to the service config file.
+    ///
+    /// Defaults to `pcs.kdl` in the current directory, so `pcs-service serve`
+    /// works with no flags. A missing file surfaces as
+    /// `Configuration error: reading config file pcs.kdl: ...`.
+    #[arg(
+        long,
+        short = 'c',
+        env = "PCS_CONFIG",
+        default_value = "pcs.kdl",
+        global = true
+    )]
+    pub config: PathBuf,
 
     /// HTTP control-plane address to query (for status/cluster commands).
     #[arg(long, env = "PCS_ADDR", global = true)]
@@ -40,6 +50,10 @@ pub struct GlobalOpts {
     /// Log level override applied to the tracing filter.
     #[arg(long, env = "PCS_LOG_LEVEL", global = true)]
     pub log_level: Option<String>,
+
+    /// OTLP/HTTP collector base URL for span export. Empty disables it.
+    #[arg(long, env = "PCS_OTLP_ENDPOINT", global = true)]
+    pub otlp_endpoint: Option<String>,
 }
 
 /// Top-level subcommands.

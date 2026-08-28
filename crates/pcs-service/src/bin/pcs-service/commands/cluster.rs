@@ -43,16 +43,12 @@ pub async fn run(_global: &GlobalOpts, _cmd: &ClusterCmd) -> Result<(), PcsError
 
 /// Validate the config and confirm it is bootstrap-ready.
 ///
-/// A pre-flight check only: it loads the TOML, confirms `mode = cluster` and
+/// A pre-flight check only: it loads the config, confirms `mode = cluster` and
 /// `bootstrap = true`, then prints next-step instructions. Bootstrapping itself
 /// happens when `pcs-service serve --config <path>` runs with the same file.
 #[cfg(feature = "service-cluster")]
 async fn cmd_init(global: &GlobalOpts) -> Result<(), PcsError> {
-    let config_path = global
-        .config
-        .as_ref()
-        .ok_or_else(|| PcsError::configuration("--config is required for cluster init"))?;
-
+    let config_path = &global.config;
     let config = ServiceConfig::load(config_path)?;
 
     match &config.mode {

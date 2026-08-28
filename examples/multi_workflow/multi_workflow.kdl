@@ -1,0 +1,132 @@
+mode "standalone"
+
+node id=1 name="pcs-multi-workflow" data_dir="${PCS_DATA_DIR:-/tmp/pcs-multi-workflow}"
+
+// A core NATS subscription never reaches EOF, so the stream runner drives
+// every workflow's sources item by item.
+run_mode kind="stream"
+
+workflow "route" {
+    transformer "ndjson_fmt" format="ndjson"
+
+    source "orders_in" type="NatsSource" component="Sale" transformer="ndjson_fmt" {
+        config {
+            batch_size 2500
+            poll_timeout_ms 5
+
+            connection {
+                servers "${PCS_NATS_URL:-nats://localhost:4222}"
+                name "pcs-multi-route"
+            }
+
+            mode kind="core" subject="multi.orders"
+
+            schema_fields "timestamp_ms" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "amount" type="float64" nullable=#false
+        }
+    }
+
+    wasm "router" module="target/wasm32-wasip2/release/multi_workflow_router_wasm.wasm"
+
+    // The rush branch: routed batches land in PostgreSQL untouched.
+    sink "rush_sales" type="PostgresSink" component="Sale" {
+        config {
+            name "rush-sales"
+            table "public.rush_sales"
+            write_mode "upsert"
+            conflict_columns "timestamp_ms" "symbol"
+
+            connection {
+                dsn "${PCS_PG_DSN:-postgres://postgres:pcs@127.0.0.1:5432/pcs}"
+                application_name "pcs-multi-route"
+                sslmode "disable"
+            }
+
+            schema_fields "timestamp_ms" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "amount" type="float64" nullable=#false
+        }
+    }
+
+    // The standard branch bridges into the settle workflow on this channel.
+    sink "standard_bridge" type="ChannelSink" component="Sale" {
+        config name="standard" buffer=64 {
+            schema_fields "timestamp_ms" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "amount" type="float64" nullable=#false
+        }
+    }
+
+    link from="orders_in" to="router"
+    link from="router" to="rush_sales" branch="rush"
+    link from="router" to="standard_bridge" branch="standard"
+}
+
+workflow "settle" {
+    transformer "settle_ndjson" format="ndjson"
+
+    // Fan-in: the bridged channel plus a second live NATS subject, both
+    // carrying the Sale schema the windowed processor declares.
+    source "standard_in" type="ChannelSource" component="Sale" {
+        config name="standard" buffer=64 {
+            schema_fields "timestamp_ms" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "amount" type="float64" nullable=#false
+        }
+    }
+
+    source "offsets_in" type="NatsSource" component="Sale" transformer="settle_ndjson" {
+        config {
+            batch_size 2500
+            poll_timeout_ms 5
+
+            connection {
+                servers "${PCS_NATS_URL:-nats://localhost:4222}"
+                name "pcs-multi-settle"
+            }
+
+            mode kind="core" subject="multi.offsets"
+
+            schema_fields "timestamp_ms" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "amount" type="float64" nullable=#false
+        }
+    }
+
+    wasm "window_sales" module="target/wasm32-wasip2/release/windowing_wasm.wasm" {
+        window kind="tumbling" size_ms=30000 time_field="timestamp_ms" allowed_lateness_ms=5000 {
+            key_field "symbol"
+        }
+    }
+
+    sink "window_totals" type="PostgresSink" component="WindowTotal" {
+        config {
+            name "window-totals"
+            table "public.window_totals"
+            write_mode "upsert"
+            conflict_columns "window_id" "symbol"
+
+            connection {
+                dsn "${PCS_PG_DSN:-postgres://postgres:pcs@127.0.0.1:5432/pcs}"
+                application_name "pcs-multi-settle"
+                sslmode "disable"
+            }
+
+            schema_fields "window_id" type="int64" nullable=#false
+            schema_fields "symbol" type="utf8" nullable=#false
+            schema_fields "count" type="int64" nullable=#false
+            schema_fields "sum" type="float64" nullable=#false
+        }
+    }
+
+    link from="standard_in" to="window_sales"
+    link from="offsets_in" to="window_sales"
+    link from="window_sales" to="window_totals"
+}
+
+http bind="127.0.0.1:8080"
+
+observability log_format="pretty" log_level="info" {
+    inspector enabled=#true ui=#true
+}

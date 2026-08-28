@@ -1,6 +1,6 @@
 +++
 title = "Native plugins"
-description = "A shared library the host loads at runtime: two C symbols, the same Arrow IPC wire format a guest speaks, and none of the sandbox."
+description = "A shared library the host loads at runtime: two C symbols, the same Arrow IPC wire format a processor speaks, and none of the sandbox."
 template = "page.html"
 weight = 2
 +++
@@ -13,7 +13,8 @@ A native plugin is a shared library that `pcs-service` loads at runtime, with
 `pcs_plugin_v1` fills a host allocated vtable with four function pointers.
 
 The contract behind those pointers is the one a
-[WebAssembly guest](@/guests/_index.md) implements, written in C instead of WIT.
+[WebAssembly processor](@/processors/_index.md) implements, written in C
+instead of WIT.
 `describe` runs once at load and reports the plugin name, its version, and the
 Arrow schema of every component it declares. `run_batch` runs once per batch over
 the same [Arrow IPC wire format](@/reference/wire-format.md), and the opaque
@@ -93,8 +94,8 @@ boundary.
 
 ## What a plugin costs you
 
-A guest is sandboxed, portable and preemptible. A wasmtime epoch deadline bounds
-every call, and a trap ends the batch instead of the service.
+A processor is sandboxed, portable and preemptible. A wasmtime epoch deadline
+bounds every call, and a trap ends the batch instead of the service.
 
 A plugin has none of that. It runs in-process with full host privileges, it
 cannot be interrupted, and a memory error in it is a memory error in the host.
@@ -106,7 +107,7 @@ and no componentizer in the build.
 
 A wedged plugin wedges the thread driving it, and a segfault in one takes the
 service down with it. The optional `sha3_256` digest below is the only integrity
-gate there is. Point `[pipeline.plugin]` at a library you built or a library you
+gate there is. Point the `plugin` node at a library you built or a library you
 trust the way you trust the service binary itself.
 
 </div>
@@ -118,7 +119,7 @@ depends on it, and hands a function that builds a `Pipeline` to
 `export_plugin!`. Every block below is from
 `crates/pcs-plugin-smoketest/src/lib.rs`, which CI builds.
 
-```toml
+```toml,name=The plugin crate manifest
 [lib]
 crate-type = ["cdylib"]
 
@@ -127,7 +128,7 @@ pcs-plugin = { path = "../pcs-plugin" }
 serde      = { workspace = true }
 ```
 
-```rust
+```rust,name=The build function and the export macro
 use pcs_plugin::prelude::*;
 
 pub fn build() -> Pipeline {
@@ -147,20 +148,20 @@ The macro writes both exported symbols, the four vtable thunks, and the
 `pcs_config_get` and `pcs_config_parse` functions into the crate.
 `cargo build --release` on it produces the library.
 
-The optional `state = T` names the one component whose rows survive a batch, and
-`export_plugin!(build)` without it declares a stateless plugin. `T` must not be
-registered in `build()`: the macro decodes the prior checkpoint into a
-`GuestState<T>` resource before the pipeline runs and captures it afterwards, so
-those rows never appear in the output. A plugin's process memory does survive
-between calls, and keeping state there is still wrong. Consecutive batches of one
-partition may land on different processes, and only the checkpoint travels with
-the claim.
+The optional `state = T` names the one component whose rows survive a batch,
+and `export_plugin!(build)` without it declares a stateless plugin. `T` must
+not be registered in `build()`: the macro decodes the prior checkpoint into a
+`ProcessorState<T>` resource before the pipeline runs and captures it
+afterwards, so those rows never appear in the output. A plugin's process
+memory does survive between calls, and keeping state there is still wrong.
+Consecutive batches of one partition may land on different processes, and
+only the checkpoint travels with the claim.
 
 Config values arrive as strings through those generated functions. Logging and
 metrics go out through `pcs_plugin::host`, the native counterpart of the
-`host-io` interface a guest imports.
+`host-io` interface a processor imports.
 
-```rust
+```rust,name=Reading a config value in a system
 let multiplier = match pcs_config_parse::<i64>(MULTIPLIER_KEY) {
     Some(Ok(value)) => value,
     Some(Err(e)) => {
@@ -172,7 +173,7 @@ let multiplier = match pcs_config_parse::<i64>(MULTIPLIER_KEY) {
 };
 ```
 
-```rust
+```rust,name=Logs and metrics through the host
 pcs_plugin::host::metric("smoketest.rows", rows as f64);
 pcs_plugin::host::info("smoketest", &format!("numbered {rows} rows through {advanced}"));
 ```
@@ -185,21 +186,20 @@ try again.
 
 ## How the host loads one
 
-```toml
-[pipeline.plugin]
-library = "/var/lib/pcs/pipelines/libpcs_plugin_smoketest.so"
-# Optional. Hex digest of the library file's bytes, with an optional
-# `sha3-256:` prefix.
-sha3_256 = "abc123..."
-
-[pipeline.plugin.config]
-# Quote a dotted key, or TOML reads it as a nested table.
-"smoketest.multiplier" = "10"
+```kdl,name=The plugin node in a service config
+pipeline {
+    plugin library="/var/lib/pcs/pipelines/libpcs_plugin_smoketest.so" {
+        // Optional. Hex digest of the library file's bytes, with an optional
+        // `sha3-256:` prefix.
+        sha3_256 "abc123..."
+        config "smoketest.multiplier"="10"
+    }
+}
 ```
 
 A relative `library` resolves against the loader base directory. An unknown key
-in the section is a parse error, and setting both `[pipeline.wasm]` and
-`[pipeline.plugin]` fails the build rather than picking one.
+in the node is a parse error, and setting both a `wasm` and a `plugin` node
+fails the build rather than picking one.
 
 Load ordering is fixed: check `pcs_abi_version` against the host's own, verify
 the digest when one is set, call `describe`, decode every component schema, then
@@ -213,7 +213,7 @@ To load one from your own binary, call
 `pcs_service::plugin::NativePluginRuntime::open` with the library path and the
 config map. There is no name argument: the manifest name is authoritative.
 
-```bash
+```bash,name=Build the plugin then load it
 cargo build -p pcs-plugin-smoketest
 cargo run -p pcs-service --features plugin --example native_plugin
 ```
@@ -231,7 +231,7 @@ author a plugin.
 | **Kotlin** | GraalVM, `@CEntryPoint(name = "pcs_abi_version")` | `native-image --shared` |
 
 Python and TypeScript cannot export a C ABI, so both stay on the
-[WebAssembly guest](@/guests/_index.md) path.
+[WebAssembly processor](@/processors/_index.md) path.
 
 `crates/pcs-plugin-abi/include/pcs_plugin.h` is the authority outside Rust. It
 declares every struct and both entry points, and its contract comment carries the

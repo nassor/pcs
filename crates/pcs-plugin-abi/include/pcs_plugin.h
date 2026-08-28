@@ -2,7 +2,7 @@
  * pcs_plugin.h -- the C ABI a PCS native plugin exports.
  *
  * A native plugin is a shared library the host loads with dlopen or
- * LoadLibrary. It mirrors the pcs:pipeline@0.2.0 WIT world a WebAssembly guest
+ * LoadLibrary. It mirrors the pcs:pipeline@0.3.0 WIT world a WebAssembly processor
  * implements: two entry points, four vtable calls, three host callbacks, Arrow
  * IPC bytes as the data plane, one opaque checkpoint blob for state that
  * crosses a batch boundary.
@@ -66,7 +66,7 @@
  * NO PREEMPTION
  *
  * A plugin runs in-process with full host privileges. There is no equivalent of
- * the wasmtime epoch deadline that bounds a WebAssembly guest: a plugin that
+ * the wasmtime epoch deadline that bounds a WebAssembly processor: a plugin that
  * wedges wedges its caller, and one that corrupts memory takes the host with
  * it. The host's only integrity gate is the optional sha3_256 digest in the
  * service config. Plugin paths are operator-trusted.
@@ -95,7 +95,7 @@
  *           A CEntryPoint takes an IsolateThread, so create one isolate in
  *           pcs_plugin_v1 and attach per call.
  *
- * The data plane is the same Arrow IPC framing a WebAssembly guest exchanges,
+ * The data plane is the same Arrow IPC framing a WebAssembly processor exchanges,
  * specified in docs/content/reference/wire-format.md. The five packaged codecs
  * under packages/arrow-ipc-* read and write it with no Arrow dependency.
  */
@@ -110,11 +110,10 @@
 extern "C" {
 #endif
 
-/* major << 16 | minor. The host accepts an equal major and a minor no greater
- * than its own. Minor 1: describe and run_batch became extern "C-unwind" on
- * the Rust side; see UNWINDING above. A minor-0 plugin still loads and
- * behaves exactly as before. */
-#define PCS_ABI_VERSION 0x00010001u
+ * behaves exactly as before. Minor 2 appended routes/has_routes to
+ * PcsRunResult; a minor-1 plugin leaves them zeroed, which the host reads as
+ * "no routing decision", so it loads and behaves exactly as before. */
+#define PCS_ABI_VERSION 0x00010002u
 
 /* PcsStatus values. OK is zero. */
 #define PCS_STATUS_OK 0
@@ -155,7 +154,7 @@ typedef struct {
     uint32_t retries;
 } PcsRunMetrics;
 
-/* sizeof 88, alignof 8 */
+/* sizeof 120, alignof 8 */
 typedef struct {
     /* Arrow IPC bytes for the mutated dataset. Plugin-owned. */
     PcsBuffer output;
@@ -167,6 +166,12 @@ typedef struct {
      * blob. */
     int32_t has_checkpoint;
     PcsRunMetrics metrics;
+    /* UTF-8 JSON array of branch names this batch's output is delivered to.
+     * Plugin-owned. Read only when has_routes is non-zero. A null buffer means
+     * no routing decision (legacy multicast). */
+    PcsBuffer routes;
+    /* Non-zero when routes carries a JSON list. */
+    int32_t has_routes;
 } PcsRunResult;
 
 /* Host capabilities, callable only while a vtable call is in progress.

@@ -34,37 +34,66 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Writes a minimal standalone TOML config to a temp file. `data_dir` keeps each
+/// Writes a minimal standalone config to a temp file. `data_dir` keeps each
 /// test isolated, and `http.bind` uses port 0 so the binary picks an ephemeral
 /// port and prints the address.
 fn write_standalone_config(data_dir: &std::path::Path) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("tempfile");
     let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+
+    // FileSource/FileSink give a real, always-buildable pipeline: the file
+    // exists (or, for the sink, its parent directory does) before the
+    // service ever boots, matching examples/configs/standalone.kdl. A
+    // ChannelSource/ChannelSink pair would need a `name` and a registered
+    // channel bridge, which is beside the point for a boot/HTTP smoke test.
+    let input_path = data_dir.join("smoke-in.csv");
+    std::fs::write(&input_path, "id\n1\n").expect("write input csv");
+    let input_path_str = input_path.to_string_lossy().replace('\\', "/");
+    let output_path_str = data_dir
+        .join("smoke-out.csv")
+        .to_string_lossy()
+        .replace('\\', "/");
+
     write!(
         f,
         r#"
-mode = "standalone"
+mode "standalone"
 
-[node]
-id = 1
-data_dir = "{data_dir_str}"
+node id=1 data_dir="{data_dir_str}"
 
-[run_mode]
-kind = "continuous"
+run_mode kind="continuous"
 
-[http]
-bind = "127.0.0.1:0"
+workflow "smoke" {{
+    transformer "csv_fmt" format="csv" {{
+        options has_headers=#true
+    }}
+    source "in" type="FileSource" component="Ping" transformer="csv_fmt" {{
+        config {{
+            path "{input_path_str}"
+            schema_fields "id" type="int64" nullable=#false
+        }}
+    }}
+    sink "out" type="FileSink" component="Ping" transformer="csv_fmt" {{
+        config {{
+            path "{output_path_str}"
+            schema_fields "id" type="int64" nullable=#false
+        }}
+    }}
+    link from="in" to="out"
+}}
+
+http bind="127.0.0.1:0"
 "#
     )
     .expect("write config");
     f
 }
 
-/// Write a deliberately malformed TOML to a temp file.
+/// Write a deliberately malformed config to a temp file.
 fn write_bad_config() -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("tempfile");
-    // Unclosed bracket, so the TOML parse fails.
-    writeln!(f, "this = [unclosed").expect("write bad config");
+    // Unterminated string, so the KDL parse fails.
+    writeln!(f, "this \"unclosed").expect("write bad config");
     f
 }
 
@@ -129,6 +158,7 @@ fn spawn_serve_and_read_port(
 
 /// Poll `url` with GET until a 200 response or `timeout` elapses.
 async fn poll_until_200(url: &str, timeout: Duration) -> Result<(), String> {
+    pcs_service::service::install_ring_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
@@ -142,6 +172,39 @@ async fn poll_until_200(url: &str, timeout: Duration) -> Result<(), String> {
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!("timed out polling {url} after {timeout:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Poll `url` with GET until the body contains every string in `needles`, or
+/// `timeout` elapses. Returns the last body seen either way.
+async fn poll_until_body_contains(
+    url: &str,
+    needles: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    pcs_service::service::install_ring_provider();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = String::new();
+    loop {
+        if let Ok(resp) = client.get(url).send().await
+            && resp.status().is_success()
+            && let Ok(body) = resp.text().await
+        {
+            if needles.iter().all(|n| body.contains(n)) {
+                return Ok(body);
+            }
+            last = body;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out polling {url} after {timeout:?}; last body:\n{last}"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -254,6 +317,44 @@ async fn test_serve_health_endpoint_returns_200() {
     }
 
     poll_result.expect("/health should return 200 within 5 seconds of startup");
+    assert!(exited, "service should exit within 5 seconds of SIGTERM");
+}
+
+/// `/metrics` must carry series that real code writes, not just descriptors.
+///
+/// `pcs_workflow_runs_total` comes from the standalone runner's iteration
+/// counter and the three service gauges come from the HTTP watchdog tick, so a
+/// body containing all four proves both writers ran.
+#[tokio::test]
+async fn test_metrics_endpoint_exposes_written_series() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config = write_standalone_config(dir.path());
+
+    let (mut guard, addr) = spawn_serve_and_read_port(config.path(), Duration::from_secs(10));
+
+    let metrics_url = format!("http://{addr}/metrics");
+    let expected = [
+        "pcs_workflow_runs_total",
+        "pcs_liveness_counter",
+        "pcs_ready",
+        "pcs_uptime_seconds",
+    ];
+    let body = poll_until_body_contains(&metrics_url, &expected, Duration::from_secs(10)).await;
+
+    terminate_child(&guard.0);
+    let exited = wait_child_timeout(&mut guard.0, Duration::from_secs(5));
+    if !exited {
+        guard.0.kill().ok();
+        guard.0.wait().ok();
+    }
+
+    let body = body.unwrap_or_else(|e| panic!("{e}"));
+    for name in expected {
+        assert!(
+            body.contains(name),
+            "/metrics should carry {name}, body was:\n{body}"
+        );
+    }
     assert!(exited, "service should exit within 5 seconds of SIGTERM");
 }
 

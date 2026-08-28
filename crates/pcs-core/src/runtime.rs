@@ -3,21 +3,61 @@
 //! A host (standalone runner, `DistributedRunner`, service builder) holds
 //! `Box<dyn PipelineRuntime>` instead of a concrete [`Pipeline`]. Two impls exist:
 //! [`Pipeline`] in this crate wraps [`Pipeline::run_on`], and `WasmPipelineRuntime`
-//! in `pcs-service` serializes the dataset to Arrow IPC, calls a guest WASM
+//! in `pcs-service` serializes the dataset to Arrow IPC, calls a processor WASM
 //! component's `run-batch` export via wasmtime, and reads the IPC result back.
 //!
-//! The trait only exists when the `runtime` feature is enabled. Guest builds
-//! (`--no-default-features --features guest`) use [`Pipeline`] directly through
-//! the sync executor in the guest SDK and never construct a `dyn PipelineRuntime`.
+//! The trait only exists when the `runtime` feature is enabled. Processor builds
+//! (`--no-default-features --features processor`) use [`Pipeline`] directly through
+//! the sync executor in the processor SDK and never construct a `dyn PipelineRuntime`.
 
 use async_trait::async_trait;
 
 use crate::{Dataset, PcsResult, Pipeline};
 
+/// What a runtime reports about itself beyond [`PipelineRuntime::name`].
+///
+/// A host holding `Box<dyn PipelineRuntime>` has erased the concrete runtime,
+/// so the out-of-process runtimes' self-description (a processor component's
+/// `describe()` record, a native plugin's manifest) is otherwise unreachable.
+/// This is the one generic way to read it.
+///
+/// A native [`Pipeline`] has no self-description concept beyond
+/// [`PipelineRuntime::name`], so it keeps the empty default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeDescriptorInfo {
+    /// The identity the runtime declares for **itself**, empty when it declares
+    /// none.
+    ///
+    /// Not the same thing as [`PipelineRuntime::name`], which is the name the
+    /// host gave the pipeline: a WASM processor's `describe()` reports the name
+    /// the processor author chose, and that is what identifies which artifact is
+    /// actually loaded.
+    pub name: String,
+    /// Version string the runtime reports, empty when it reports none.
+    pub version: String,
+    /// Whether the runtime carries state across batch boundaries.
+    pub stateful: bool,
+    /// Fingerprint of the runtime's component schemas, empty when it reports
+    /// none.
+    pub schema_fingerprint: String,
+}
+
+/// What a [`PipelineRuntime::run_on_with_state_and_routes`] call produced.
+#[derive(Debug, Default, Clone)]
+pub struct RuntimeOutput {
+    /// Opaque state blob, persisted verbatim — the value
+    /// [`run_on_with_state`](PipelineRuntime::run_on_with_state) returns.
+    pub state: Option<Vec<u8>>,
+    /// Branch names this batch's output is delivered to. `None` preserves
+    /// legacy behaviour: the host multicasts to every downstream link.
+    /// `Some(vec![])` routes the output nowhere.
+    pub routes: Option<Vec<String>>,
+}
+
 /// Swappable host-side execution backend for a single pipeline.
 ///
 /// Host components hold a `Box<dyn PipelineRuntime>` so they can drive either a
-/// native [`Pipeline`] or a WASM guest module through the same call site.
+/// native [`Pipeline`] or a WASM processor module through the same call site.
 ///
 /// Implementations must be `Send` so the box can move between threads. Futures
 /// produced by `run_on` need not be `Send`: the host always drives them to
@@ -55,10 +95,27 @@ pub trait PipelineRuntime: Send {
         Ok(None)
     }
 
+    /// Execute against `data`, carrying opaque state, and return the batch's
+    /// routing decision alongside it.
+    ///
+    /// The default implementation delegates to [`run_on_with_state`](Self::run_on_with_state)
+    /// and reports no routes, which is correct for any runtime that cannot route.
+    async fn run_on_with_state_and_routes(
+        &self,
+        data: &mut Dataset,
+        prior: Option<&[u8]>,
+    ) -> PcsResult<RuntimeOutput> {
+        let state = self.run_on_with_state(data, prior).await?;
+        Ok(RuntimeOutput {
+            state,
+            routes: None,
+        })
+    }
+
     /// Component names this runtime expects to find in the dataset.
     ///
     /// Called at load and validation time only. Hosts use the list to check
-    /// `target_component` / `source_component` declarations in TOML config
+    /// `target_component` / `source_component` declarations in the config file
     /// against the components the runtime handles, before the first `run_on`
     /// call.
     ///
@@ -66,6 +123,15 @@ pub trait PipelineRuntime: Send {
     /// validate internally.
     fn declared_components(&self) -> Vec<&str> {
         Vec::new()
+    }
+
+    /// What this runtime reports about itself beyond its name.
+    ///
+    /// Called by status and inspection surfaces, never on the execution path.
+    /// The default returns an empty [`RuntimeDescriptorInfo`], which is what a
+    /// runtime with no separate self-description has to report.
+    fn descriptor_info(&self) -> RuntimeDescriptorInfo {
+        RuntimeDescriptorInfo::default()
     }
 
     /// Return a schema-only, empty [`Dataset`] matching this runtime's components.
@@ -77,7 +143,7 @@ pub trait PipelineRuntime: Send {
     ///
     /// There is no default body: a schemaless fallback would surface later as an
     /// opaque `ensure_plan` failure. A runtime that cannot build a valid template
-    /// (e.g. corrupted guest describe) must fail in its constructor instead.
+    /// (e.g. corrupted processor describe) must fail in its constructor instead.
     fn template_dataset(&self) -> Dataset;
 }
 
@@ -142,6 +208,19 @@ mod tests {
         let p = Pipeline::new("example");
         let rt: &dyn PipelineRuntime = &p;
         assert_eq!(rt.name(), "example");
+    }
+
+    #[test]
+    fn descriptor_info_defaults_to_empty_for_native_pipeline() {
+        let p = Pipeline::new("example");
+        let rt: Box<dyn PipelineRuntime> = Box::new(p);
+        let info = rt.descriptor_info();
+        assert_eq!(
+            info,
+            RuntimeDescriptorInfo::default(),
+            "a native pipeline declares no identity of its own beyond name()"
+        );
+        assert_eq!(rt.name(), "example", "name() is still the host's name");
     }
 
     #[test]

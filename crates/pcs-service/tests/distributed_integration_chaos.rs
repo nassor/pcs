@@ -2,7 +2,7 @@
 //! injection. Requires Docker and Toxiproxy, and runs for about 70 seconds.
 //!
 //! ```bash
-//! cargo test --features distributed-raft,io \
+//! cargo test --features distributed-raft \
 //!     --test distributed_integration_chaos -- --ignored --nocapture
 //! ```
 //!
@@ -20,6 +20,7 @@ mod common;
 
 #[cfg(feature = "distributed-raft")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spins up a 5-node Raft cluster behind Toxiproxy and chaos-injects faults for ~70-100s"]
 async fn full_stack_chaos_monkey_60s() {
     use std::sync::Arc;
     use std::time::Duration;

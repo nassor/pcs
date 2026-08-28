@@ -60,6 +60,7 @@ fn config(run_mode: RunMode) -> ServiceConfig {
             links: Vec::new(),
         }],
         http: HttpConfig::default(),
+        store: None,
         observability: ObservabilityConfig::default(),
     }
 }
@@ -173,6 +174,7 @@ async fn routing_processor_delivers_only_to_the_selected_branch() {
         &config(RunMode::OneShot),
         CancellationToken::new(),
         None,
+        None,
     )
     .await
     .expect("run succeeds");
@@ -202,6 +204,7 @@ async fn routing_processor_can_fan_to_several_branches() {
         &config(RunMode::OneShot),
         CancellationToken::new(),
         None,
+        None,
     )
     .await
     .expect("run succeeds");
@@ -221,6 +224,7 @@ async fn legacy_processor_without_routes_multicasts_to_every_labelled_edge() {
         &config(RunMode::OneShot),
         CancellationToken::new(),
         None,
+        None,
     )
     .await
     .expect("run succeeds");
@@ -236,7 +240,7 @@ async fn stream_routing_processor_delivers_to_the_selected_branch() {
     tx.send(three_row_batch()).await.expect("send item");
     drop(tx); // EOF
 
-    run_stream(built, CancellationToken::new(), None)
+    run_stream(built, CancellationToken::new(), None, None)
         .await
         .expect("run succeeds");
 

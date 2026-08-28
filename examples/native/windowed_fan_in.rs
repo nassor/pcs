@@ -303,6 +303,7 @@ async fn main() -> Result<(), PcsError> {
             sinks: Vec::new(),
             links: Vec::new(),
         }],
+        store: None,
         http: HttpConfig::default(),
         observability: ObservabilityConfig::default(),
     };
@@ -315,7 +316,7 @@ async fn main() -> Result<(), PcsError> {
         inspector: None,
     };
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None).await?;
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None).await?;
     println!();
     println!(
         "iterations: {} · rows in: {} · sink batches: {}",

@@ -786,6 +786,7 @@ mod tests {
             },
             workflows: vec![workflow],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         }
     }
@@ -971,6 +972,7 @@ mod tests {
             },
             workflows: vec![empty_workflow("a"), empty_workflow("b")],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         };
 

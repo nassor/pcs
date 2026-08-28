@@ -29,8 +29,6 @@ use uuid::Uuid;
 
 use crate::PcsResult;
 use crate::distributed::checkpoint::{CheckpointStore, PROCESSOR_STATE_STAGE_SENTINEL};
-use crate::distributed::partition::MAX_LOG_ENTRY_BYTES;
-
 /// Load the runtime state blob written under `prior_claim_id`.
 ///
 /// Returns `Ok(None)` on the first run, when no checkpoint has been written
@@ -63,8 +61,9 @@ pub async fn load_processor_state(
 /// # Errors
 ///
 /// Returns [`PcsError::Configuration`](crate::PcsError::Configuration) if the
-/// blob is at or above [`MAX_LOG_ENTRY_BYTES`], which the Raft propose boundary
-/// would reject anyway.
+/// blob is at or above the store's
+/// [`max_checkpoint_bytes`](CheckpointStore::max_checkpoint_bytes) cap, which
+/// the Raft propose boundary would reject anyway.
 pub async fn save_processor_state(
     store: &(impl CheckpointStore + ?Sized),
     claim_id: Uuid,
@@ -77,12 +76,12 @@ pub async fn save_processor_state(
         return Ok(());
     }
 
-    if blob.len() >= MAX_LOG_ENTRY_BYTES {
+    let cap = store.max_checkpoint_bytes();
+    if blob.len() >= cap {
         return Err(PcsError::configuration(format!(
-            "processor state blob size {} bytes exceeds MAX_LOG_ENTRY_BYTES {} — \
+            "processor state blob size {} bytes exceeds the store cap {cap} — \
              reduce the runtime's retained state or shorten batches",
             blob.len(),
-            MAX_LOG_ENTRY_BYTES
         )));
     }
 
@@ -233,12 +232,12 @@ mod tests {
     #[tokio::test]
     async fn save_rejects_an_oversized_blob() {
         let store = MemStore::default();
-        let blob = vec![0u8; MAX_LOG_ENTRY_BYTES];
+        let blob = vec![0u8; store.max_checkpoint_bytes()];
         let err = save_processor_state(&store, claim(), &blob, 1)
             .await
             .expect_err("oversized blob must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("MAX_LOG_ENTRY_BYTES"), "got: {msg}");
+        assert!(msg.contains("store cap"), "got: {msg}");
     }
 
     #[tokio::test]

@@ -22,8 +22,11 @@
 //! - **State carry.** The blob returned by a processor's `run_on_with_state` is
 //!   fed back as `prior` on the next item for that same processor, so
 //!   processor state survives across items even though the WASM store does
-//!   not. One blob per processor node; the blobs live in loop memory only and
-//!   are never checkpointed, so they are lost on restart.
+//!   not. One blob per processor node; the blobs live in loop memory and, with
+//!   no store configured, are never checkpointed, so they are lost on
+//!   restart. With a `store "tikv" { … }` block, priors and source cursors
+//!   persist between runs and a restarted service resumes from its last save
+//!   point.
 //! - **At-most-once.** An item whose processor call fails drops that
 //!   processor's fan-out for the item (logged and counted); `prior` is left
 //!   untouched so the next item resumes from the last good state.
@@ -51,6 +54,7 @@ use pcs_core::runtime::PipelineRuntime;
 
 use super::builder::{BuiltNodeKind, BuiltService};
 use super::standalone::{NodeRunStats, StandaloneStats};
+use super::tikv_state::{SourceCursorMeta, TikvStateClient};
 #[cfg(feature = "windows")]
 use super::windowing::WindowTracker;
 
@@ -73,6 +77,13 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 /// Backoff after a source error, so a permanently failing source cannot spin
 /// the loop at full speed.
 const SOURCE_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+/// Unix milliseconds now (wall clock), for persisted cursor timestamps.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Drive a [`BuiltService`] in stream mode: one workflow pass per arriving
 /// source batch.
@@ -93,6 +104,7 @@ pub async fn run_stream(
     built: BuiltService,
     cancel: CancellationToken,
     live_stats: Option<Arc<RwLock<StandaloneStats>>>,
+    tikv: Option<Arc<TikvStateClient>>,
 ) -> Result<StandaloneStats, PcsError> {
     let source_count = built
         .nodes
@@ -184,6 +196,34 @@ pub async fn run_stream(
     let mut exhausted: Vec<bool> = vec![false; n];
     let mut remaining_sources = source_indices.len();
     let mut source_cursor = 0usize;
+    // Items delivered per source, tracked so a persisted cursor can name the
+    // exact count at the last save point.
+    let mut items_per_source: Vec<u64> = vec![0; n];
+
+    // Resume persisted state when a store is configured: processor priors
+    // and source cursors come back from TiKV so a restart continues from the
+    // last save point. Errors abort startup — a store that cannot be read
+    // must not silently restart from zero.
+    if let Some(client) = &tikv {
+        for i in 0..n {
+            if matches!(kinds[i], NodeRunKind::Processor) {
+                prior[i] = client.load_prior(&workflow_id, &ids[i]).await?;
+            }
+        }
+        for &si in &source_indices {
+            if let Some(meta) = client.load_source_cursor(&workflow_id, &ids[si]).await? {
+                items_per_source[si] = meta.items_processed;
+                #[cfg(feature = "tracing")]
+                tracing::info!(
+                    source = %ids[si],
+                    items = meta.items_processed,
+                    "resuming source from persisted cursor"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = meta;
+            }
+        }
+    }
 
     #[cfg(feature = "tracing")]
     tracing::info!(
@@ -263,6 +303,29 @@ pub async fn run_stream(
         node_stats[source_index].batches += 1;
         crate::metrics::instruments().source_batch(&ids[source_index]);
         crate::metrics::instruments().rows(&ids[source_index], rows);
+        // Persist the source cursor so a restart resumes from here. Best
+        // effort: memory stays authoritative and an at-least-once source
+        // covers a missed write with one replay.
+        items_per_source[source_index] += 1;
+        if let Some(client) = &tikv {
+            let meta = SourceCursorMeta {
+                items_processed: items_per_source[source_index],
+                last_batch_at_ms: wall_clock_ms(),
+            };
+            if let Err(_e) = client
+                .save_source_cursor(&workflow_id, &ids[source_index], meta)
+                .await
+            {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    source = %ids[source_index],
+                    error = %_e,
+                    "persisting source cursor failed (continuing; at-least-once replay covers it)"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = _e;
+            }
+        }
 
         // Fan out the source item exactly like a batch-mode source drain.
         let component = components[source_index].expect("the stream source declares a component");
@@ -372,6 +435,24 @@ pub async fn run_stream(
                             // means the processor carries no state, so it
                             // must clear `prior` too.
                             prior[i] = out.state;
+                            if let Some(client) = &tikv {
+                                let result = match &prior[i] {
+                                    Some(blob) => {
+                                        client.save_prior(&workflow_id, &ids[i], blob).await
+                                    }
+                                    None => client.delete_prior(&workflow_id, &ids[i]).await,
+                                };
+                                if let Err(_e) = result {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::warn!(
+                                        processor = %ids[i],
+                                        error = %_e,
+                                        "persisting processor state failed (continuing)"
+                                    );
+                                    #[cfg(not(feature = "tracing"))]
+                                    let _ = _e;
+                                }
+                            }
                             let rows_out = datasets[i]
                                 .as_ref()
                                 .expect("processor node keeps its dataset")

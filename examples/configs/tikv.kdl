@@ -1,0 +1,64 @@
+// PCS standalone service configuration backed by a TiKV store.
+//
+// Run (needs a local PD + TiKV; see the manual smoke recipe in the plan):
+//   cargo run --features tikv-store,connector-file,transformer-csv --bin pcs-service -- validate \
+//     --config examples/configs/tikv.kdl
+//   cargo run --features tikv-store,connector-file,transformer-csv --bin pcs-service -- serve \
+//     --config examples/configs/tikv.kdl
+//
+// With the `store` block present, `serve` persists the raw config file to
+// TiKV before the pipeline builds, stream-mode source cursors and processor
+// priors are written back as items flow, and a restarted service resumes from
+// its last save point.
+//
+// The pipeline reads examples/configs/fixtures/orders.csv and writes
+// /tmp/pcs-tikv-orders-out.csv. If you change that path, create the parent
+// directory first.
+
+mode "standalone"
+
+node id=1 name="pcs-tikv" data_dir="${PCS_DATA_DIR:-/tmp/pcs-tikv}"
+
+// TiKV persistent store. `pd_endpoints` names the PD cluster; everything this
+// store writes is namespaced under `key_prefix`. Interval/one-shot processor
+// state carry is opt-in via `batch_resume #true`.
+store "tikv" {
+    pd_endpoints "127.0.0.1:2379"
+    key_prefix "pcs-smoke"
+}
+
+// Stream mode: one workflow pass per arriving batch, no pacing timer.
+run_mode kind="stream"
+
+workflow "orders" {
+    transformer "csv_fmt" format="csv" {
+        options has_headers=#true
+    }
+
+    // Stream-mode sources are live (never reach EOF by themselves); this
+    // one-shot file source simply terminates after the file is drained.
+    source "csv_orders" type="FileSource" component="orders" transformer="csv_fmt" {
+        config {
+            path "examples/configs/fixtures/orders.csv"
+            schema_fields "id" type="Int64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#true
+            schema_fields "status" type="Utf8" nullable=#true
+        }
+    }
+
+    sink "csv_out" type="FileSink" component="orders" transformer="csv_fmt" {
+        config {
+            path "/tmp/pcs-tikv-orders-out.csv"
+            truncate #true
+            schema_fields "id" type="Int64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#true
+            schema_fields "status" type="Utf8" nullable=#true
+        }
+    }
+
+    link from="csv_orders" to="csv_out"
+}
+
+http bind="127.0.0.1:0" disabled=#false
+
+observability log_format="pretty" log_level="info"

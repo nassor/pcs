@@ -102,6 +102,7 @@ fn config() -> ServiceConfig {
             links: Vec::new(),
         }],
         http: HttpConfig::default(),
+        store: None,
         observability: ObservabilityConfig::default(),
     }
 }
@@ -212,7 +213,7 @@ async fn plugin_routing_processor_delivers_to_the_selected_branch() {
     tx.send(batch).await.expect("send batch");
     drop(tx);
 
-    run_standalone(built, &config(), CancellationToken::new(), None)
+    run_standalone(built, &config(), CancellationToken::new(), None, None)
         .await
         .expect("run succeeds");
 

@@ -185,6 +185,7 @@ mod tests {
             },
             workflows: vec![make_workflow(sources, sinks)],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         }
     }

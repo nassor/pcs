@@ -14,11 +14,9 @@
 #![cfg(feature = "distributed-raft")]
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use pcs_service::distributed::consensus::driver::{
     ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
 };
@@ -365,8 +363,8 @@ impl RaftClusterHarness {
                 listen_addr,
                 peers: peer_maps[i].clone(),
                 heartbeat_interval_ms: 50,
-                election_timeout_min_ms: 300,
-                election_timeout_max_ms: 500,
+                election_timeout_ms: 400,
+                snapshot_log_interval: 1000,
             };
             let (handle, task) = ArrowRaftDriver::start(
                 config,
@@ -383,21 +381,8 @@ impl RaftClusterHarness {
             });
         }
 
-        if n > 1 {
-            let members: BTreeMap<u64, BasicNode> = listen_addrs
-                .iter()
-                .enumerate()
-                .map(|(i, addr)| {
-                    (
-                        i as u64 + 1,
-                        BasicNode {
-                            addr: addr.to_string(),
-                        },
-                    )
-                })
-                .collect();
-            nodes[0].handle.initialize(members).await?;
-        }
+        // Membership is static: each driver seeds its conf state from its
+        // configured peers on first boot, so no initialize call is needed.
 
         Ok(Self {
             nodes,
@@ -411,7 +396,7 @@ impl RaftClusterHarness {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             for node in &self.nodes {
-                if let Some(leader_id) = node.handle.metrics().current_leader {
+                if let Some(leader_id) = node.handle.metrics().leader_id {
                     return Ok(leader_id);
                 }
             }
@@ -442,12 +427,13 @@ impl RaftClusterHarness {
 
     /// Last-applied log index for a node (None if nothing applied yet).
     pub fn last_applied(&self, node_id: u64) -> Option<u64> {
-        self.nodes
+        let applied = self
+            .nodes
             .get((node_id - 1) as usize)?
             .handle
             .metrics()
-            .last_applied
-            .map(|lid| lid.index)
+            .applied_index;
+        (applied > 0).then_some(applied)
     }
 
     /// Access the Toxiproxy client for injecting faults.
@@ -467,7 +453,7 @@ impl RaftClusterHarness {
     pub fn max_term(&self) -> u64 {
         self.nodes
             .iter()
-            .map(|n| n.handle.metrics().current_term)
+            .map(|n| n.handle.metrics().term)
             .max()
             .unwrap_or(0)
     }

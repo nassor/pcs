@@ -1,5 +1,5 @@
-//! openraft type configuration and consensus command/response types for PCS's
-//! Arrow-IPC distributed consensus layer.
+//! Consensus command and response types for PCS's Arrow-IPC distributed
+//! consensus layer.
 //!
 //! ## Log entry size contract
 //!
@@ -10,9 +10,8 @@
 //!
 //! ## Serialization
 //!
-//! [`ConsensusCommand`] and [`ConsensusResponse`] are the openraft `D` and `R` types
-//! for [`PcsTypeConfig`]: openraft presents them directly to `RaftLogStorage` /
-//! `RaftStateMachine` without an intermediate string encoding. Persistence uses
+//! [`ConsensusCommand`] and [`ConsensusResponse`] are the application payloads
+//! carried verbatim in the Raft log as `Entry.data` bytes. Persistence uses
 //! `postcard` (see `storage.rs`), which is canonical by construction: stable byte
 //! output for equal inputs, no JSON map-ordering ambiguity, no UTF-8 encoding cost.
 //! Raft determinism depends on it, because two replicas applying the same committed
@@ -28,21 +27,6 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(feature = "distributed-raft")]
-openraft::declare_raft_types!(
-    /// openraft type configuration parameterised for PCS's Arrow-IPC consensus.
-    ///
-    /// `D = ConsensusCommand` and `R = ConsensusResponse` let openraft carry the
-    /// application types directly, with no intermediate JSON string encoding on the
-    /// `client_write` path or the apply path. Log-entry persistence uses `postcard`
-    /// (see `storage.rs`) for canonical, compact binary encoding.
-    pub PcsTypeConfig:
-        D = ConsensusCommand,
-        R = ConsensusResponse,
-        NodeId = u64,
-        Node = openraft::BasicNode,
-);
-
 /// A command that can be committed through Raft and applied to the state machine.
 ///
 /// Persistence uses `postcard` (see `storage.rs`). Arrow IPC payloads
@@ -56,7 +40,7 @@ openraft::declare_raft_types!(
 /// time. Apply handlers never read `SystemTime`, so followers replaying the same
 /// committed entry compute byte-identical state. The field is `#[serde(default)]`, so
 /// postcard-encoded entries that omit it still decode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsensusCommand {
     /// Register a new master RecordBatch in the replicated state.
     ///
@@ -143,7 +127,7 @@ pub enum ConsensusCommand {
 }
 
 /// Return value from applying a [`ConsensusCommand`] to the state machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsensusResponse {
     /// Master batch registered successfully.
     MasterBatchRegistered { batch_id: u64 },
@@ -207,8 +191,7 @@ pub fn row_range(start: u32, end: u32) -> Range<u32> {
 }
 
 impl std::fmt::Display for ConsensusCommand {
-    /// Concise, non-allocating summary suitable for Raft log tracing, required by the
-    /// openraft `AppData` bound.
+    /// Concise, non-allocating summary suitable for Raft log tracing.
     ///
     /// Omits `ipc_bytes` payloads: they reach 1 MiB and must not end up in log or
     /// trace output. The variant tag plus identifying keys is enough for operational

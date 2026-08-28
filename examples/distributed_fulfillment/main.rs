@@ -177,8 +177,8 @@ async fn main() -> PcsResult<()> {
         listen_addr: args.listen,
         peers: args.peers.clone(),
         heartbeat_interval_ms: 50,
-        election_timeout_min_ms: 150,
-        election_timeout_max_ms: 300,
+        election_timeout_ms: 300,
+        snapshot_log_interval: 10_000,
     };
 
     let log_db = args.data_dir.join("raft_log.redb");
@@ -190,24 +190,9 @@ async fn main() -> PcsResult<()> {
     // Raft RPCs has to be started separately.
     let _tcp_server = raft_handle.spawn_tcp_server(args.listen);
 
+    // Membership is static: each driver seeds its conf state from its peers on
+    // first boot, so the bootstrap flag only marks the data directory.
     if args.bootstrap {
-        use openraft::BasicNode;
-        let mut members = std::collections::BTreeMap::new();
-        members.insert(
-            args.node_id,
-            BasicNode {
-                addr: args.listen.to_string(),
-            },
-        );
-        for (peer_id, peer_addr) in &args.peers {
-            members.insert(
-                *peer_id,
-                BasicNode {
-                    addr: peer_addr.to_string(),
-                },
-            );
-        }
-        raft_handle.initialize(members).await?;
         #[cfg(feature = "tracing")]
         tracing::info!(node_id = args.node_id, "Raft cluster initialized");
     }
@@ -370,11 +355,11 @@ async fn wait_for_leader(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let metrics = handle.metrics();
-        if metrics.current_leader.is_some() && metrics.last_applied.is_some() {
+        if metrics.leader_id.is_some() && metrics.applied_index > 0 {
             #[cfg(feature = "tracing")]
             tracing::info!(
-                leader = ?metrics.current_leader,
-                last_applied = ?metrics.last_applied,
+                leader = ?metrics.leader_id,
+                last_applied = metrics.applied_index,
                 "cluster has leader"
             );
             return Ok(());

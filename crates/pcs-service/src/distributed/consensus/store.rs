@@ -409,19 +409,6 @@ impl RedbSharedStore {
             Self::MultiNode(m) => m.load_checkpoint_record(claim_id, stage_idx).await,
         }
     }
-
-    /// Schema fingerprint recorded by any persisted data checkpoint on this
-    /// node, or `Ok(None)` when the node has no persisted state yet.
-    ///
-    /// Used at startup to refuse a redeployed pipeline whose schema fingerprint does
-    /// not match the state it would resume against.
-    pub async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
-        match self {
-            Self::SingleNode(s) => s.persisted_schema_id().await,
-            #[cfg(feature = "distributed-raft")]
-            Self::MultiNode(m) => m.persisted_schema_id().await,
-        }
-    }
 }
 
 #[async_trait]
@@ -608,6 +595,19 @@ impl CheckpointStore for RedbSharedStore {
             schema_id: r.schema_id,
             created_at: r.created_at,
         }))
+    }
+
+    /// Schema fingerprint recorded by any persisted data checkpoint on this
+    /// node, or `Ok(None)` when the node has no persisted state yet.
+    ///
+    /// Used at startup to refuse a redeployed pipeline whose schema
+    /// fingerprint does not match the state it would resume against.
+    async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
+        match self {
+            Self::SingleNode(s) => s.persisted_schema_id().await,
+            #[cfg(feature = "distributed-raft")]
+            Self::MultiNode(m) => m.persisted_schema_id().await,
+        }
     }
 }
 

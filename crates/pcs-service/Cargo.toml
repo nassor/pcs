@@ -20,6 +20,8 @@ homepage.workspace = true
 # defaulting it would break `cargo install` on a machine without cmake.
 # `distributed-raft` and `service-cluster` stay opt-in too — a cluster node is
 # a deliberate deployment choice, not a default.
+# `tikv-store` stays opt-in like `connector-kafka`: tikv-client pulls tonic
+# and prost, so defaulting it would inflate the install graph.
 default = [
     "mimalloc",
     "service",
@@ -61,7 +63,11 @@ distributed = [
     "pcs-core/distributed",
     "pcs-core/runtime",
 ]
-distributed-raft = ["distributed", "dep:openraft", "dep:futures-util", "dep:postcard"]
+distributed-raft = ["distributed", "dep:raft", "dep:postcard", "dep:prost"]
+# TiKV persistent layer: config/cursor/window-state persistence plus a
+# `TikvSharedStore` backing the distributed runner. tikv-client brings tonic
+# and prost, hence opt-in like `connector-kafka`.
+tikv-store = ["distributed", "dep:tikv-client", "dep:postcard"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha3", "pcs-core/runtime"]
 # Native plugin host: dlopen a shared library exporting the pcs-plugin-abi C
 # ABI. `sha3` is the optional content digest for the library file, the same
@@ -164,7 +170,6 @@ pcs-transformer-parquet = { path = "../pcs-transformer-parquet", version = "0.1.
 async-trait   = { workspace = true }
 tokio         = { workspace = true }
 futures       = { workspace = true }
-futures-util  = { workspace = true, optional = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true, optional = true }
 serde_bytes   = { workspace = true, optional = true }
@@ -180,12 +185,14 @@ libloading    = { workspace = true, optional = true }
 base64        = { workspace = true, optional = true }
 
 redb          = { version = "4.2.0", optional = true }
-# `version` is required for `cargo package`/`publish` (a bare git dependency
-# is rejected); it is a caret floor, not an exact pin, so it tolerates the
-# `release-0.10` branch moving forward to a newer 0.10.0-alpha.N build while
-# still requiring the git-resolved crate to actually be a 0.10.0 pre-release.
-# Switch to a plain `version` (dropping `git`/`branch`) once 0.10.0 stabilizes.
-openraft      = { git = "https://github.com/databendlabs/openraft", branch = "release-0.10", version = "0.10.0-alpha.34", features = ["serde"], optional = true }
+# Consensus core only: the host drives a RawNode, persists the log, and ships
+# Ready messages. `prost-codec` uses prost 0.11 for the wire Entry/Message
+# encoding; `default-logger` gives raft's log output without env_logger.
+raft          = { version = "0.7", default-features = false, features = ["prost-codec", "default-logger"], optional = true }
+prost         = { version = "0.11", optional = true }
+# TiKV raw client. `default-features = false` drops the prometheus push/process
+# deps. Not yet production-stable upstream; pinned by Cargo.lock.
+tikv-client   = { version = "0.4", default-features = false, optional = true }
 postcard      = { version = "1.1", default-features = false, features = ["alloc"], optional = true }
 hex           = { version = "0.4.3", optional = true }
 pcs-config    = { path = "../pcs-config", version = "0.1.0", optional = true }
@@ -368,7 +375,7 @@ tokio         = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid          = { workspace = true }
 redb          = { version = "4.2.0" }
-openraft      = { git = "https://github.com/databendlabs/openraft", branch = "release-0.10", features = ["serde"] }
+raft          = { version = "0.7", default-features = false, features = ["prost-codec", "default-logger"] }
 tokio-util    = { workspace = true }
 reqwest       = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "blocking"] }
 testcontainers = "0.28"

@@ -155,6 +155,10 @@ where
         // `processor_state_store` for why the pointer is chained rather than derived from a
         // stable partition key.
         let mut state_claim_id: Option<Uuid> = None;
+        // Note: a *process restart* still re-claims with fresh UUIDs, so
+        // cross-restart accumulator resume stays claim-granular (unchanged
+        // redb-era semantics); within a run, chaining now works.
+        let mut accumulator_claim_id: Option<Uuid> = None;
 
         loop {
             if let Some(max) = self.config.max_batches
@@ -218,39 +222,45 @@ where
                 use crate::distributed::accumulator_store::load_accumulator_state;
                 use crate::windows::accumulator::WindowAccumulator;
 
-                match load_accumulator_state(&self.store, &claim).await {
-                    Ok(Some(batch)) => {
-                        if partition_data
-                            .batch_for(WindowAccumulator::name())
-                            .is_some()
-                        {
-                            let rows =
-                                WindowAccumulator::from_record_batch(&batch).map_err(|e| {
-                                    PcsError::generic(format!(
-                                        "DistributedRunner: failed to decode accumulator: {e}"
-                                    ))
-                                })?;
-                            partition_data
-                                .append::<WindowAccumulator>(&rows)
-                                .map_err(|e| {
-                                    PcsError::generic(format!(
-                                        "DistributedRunner: failed to restore accumulator rows: {e}"
-                                    ))
-                                })?;
+                // Load under the claim that last wrote an accumulator
+                // checkpoint, mirroring the processor-state chain; a fresh
+                // claim starts cold — its own id has no checkpoint yet.
+                match accumulator_claim_id {
+                    None => {}
+                    Some(prior_id) => match load_accumulator_state(&self.store, prior_id).await {
+                        Ok(Some(batch)) => {
+                            if partition_data
+                                .batch_for(WindowAccumulator::name())
+                                .is_some()
+                            {
+                                let rows =
+                                    WindowAccumulator::from_record_batch(&batch).map_err(|e| {
+                                        PcsError::generic(format!(
+                                            "DistributedRunner: failed to decode accumulator: {e}"
+                                        ))
+                                    })?;
+                                partition_data
+                                        .append::<WindowAccumulator>(&rows)
+                                        .map_err(|e| {
+                                            PcsError::generic(format!(
+                                                "DistributedRunner: failed to restore accumulator rows: {e}"
+                                            ))
+                                        })?;
+                            }
                         }
-                    }
-                    Ok(None) => {}
-                    Err(_e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            parent: &batch_span,
-                            claim_id = %claim.claim_id,
-                            error = %_e,
-                            "accumulator load failed; releasing claim for retry"
-                        );
-                        Self::release_with_log(&self.store, &claim).await;
-                        continue;
-                    }
+                        Ok(None) => {}
+                        Err(_e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                parent: &batch_span,
+                                claim_id = %claim.claim_id,
+                                error = %_e,
+                                "accumulator load failed; releasing claim for retry"
+                            );
+                            Self::release_with_log(&self.store, &claim).await;
+                            continue;
+                        }
+                    },
                 }
             }
 
@@ -402,17 +412,22 @@ where
             #[cfg(all(feature = "windows", feature = "distributed"))]
             if run_error.is_none() && !claim_released {
                 use crate::distributed::accumulator_store::save_accumulator_state;
-                if let Err(e) = save_accumulator_state(&self.store, &claim, &partition_data).await {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        parent: &batch_span,
-                        claim_id = %claim.claim_id,
-                        error = %e,
-                        "accumulator save failed; releasing claim for retry"
-                    );
-                    Self::release_with_log(&self.store, &claim).await;
-                    claim_released = true;
-                    run_error = Some(e);
+                match save_accumulator_state(&self.store, claim.claim_id, &partition_data).await {
+                    // Advance the chain only once the save is durable, same
+                    // contract as the processor-state pointer below.
+                    Ok(()) => accumulator_claim_id = Some(claim.claim_id),
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            parent: &batch_span,
+                            claim_id = %claim.claim_id,
+                            error = %e,
+                            "accumulator save failed; releasing claim for retry"
+                        );
+                        Self::release_with_log(&self.store, &claim).await;
+                        claim_released = true;
+                        run_error = Some(e);
+                    }
                 }
             }
 
@@ -921,6 +936,128 @@ mod tests {
         let processed = runner.run(world_factory).await.unwrap();
         assert_eq!(processed, 2);
         assert_eq!(run_count.load(Ordering::Relaxed), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+    /// Chain-carry proof: the second claim must load the accumulator rows the
+    /// first claim wrote (load under the *prior* claim id, not the fresh one),
+    /// and both claims must leave their own checkpoint in the store.
+    #[cfg(feature = "windows")]
+    #[tokio::test]
+    async fn test_accumulator_values_carry_across_claims() {
+        use crate::component::Component as _;
+        use crate::windows::accumulator::WindowAccumulator;
+        use redb::ReadableDatabase;
+        use redb::ReadableTable as _;
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let path = temp_path();
+        let store = RedbSharedStore::single_node(&path).unwrap();
+
+        let seed_db = match &store {
+            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
+            #[cfg(feature = "distributed-raft")]
+            _ => panic!("expected SingleNode"),
+        };
+
+        // Two batches → two claims, one per claim pass. Each claim pass is a
+        // separate world, so only the chained accumulator can carry rows
+        // from the first claim to the second.
+        for batch_id in 0u64..2 {
+            sm_apply(
+                &seed_db,
+                ConsensusCommand::RegisterMasterBatch {
+                    batch_id,
+                    component: "test".to_string(),
+                    schema_id: 1,
+                    ipc_bytes: vec![0u8; 64],
+                    total_rows: 10,
+                    now_at_propose: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        // The system records how many accumulator rows the dataset held at
+        // entry (the restored prior state) and appends one more, with a
+        // distinct window_id per run.
+        let run_count = StdArc::new(AtomicU32::new(0));
+        let entry_rows = StdArc::new(StdMutex::new(Vec::<u64>::new()));
+        let run_count_clone = StdArc::clone(&run_count);
+        let entry_rows_clone = StdArc::clone(&entry_rows);
+
+        let mut pipeline = Pipeline::new("test");
+        pipeline.add_system(system_fn(
+            SystemMeta::new("append_accumulator"),
+            move |data: &mut Dataset| {
+                entry_rows_clone.lock().unwrap().push(data.rows() as u64);
+                let run = run_count_clone.fetch_add(1, Ordering::Relaxed);
+                if data.batch_for(WindowAccumulator::name()).is_some() {
+                    let row = WindowAccumulator {
+                        version: Some(1),
+                        source_component: "test".to_string(),
+                        window_id: run as i64,
+                        key_hash: 0,
+                        count: 1,
+                        sum_f64: Some(run as f64 + 1.0),
+                        min_f64: None,
+                        max_f64: None,
+                        session_start_ts: None,
+                        session_end_ts: None,
+                        finalized_at_watermark: None,
+                    };
+                    data.append::<WindowAccumulator>(&[row]).unwrap();
+                }
+                Ok(())
+            },
+        ));
+
+        let world_factory = || {
+            let mut d = Dataset::new();
+            d.register_component::<WindowAccumulator>().unwrap();
+            d
+        };
+
+        let config = RunnerConfig {
+            max_batches: Some(2),
+            checkpoint_strategy: CheckpointStrategy::None,
+            ..Default::default()
+        };
+        let runner = DistributedRunner::new(store, Box::new(pipeline), config);
+        let processed = runner.run(world_factory).await.unwrap();
+        assert_eq!(processed, 2);
+        assert_eq!(run_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            entry_rows.lock().unwrap().as_slice(),
+            &[0, 1],
+            "the second claim must start from the first claim's accumulator rows"
+        );
+
+        // Store-level: both claims left an accumulator checkpoint, the second
+        // carrying the first's row plus its own (1 row and 2 rows).
+        let txn = seed_db.begin_read().unwrap();
+        let checkpoints: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("arrow_checkpoints");
+        let table = txn.open_table(checkpoints).unwrap();
+        let mut checkpoint_row_counts: Vec<u64> = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (_, value) = entry.unwrap();
+            let record: crate::distributed::consensus::state_machine::CheckpointRecord =
+                serde_json::from_slice(value.value()).expect("decode checkpoint record");
+            let dataset = Dataset::read_ipc(&mut record.ipc_bytes.as_slice())
+                .expect("checkpoint payload is single-component IPC");
+            if let Some(batch) = dataset.batch_for(WindowAccumulator::name()) {
+                checkpoint_row_counts.push(batch.num_rows() as u64);
+            }
+        }
+        checkpoint_row_counts.sort_unstable();
+        assert_eq!(
+            checkpoint_row_counts,
+            vec![1, 2],
+            "claim 1 persists 1 row; claim 2 persists claim 1's row plus its own"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

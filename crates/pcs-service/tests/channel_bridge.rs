@@ -122,8 +122,8 @@ async fn a_channel_sink_in_one_workflow_bridges_to_a_channel_source_in_another()
     let producer = built.remove(0);
 
     let results = futures::future::join_all([
-        run_standalone(producer, &config, CancellationToken::new(), None),
-        run_standalone(consumer, &config, CancellationToken::new(), None),
+        run_standalone(producer, &config, CancellationToken::new(), None, None),
+        run_standalone(consumer, &config, CancellationToken::new(), None, None),
     ])
     .await;
     let mut results = results.into_iter();

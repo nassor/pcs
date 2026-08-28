@@ -3,7 +3,7 @@
 //! `dump_state` reads every table into owned records for Arrow IPC
 //! serialization; `restore_state` replaces the current state with a dump and
 //! rebuilds the `arrow_claims_by_batch` secondary index, optionally writing the
-//! openraft watermarks in the same commit.
+//! raft watermarks in the same commit.
 
 use redb::{Database, ReadableDatabase, ReadableTable};
 

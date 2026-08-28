@@ -288,7 +288,7 @@ async fn an_s3_source_and_sink_move_rows_through_the_standalone_runner() {
         .expect("service builds")
         .remove(0);
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("one-shot run");
     assert_eq!(stats.iterations, 1);

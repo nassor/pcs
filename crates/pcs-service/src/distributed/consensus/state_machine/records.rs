@@ -33,7 +33,7 @@ pub(super) const PENDING_BATCHES: TableDefinition<u64, &[u8]> =
 
 /// SM metadata table. Defined here so `restore_state` can write watermarks
 /// in the same transaction as the snapshot data — one commit, one fsync. The
-/// same table is declared in `storage/mod.rs` for the openraft state machine.
+/// same table is declared in `storage/mod.rs` for the raft state machine.
 pub(super) const SM_META_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("arrow_sm_meta");
 

@@ -384,8 +384,12 @@ cluster node is a deliberate deployment choice.
   `pcs-plugin-abi` C ABI, validates its manifest, and runs each batch through `run-batch`.
 - `distributed`: `PartitionSource`, `CheckpointStore`, `DistributedRunner`, redb store, TCP
   transport.
-- `distributed-raft`: openraft log store, state machine, snapshot, node driver (implies
-  `distributed`).
+- `distributed-raft`: raft-rs (tikv/raft-rs) log store, state machine, snapshot, node driver
+  (implies `distributed`).
+- `tikv-store`: TiKV persistent layer. `TikvSharedStore` implements `PartitionSource` +
+  `CheckpointStore` over a raw TiKV client (claims via CAS, no PCS raft for app data), and
+  `TikvStateClient` persists configs, processor priors and source cursors. Opt-in like
+  `connector-kafka`: tikv-client pulls tonic/prost. Implies `distributed`.
 - `service`: the `pcs-service` binary. axum HTTP control plane, KDL config through
   `dep:pcs-config`, metrics, standalone runner (implies `pcs-core/io`, `distributed`,
   `parquet-checkpoint`, `tracing`, `metrics`, `inspector`). Also pulls `opentelemetry-otlp` and
@@ -570,15 +574,26 @@ contributes shared types only; all runner code lives here.
   `PROCESSOR_STATE_STAGE_SENTINEL`)
 - `ParquetCheckpointStore`: archival checkpoint store (needs `parquet-checkpoint`)
 
-**`distributed-raft` feature:**
-- `ArrowRedbLogStore`: openraft `RaftLogStorage` over a log-only redb file
-- `ArrowRedbStateMachine`: openraft `RaftStateMachine`, applies `ConsensusCommand` to a separate file
+- `RaftRedbLogStore`: raft-rs `Storage` over a log-only redb file (hard state, conf state,
+  prost-encoded entries, snapshot)
+- `AppStateMachine`: applies `ConsensusCommand` to a separate file, tracking `last_applied`
 - `validate_store_consistency`: refuses startup when the state machine is behind what the log store
   purged. Called by `ArrowRaftDriver::start`
-- `ArrowRaftDriver`, `ArrowRaftDriverConfig`, `ArrowRaftDriverHandle`: openraft node lifecycle with
+- `ArrowRaftDriver`, `ArrowRaftDriverConfig`, `ArrowRaftDriverHandle`: a `RawNode` drive loop
+  (tick/step/Ready cycle, static membership seeded from the configured peers on first boot) with
   a proposal channel
-- `PcsTypeConfig`: openraft type configuration (`D = ConsensusCommand`, `R = ConsensusResponse`)
-- `TcpNetworkFactory`, `TcpNetwork`, `RaftTcpServer`: `RaftNetworkV2` over length-prefixed TCP
+- `ConsensusCommand` and `ConsensusResponse`: postcard-encoded in `Entry.data`
+- `TransportHub`, `TcpNetwork`, `RaftTcpServer`: pooled length-prefixed TCP; raft messages travel
+  as prost-encoded `eraftpb::Message`, forwarded proposals ride a separate tag
+
+**`tikv-store` feature:**
+- `TikvSharedStore`: `PartitionSource` + `CheckpointStore` over a raw TiKV client. Claims are
+  atomic CAS transitions on per-row-range keys; row ranges are fixed 512-row chunks created at
+  registration. Checkpoints cap at 4 MiB (`TIKV_MAX_CHECKPOINT_BYTES`).
+- `TikvStateClient`: config bytes, processor priors and source cursors under the store's key
+  prefix. The dual-impl no-op keeps callers free of `#[cfg]`.
+- Stream mode persists source cursors and processor priors whenever a store is configured;
+  interval/one-shot state carry is opt-in via `store "tikv" { batch_resume true }`.
 
 #### WASM host (`src/wasm/`, `wasm` feature)
 

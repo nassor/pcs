@@ -242,6 +242,95 @@ pub enum ServiceMode {
     },
 }
 
+/// Default TiKV key prefix for every key this store writes.
+fn default_tikv_key_prefix() -> String {
+    "pcs".to_string()
+}
+
+/// Default TiKV client operation timeout in milliseconds.
+fn default_tikv_timeout_ms() -> u64 {
+    10_000
+}
+
+/// Default claim lease TTL in milliseconds.
+fn default_tikv_lease_ttl_ms() -> u64 {
+    90_000
+}
+
+/// Persistent store declaration, tagged by `store`.
+///
+/// ```kdl
+/// store "tikv" {
+///     pd_endpoints "127.0.0.1:2379"
+///     key_prefix "pcs-smoke"
+/// }
+/// ```
+///
+/// With a `store` block present, the pipeline config is persisted to the
+/// store before the pipeline builds, stream-mode and cluster-mode resume
+/// state (processor priors and source cursors) is written back as work
+/// progresses, and the distributed runner in cluster mode is backed by the
+/// store. Interval/one-shot batch state carry is opt-in per store via
+/// `batch_resume`.
+#[derive(Debug, Clone, Serialize)]
+pub enum StoreConfig {
+    /// TiKV (raw kv client).
+    Tikv {
+        /// PD endpoints, one or several `host:port` strings.
+        pd_endpoints: Vec<String>,
+        /// Prefix for every key this store writes.
+        key_prefix: String,
+        /// Client operation timeout in milliseconds.
+        timeout_ms: u64,
+        /// Claim lease TTL in milliseconds.
+        lease_ttl_ms: u64,
+        /// Opt-in interval/one-shot processor state carry across iterations.
+        batch_resume: bool,
+    },
+}
+
+impl<'de> Deserialize<'de> for StoreConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // The KDL parser stores a node's leading argument under `id` (see
+        // pcs-config rules), so the tag arrives as an `id` entry rather than
+        // a `store` key. Read it first, then validate the remaining keys
+        // against the variant's shape.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TikvInner {
+            id: String,
+            #[serde(deserialize_with = "one_or_many")]
+            pd_endpoints: Vec<String>,
+            #[serde(default = "default_tikv_key_prefix")]
+            key_prefix: String,
+            #[serde(default = "default_tikv_timeout_ms")]
+            timeout_ms: u64,
+            #[serde(default = "default_tikv_lease_ttl_ms")]
+            lease_ttl_ms: u64,
+            #[serde(default)]
+            batch_resume: bool,
+        }
+
+        let inner = TikvInner::deserialize(deserializer)?;
+        if inner.id != "tikv" {
+            return Err(serde::de::Error::custom(format!(
+                "unknown store kind '{}' (expected \"tikv\")",
+                inner.id
+            )));
+        }
+        Ok(StoreConfig::Tikv {
+            pd_endpoints: inner.pd_endpoints,
+            key_prefix: inner.key_prefix,
+            timeout_ms: inner.timeout_ms,
+            lease_ttl_ms: inner.lease_ttl_ms,
+            batch_resume: inner.batch_resume,
+        })
+    }
+}
+
 /// A windowing declaration on a processor node: which windows the host
 /// assumes the processor's merging logic works in, and what it tracks for
 /// them.
@@ -1347,6 +1436,10 @@ pub struct ServiceConfig {
     /// Runtime mode (standalone or cluster), flattened into the document.
     #[serde(flatten)]
     pub mode: ServiceMode,
+    /// Persistent store declaration; `None` keeps the in-process/redb
+    /// backends as today.
+    #[serde(default)]
+    pub store: Option<StoreConfig>,
     /// The workflows this process runs. One or more `workflow` blocks; a
     /// single block deserializes as a one-element list.
     #[serde(rename = "workflow", deserialize_with = "one_or_many")]
@@ -1523,6 +1616,9 @@ impl ServiceConfig {
             }
         }
 
+        // Persistent store validation. The feature gate is compile-time: a
+        // `store` block in a binary without `tikv-store` is a config error,
+        // not a silently ignored section.
         if !self.http.disabled {
             SocketAddr::from_str(&self.http.bind).map_err(|e| {
                 PcsError::configuration(format!(
@@ -1532,6 +1628,54 @@ impl ServiceConfig {
             })?;
         }
 
+        #[cfg(not(feature = "tikv-store"))]
+        if self.store.is_some() {
+            return Err(PcsError::configuration(
+                "config declares a `store` block, but this binary was built without \
+                 the `tikv-store` feature — rebuild with `--features tikv-store`",
+            ));
+        }
+        #[cfg(feature = "tikv-store")]
+        if let Some(StoreConfig::Tikv {
+            pd_endpoints,
+            key_prefix,
+            lease_ttl_ms,
+            ..
+        }) = &self.store
+        {
+            if pd_endpoints.is_empty() {
+                return Err(PcsError::configuration(
+                    "store tikv: pd_endpoints must not be empty",
+                ));
+            }
+            for ep in pd_endpoints {
+                let Some((host, port)) = ep.rsplit_once(':') else {
+                    return Err(PcsError::configuration(format!(
+                        "store tikv: invalid pd endpoint {ep} (expected host:port)"
+                    )));
+                };
+                if host.is_empty() || port.parse::<u16>().is_err() {
+                    return Err(PcsError::configuration(format!(
+                        "store tikv: invalid pd endpoint {ep} (expected host:port)"
+                    )));
+                }
+            }
+            if *lease_ttl_ms < 10_000 {
+                return Err(PcsError::configuration(format!(
+                    "store tikv: lease_ttl_ms ({lease_ttl_ms}) must be at least 10000"
+                )));
+            }
+            let valid_prefix = !key_prefix.is_empty()
+                && key_prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+            if !valid_prefix {
+                return Err(PcsError::configuration(format!(
+                    "store tikv: key_prefix '{key_prefix}' must be non-empty and contain only \
+                     alphanumerics, '.', '_' or '-'"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1652,6 +1796,7 @@ peer id=2 addr="127.0.0.2:9000"
                 }],
                 links: Vec::new(),
             }],
+            store: None,
             http: HttpConfig {
                 bind: "0.0.0.0:8080".to_string(),
                 disabled: false,
@@ -1750,6 +1895,143 @@ node id=1 data_dir="/tmp/pcs"
         assert!(
             err.contains("workflow"),
             "error should name the missing field: {err}"
+        );
+    }
+
+    /// A `store "tikv"` block parses into [`StoreConfig::Tikv`] with the
+    /// documented defaults, and validates when the `tikv-store` feature is
+    /// compiled in.
+    #[test]
+    #[cfg(feature = "tikv-store")]
+    fn test_store_tikv_parses_and_validates() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "tikv" {{
+    pd_endpoints "127.0.0.1:2379" "127.0.0.2:2379"
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse");
+        match &cfg.store {
+            Some(StoreConfig::Tikv {
+                pd_endpoints,
+                key_prefix,
+                timeout_ms,
+                lease_ttl_ms,
+                batch_resume,
+            }) => {
+                assert_eq!(pd_endpoints, &vec!["127.0.0.1:2379", "127.0.0.2:2379"]);
+                assert_eq!(key_prefix, &default_tikv_key_prefix());
+                assert_eq!(timeout_ms, &default_tikv_timeout_ms());
+                assert_eq!(lease_ttl_ms, &default_tikv_lease_ttl_ms());
+                assert!(!batch_resume, "batch resume is opt-in, default false");
+            }
+            other => panic!("expected a tikv store config, got {other:?}"),
+        }
+        cfg.validate()
+            .expect("a well-formed tikv store should validate");
+    }
+
+    /// Without the `tikv-store` feature a `store` block is a configuration
+    /// error, not a silently ignored section.
+    #[test]
+    #[cfg(not(feature = "tikv-store"))]
+    fn test_store_block_rejected_without_feature() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "tikv" {{
+    pd_endpoints "127.0.0.1:2379"
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse");
+        let err = cfg
+            .validate()
+            .expect_err("store without the feature must fail");
+        assert!(
+            err.to_string().contains("tikv-store"),
+            "error should mention the missing feature: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tikv-store")]
+    fn test_store_tikv_rejects_bad_endpoint() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "tikv" {{
+    pd_endpoints "127.0.0.1"
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse");
+        let err = cfg.validate().expect_err("a bare host must fail");
+        assert!(
+            err.to_string().contains("pd endpoint"),
+            "error should name the endpoint: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tikv-store")]
+    fn test_store_tikv_rejects_short_lease() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "tikv" {{
+    pd_endpoints "127.0.0.1:2379"
+    lease_ttl_ms 5000
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse");
+        let err = cfg.validate().expect_err("a 5 s lease must fail");
+        assert!(
+            err.to_string().contains("lease_ttl_ms"),
+            "error should name the lease: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tikv-store")]
+    fn test_store_tikv_rejects_bad_prefix() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "tikv" {{
+    pd_endpoints "127.0.0.1:2379"
+    key_prefix "pcs smoke"
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse");
+        let err = cfg.validate().expect_err("a prefix with a space must fail");
+        assert!(
+            err.to_string().contains("key_prefix"),
+            "error should name the prefix: {err}"
         );
     }
 
@@ -2193,6 +2475,7 @@ workflow "w" {
                 links: Vec::new(),
             }],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         };
         cfg.validate()

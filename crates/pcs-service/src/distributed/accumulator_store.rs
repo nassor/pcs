@@ -7,13 +7,23 @@
 //!
 //! `save_accumulator_state` calls [`Dataset::write_component_ipc`], which writes only
 //! the `WindowAccumulator` component. The payload is bounded by the accumulator
-//! row-count rather than the full dataset size, so it stays well within the 1 MiB cap
-//! for typical window counts.
+//! row-count rather than the full dataset size, so it stays well within the store's
+//! [`max_checkpoint_bytes`](CheckpointStore::max_checkpoint_bytes) cap for typical
+//! window counts.
 //!
 //! ## First-run bootstrap
 //!
 //! `load_accumulator_state` returns `Ok(None)` when no prior checkpoint exists.
 //! The caller should treat `None` as an empty accumulator (zero prior rows).
+//!
+//! ## Chained keying
+//!
+//! Both functions take a bare `claim_id`, not a [`BatchClaim`]: the runner
+//! chains the accumulator the same way it chains the runtime state blob
+//! (`processor_state_store`), loading under the id of the claim that last
+//! wrote a checkpoint and saving under the id it currently holds. A fresh
+//! claim's own id never has a checkpoint yet, because the state is saved
+//! before the claim is acked.
 
 #[cfg(feature = "windows")]
 use arrow_array::RecordBatch;
@@ -21,18 +31,22 @@ use arrow_array::RecordBatch;
 #[cfg(feature = "windows")]
 use crate::PcsResult;
 #[cfg(feature = "windows")]
+use crate::component::Component;
+#[cfg(feature = "windows")]
 use crate::dataset::Dataset;
 #[cfg(feature = "windows")]
 use crate::distributed::checkpoint::{ACCUMULATOR_STAGE_SENTINEL, CheckpointStore};
 #[cfg(feature = "windows")]
-use crate::distributed::partition::{BatchClaim, MAX_LOG_ENTRY_BYTES};
-
-#[cfg(feature = "windows")]
-use crate::component::Component;
-#[cfg(feature = "windows")]
 use crate::windows::accumulator::{CURRENT_ACCUMULATOR_VERSION, WindowAccumulator};
+#[cfg(feature = "windows")]
+use uuid::Uuid;
 
-/// Load the window accumulator state for `claim` from `store`.
+/// Load the window accumulator state persisted under `claim_id` from `store`.
+///
+/// The caller passes the id of the claim that last wrote an accumulator
+/// checkpoint (the chain pointer), mirroring `processor_state_store`; a fresh
+/// claim's own id would never have a checkpoint, because the state is saved
+/// before the claim is acked.
 ///
 /// Returns the raw `RecordBatch` (after schema migration) so the caller can
 /// append it into a pipeline registered with [`WindowAccumulator`].
@@ -40,10 +54,10 @@ use crate::windows::accumulator::{CURRENT_ACCUMULATOR_VERSION, WindowAccumulator
 #[cfg(feature = "windows")]
 pub async fn load_accumulator_state(
     store: &(impl CheckpointStore + ?Sized),
-    claim: &BatchClaim,
+    claim_id: Uuid,
 ) -> PcsResult<Option<RecordBatch>> {
     let checkpoint = store
-        .load_checkpoint(claim.claim_id, ACCUMULATOR_STAGE_SENTINEL)
+        .load_checkpoint(claim_id, ACCUMULATOR_STAGE_SENTINEL)
         .await?;
 
     let cp = match checkpoint {
@@ -73,15 +87,17 @@ pub async fn load_accumulator_state(
     Ok(Some(migrated))
 }
 
-/// Persist the window accumulator component from `data` to `store`.
+/// Persist the window accumulator component from `data` to `store` under
+/// `claim_id`.
 ///
 /// Serialises only the `WindowAccumulator` component (not the whole dataset).
-/// The payload size is validated against [`MAX_LOG_ENTRY_BYTES`] before writing.
-/// If the component is not registered in `data`, the save is a no-op.
+/// The payload size is validated against the store's
+/// [`max_checkpoint_bytes`](CheckpointStore::max_checkpoint_bytes) before
+/// writing. If the component is not registered in `data`, the save is a no-op.
 #[cfg(feature = "windows")]
 pub async fn save_accumulator_state(
     store: &(impl CheckpointStore + ?Sized),
-    claim: &BatchClaim,
+    claim_id: Uuid,
     data: &Dataset,
 ) -> PcsResult<()> {
     use crate::PcsError;
@@ -94,18 +110,18 @@ pub async fn save_accumulator_state(
     let mut buf = Vec::new();
     data.write_component_ipc::<WindowAccumulator>(&mut buf)?;
 
-    if buf.len() >= MAX_LOG_ENTRY_BYTES {
+    let cap = store.max_checkpoint_bytes();
+    if buf.len() >= cap {
         return Err(PcsError::configuration(format!(
-            "accumulator checkpoint size {} bytes exceeds MAX_LOG_ENTRY_BYTES {} — \
+            "accumulator checkpoint size {} bytes exceeds the store cap {cap} — \
              reduce the number of open windows or split the pipeline",
             buf.len(),
-            MAX_LOG_ENTRY_BYTES
         )));
     }
 
     store
         .save_checkpoint(
-            claim.claim_id,
+            claim_id,
             ACCUMULATOR_STAGE_SENTINEL,
             buf,
             CURRENT_ACCUMULATOR_VERSION,
@@ -118,7 +134,6 @@ mod tests {
     use super::*;
     use crate::PcsResult;
     use crate::distributed::checkpoint::{Checkpoint, CheckpointStore};
-    use crate::distributed::partition::BatchClaim;
     use crate::windows::accumulator::WindowAccumulator;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -166,20 +181,6 @@ mod tests {
         }
     }
 
-    fn make_claim(batch_id: u64) -> BatchClaim {
-        BatchClaim {
-            batch_id,
-            component: "Test".to_string(),
-            row_range: 0..10,
-            schema_id: 1,
-            claim_id: Uuid::now_v7(),
-            instance_id: Uuid::now_v7(),
-            lease_expires_at: u64::MAX,
-            claimed_at: std::time::Instant::now(),
-            lease_ttl_millis: 90_000,
-        }
-    }
-
     fn make_world_with_accumulators(rows: Vec<WindowAccumulator>) -> Dataset {
         let mut data = Dataset::new();
         data.register_component::<WindowAccumulator>().unwrap();
@@ -192,15 +193,15 @@ mod tests {
     #[tokio::test]
     async fn test_load_returns_none_when_no_checkpoint() {
         let store = MemStore::default();
-        let claim = make_claim(1);
-        let result = load_accumulator_state(&store, &claim).await.unwrap();
+        let claim_id = Uuid::now_v7();
+        let result = load_accumulator_state(&store, claim_id).await.unwrap();
         assert!(result.is_none(), "expected None on first run");
     }
 
     #[tokio::test]
     async fn test_save_and_load_round_trip() {
         let store = MemStore::default();
-        let claim = make_claim(2);
+        let claim_id = Uuid::now_v7();
 
         let acc = WindowAccumulator {
             version: Some(1),
@@ -217,11 +218,11 @@ mod tests {
         };
 
         let pipeline = make_world_with_accumulators(vec![acc.clone()]);
-        save_accumulator_state(&store, &claim, &pipeline)
+        save_accumulator_state(&store, claim_id, &pipeline)
             .await
             .unwrap();
 
-        let loaded = load_accumulator_state(&store, &claim).await.unwrap();
+        let loaded = load_accumulator_state(&store, claim_id).await.unwrap();
         let batch = loaded.expect("should have a batch");
         assert_eq!(batch.num_rows(), 1);
 
@@ -234,20 +235,22 @@ mod tests {
     #[tokio::test]
     async fn test_save_empty_world_is_noop() {
         let store = MemStore::default();
-        let claim = make_claim(3);
+        let claim_id = Uuid::now_v7();
 
         // Dataset without WindowAccumulator registered.
         let data = Dataset::new();
-        save_accumulator_state(&store, &claim, &data).await.unwrap();
+        save_accumulator_state(&store, claim_id, &data)
+            .await
+            .unwrap();
 
-        let loaded = load_accumulator_state(&store, &claim).await.unwrap();
+        let loaded = load_accumulator_state(&store, claim_id).await.unwrap();
         assert!(loaded.is_none());
     }
 
     #[tokio::test]
     async fn test_save_uses_sentinel_stage_idx() {
         let store = MemStore::default();
-        let claim = make_claim(4);
+        let claim_id = Uuid::now_v7();
 
         let pipeline = make_world_with_accumulators(vec![WindowAccumulator {
             version: Some(1),
@@ -262,13 +265,13 @@ mod tests {
             session_end_ts: None,
             finalized_at_watermark: None,
         }]);
-        save_accumulator_state(&store, &claim, &pipeline)
+        save_accumulator_state(&store, claim_id, &pipeline)
             .await
             .unwrap();
 
         // The checkpoint is stored at the sentinel key.
         let cp = store
-            .load_checkpoint(claim.claim_id, ACCUMULATOR_STAGE_SENTINEL)
+            .load_checkpoint(claim_id, ACCUMULATOR_STAGE_SENTINEL)
             .await
             .unwrap();
         assert!(cp.is_some(), "should have a checkpoint at the sentinel");
@@ -278,15 +281,15 @@ mod tests {
     #[tokio::test]
     async fn test_save_registered_but_empty_component_loads_none() {
         let store = MemStore::default();
-        let claim = make_claim(5);
+        let claim_id = Uuid::now_v7();
 
         // Registered but no rows appended.
         let pipeline = make_world_with_accumulators(vec![]);
-        save_accumulator_state(&store, &claim, &pipeline)
+        save_accumulator_state(&store, claim_id, &pipeline)
             .await
             .unwrap();
 
-        let loaded = load_accumulator_state(&store, &claim).await.unwrap();
+        let loaded = load_accumulator_state(&store, claim_id).await.unwrap();
         assert!(loaded.is_none(), "empty accumulator should load as None");
     }
 }

@@ -211,7 +211,7 @@ async fn a_postgres_source_and_sink_move_rows_through_the_standalone_runner() {
         .expect("service builds")
         .remove(0);
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("one-shot run");
     assert_eq!(stats.iterations, 1);
@@ -245,7 +245,7 @@ async fn a_postgres_source_and_sink_move_rows_through_the_standalone_runner() {
         .build_all(&config)
         .expect("service builds")
         .remove(0);
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("second run");
     assert_eq!(
@@ -302,7 +302,7 @@ async fn a_postgres_source_and_sink_move_rows_through_the_standalone_runner() {
         .build_all(&config)
         .expect("service builds")
         .remove(0);
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("third run");
     assert_eq!(

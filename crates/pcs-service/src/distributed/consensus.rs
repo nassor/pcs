@@ -30,4 +30,4 @@ pub use driver::{ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle};
 #[cfg(feature = "distributed-raft")]
 pub use snapshot::{build_snapshot_bytes, install_snapshot_bytes};
 #[cfg(feature = "distributed-raft")]
-pub use storage::{ArrowRedbLogStore, ArrowRedbStateMachine};
+pub use storage::{AppStateMachine, RaftRedbLogStore};

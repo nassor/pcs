@@ -121,7 +121,7 @@ async fn a_csv_source_and_an_avro_sink_share_one_file_connector() {
         .expect("both formats resolve through the transformer registry")
         .remove(0);
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("one-shot run");
     assert_eq!(stats.iterations, 1);

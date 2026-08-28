@@ -182,7 +182,7 @@ async fn frames_pushed_into_the_tcp_source_come_back_out_of_the_tcp_sink() {
     let runner_config = config.clone();
     let local = LocalSet::new();
     let handle = local.spawn_local(async move {
-        run_standalone(built, &runner_config, runner_cancel, None).await
+        run_standalone(built, &runner_config, runner_cancel, None, None).await
     });
 
     let stats = local

@@ -123,7 +123,7 @@ async fn a_two_processor_link_runs_two_real_wasmtime_instances() {
         .remove(0);
     assert_eq!(built.nodes.len(), 4, "source, two processors, sink");
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("one-shot run");
     assert_eq!(stats.iterations, 1);

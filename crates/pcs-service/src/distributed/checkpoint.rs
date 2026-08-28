@@ -73,6 +73,28 @@ pub trait CheckpointStore: Send + Sync {
         claim_id: Uuid,
         stage_idx: u32,
     ) -> PcsResult<Option<Checkpoint>>;
+
+    /// Largest `ipc_bytes` this store accepts per checkpoint.
+    ///
+    /// Redb keeps the Raft log-entry cap
+    /// ([`MAX_LOG_ENTRY_BYTES`](crate::distributed::partition::MAX_LOG_ENTRY_BYTES));
+    /// TiKV overrides with
+    /// [`TIKV_MAX_CHECKPOINT_BYTES`](crate::distributed::tikv_store::TIKV_MAX_CHECKPOINT_BYTES).
+    /// Pre-check helpers (`save_accumulator_state`, `save_processor_state`)
+    /// consult this instead of hard-coding the cap, so a store with a larger
+    /// envelope does not needlessly reject state.
+    fn max_checkpoint_bytes(&self) -> usize {
+        crate::distributed::partition::MAX_LOG_ENTRY_BYTES
+    }
+
+    /// Schema version recorded by any persisted data-stage checkpoint, or
+    /// `Ok(None)` when the store holds no data checkpoints yet.
+    ///
+    /// Used at startup to refuse a redeployed pipeline whose schema
+    /// fingerprint does not match the state it would resume against.
+    async fn persisted_schema_id(&self) -> PcsResult<Option<u32>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

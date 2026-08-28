@@ -14,11 +14,14 @@
 //! locally in the runner's scheduler after each batch, so output is spread
 //! across nodes and operators must aggregate it externally.
 //!
-//! ## Graceful shutdown (30 s budget)
 //!
-//! Cancellation logs the shutdown, aborts the source producer task, and lets
-//! `DistributedRunner::run_until_cancelled` release any in-flight claim before
-//! `handle.shutdown()` drains the Raft driver and the stats are returned.
+//! ## Store backends
+//!
+//! With a `store "tikv" { … }` block the shared store lives in TiKV and the
+//! PCS raft node (tikv/raft-rs) runs only for membership and leadership:
+//! application mutations go to TiKV's own raft, so the redb state machine is
+//! untouched. Without one, the redb `RedbSharedStore` routes mutations through
+//! the local raft handle as before.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,12 +33,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::PcsError;
 use crate::PcsResult;
+use crate::distributed::checkpoint::CheckpointStore;
 use crate::distributed::consensus::driver::{
     ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
 };
 use crate::distributed::consensus::store::RedbSharedStore;
 use crate::distributed::runner::{DistributedRunner, RunnerConfig};
 use crate::distributed::strategy::CheckpointStrategy;
+#[cfg(feature = "tikv-store")]
+use crate::distributed::{TikvSharedStore, TikvStoreConfig};
 use crate::service::builder::BuiltService;
 use crate::service::config::{ClusterConfig, ServiceConfig, ServiceMode};
 
@@ -137,8 +143,8 @@ pub async fn run_cluster(
         listen_addr,
         peers,
         heartbeat_interval_ms: cluster.heartbeat_interval_ms,
-        election_timeout_min_ms: cluster.election_timeout_ms,
-        election_timeout_max_ms: cluster.election_timeout_ms * 2,
+        election_timeout_ms: cluster.election_timeout_ms,
+        snapshot_log_interval: cluster.snapshot_log_interval,
     };
 
     let log_db_path = data_dir.join(RAFT_LOG_DB_FILE);
@@ -174,12 +180,26 @@ pub async fn run_cluster(
     ));
 
     let metrics = handle.metrics();
-    stats.last_raft_term = Some(metrics.current_term);
-    stats.last_leader_id = metrics.current_leader;
+    stats.last_raft_term = Some(metrics.term);
+    stats.last_leader_id = metrics.leader_id;
 
-    // handle.app_db() is the same Arc<Mutex<Database>> the Raft state machine
-    // uses, which avoids opening a second handle to the same redb file.
-    let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clone());
+    // Backend selection: with a `store` block the shared store lives in TiKV
+    // (PCS raft still runs for membership and leadership; application
+    // mutations go to TiKV's own raft), otherwise the redb store routes
+    // through the local raft handle.
+    let store: Box<dyn crate::distributed::SharedStore> = match config.store.as_ref() {
+        #[cfg(feature = "tikv-store")]
+        Some(_) => {
+            let tcfg = TikvStoreConfig::try_from(config.store.as_ref().expect("matched Some"))?;
+            Box::new(TikvSharedStore::connect(&tcfg).await?)
+        }
+        #[cfg(not(feature = "tikv-store"))]
+        Some(_) => unreachable!("validate rejects `store` without tikv-store"),
+        None => Box::new(RedbSharedStore::multi_node(
+            Arc::clone(handle.app_db()),
+            handle.clone(),
+        )),
+    };
 
     let producer_cancel = cancel.child_token();
     // ServiceConfig::validate rejects sources in cluster mode, so built.nodes
@@ -259,8 +279,7 @@ pub async fn run_cluster(
         task.abort();
     }
 
-    // openraft alpha.17 does not expose trigger_leader_transfer on the public
-    // Raft API, so shutdown skips it. The cost is one election cycle of
+    // Shutdown skips leader transfer. The cost is one election cycle of
     // unavailability (election_timeout_ms * 2).
     let _ = LEADER_TRANSFER_BUDGET; // budget reserved
 
@@ -288,9 +307,9 @@ fn spawn_raft_gauges(
                 _ = interval.tick() => {
                     let m = handle.metrics();
                     crate::metrics::instruments().raft(
-                        m.local_committed.map_or(0, |id| id.index),
-                        m.current_term,
-                        m.current_leader,
+                        m.applied_index,
+                        m.term,
+                        m.leader_id,
                     );
                 }
                 _ = cancel.cancelled() => break,
@@ -357,36 +376,17 @@ fn write_node_id_file(data_dir: &Path, node_id: u64) -> PcsResult<()> {
 }
 
 async fn bootstrap_cluster(
-    handle: &crate::distributed::consensus::driver::ArrowRaftDriverHandle,
+    _handle: &crate::distributed::consensus::driver::ArrowRaftDriverHandle,
     cluster: &ClusterConfig,
     node_id: u64,
     this_addr: &str,
     bootstrap_lock: &Path,
 ) -> PcsResult<()> {
-    use openraft::BasicNode;
-    use std::collections::BTreeMap;
-
-    let mut members: BTreeMap<u64, BasicNode> = BTreeMap::new();
-    for peer in &cluster.peers {
-        members.insert(
-            peer.id,
-            BasicNode {
-                addr: peer.addr.clone(),
-            },
-        );
-    }
-
-    // If only one peer and it's us, this is a single-node bootstrap.
-    if members.is_empty() {
-        members.insert(
-            node_id,
-            BasicNode {
-                addr: this_addr.to_string(),
-            },
-        );
-    }
-
-    handle.initialize(members).await?;
+    // Membership is static: the driver seeds the conf state from the
+    // configured peers on first boot, so there is no `initialize` call.
+    // Bootstrap bookkeeping below stays: it marks that the operator
+    // explicitly created this cluster.
+    let _ = (cluster, node_id, this_addr);
 
     let lock_dir = bootstrap_lock.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(lock_dir)
@@ -420,18 +420,13 @@ async fn wait_for_raft_settled(
 
         let metrics = handle.metrics();
         {
-            use openraft::ServerState;
+            use crate::distributed::consensus::driver::RaftNodeState;
             match metrics.state {
-                ServerState::Leader | ServerState::Follower | ServerState::Learner => {
+                RaftNodeState::Leader | RaftNodeState::Follower => {
                     return Ok(());
                 }
-                ServerState::Candidate => {
+                RaftNodeState::Candidate | RaftNodeState::PreCandidate => {
                     // Still electing; keep waiting.
-                }
-                ServerState::Shutdown => {
-                    return Err(PcsError::generic(
-                        "Raft node entered Shutdown state during startup",
-                    ));
                 }
             }
         }
@@ -508,6 +503,7 @@ mod tests {
                 links: Vec::new(),
             }],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         }
     }
@@ -641,8 +637,8 @@ mod tests {
             listen_addr: addr,
             peers: HashMap::new(),
             heartbeat_interval_ms: 30,
-            election_timeout_min_ms: 100,
-            election_timeout_max_ms: 200,
+            election_timeout_ms: 200,
+            snapshot_log_interval: 1000,
         };
 
         let (handle, _task) = ArrowRaftDriver::start(
@@ -695,8 +691,8 @@ mod tests {
             listen_addr: addr,
             peers: HashMap::new(),
             heartbeat_interval_ms: 30,
-            election_timeout_min_ms: 100,
-            election_timeout_max_ms: 200,
+            election_timeout_ms: 200,
+            snapshot_log_interval: 1000,
         };
 
         let (handle, _task) = ArrowRaftDriver::start(
@@ -802,6 +798,7 @@ mod tests {
                 links: Vec::new(),
             }],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         };
 

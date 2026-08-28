@@ -19,6 +19,7 @@ feature that registers its factory. Build with:
 | `cluster.kdl` | `service-cluster,connector-file,transformer-csv,wasm` |
 | `tcp.kdl` | `connector-tcp,wasm` |
 | `http.kdl` | `connector-http,transformer-csv,wasm` |
+| `tikv.kdl` | `tikv-store,connector-file,transformer-csv` |
 
 ## Built-in factories
 

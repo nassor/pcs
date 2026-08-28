@@ -1,5 +1,11 @@
 //! Raft snapshot builder and installer for the Arrow-IPC state machine.
 //!
+//! The raft driver builds snapshots with [`build_snapshot_bytes`] (on a
+//! `snapshot_log_interval` cadence) and installs them with
+//! [`install_snapshot_bytes`]; the chunked byte format is the only thing this
+//! module owns, so on-disk/dump compatibility is independent of the consensus
+//! engine.
+//!
 //! ## Snapshot format
 //!
 //! The snapshot payload is a sequence of length-prefixed postcard chunks, one
@@ -32,12 +38,8 @@
 
 #[cfg(feature = "distributed-raft")]
 pub(crate) mod raft_impl {
-    use std::io::Cursor;
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
 
-    use openraft::type_config::alias::{LogIdOf, SnapshotOf, StoredMembershipOf};
-    use openraft::{RaftSnapshotBuilder, Snapshot, SnapshotMeta};
     use redb::Database;
     use serde::{Deserialize, Serialize};
 
@@ -45,7 +47,6 @@ pub(crate) mod raft_impl {
     use crate::distributed::consensus::state_machine::{
         CheckpointRecord, ClaimRecord, InstanceRecord, MasterBatchRecord, dump_state, restore_state,
     };
-    use crate::distributed::consensus::types::PcsTypeConfig;
 
     #[derive(Serialize, Deserialize)]
     enum SnapshotChunk {
@@ -231,35 +232,6 @@ pub(crate) mod raft_impl {
         restore_state(db, batches, claims, checkpoints, instances, sm_meta)
     }
 
-    /// openraft `RaftSnapshotBuilder` that serializes the redb state as a
-    /// length-prefixed postcard chunk stream.
-    pub struct ArrowSnapshotBuilder {
-        pub db: Arc<Mutex<Database>>,
-        pub last_applied: Option<LogIdOf<PcsTypeConfig>>,
-        pub last_membership: StoredMembershipOf<PcsTypeConfig>,
-    }
-
-    impl RaftSnapshotBuilder<PcsTypeConfig> for ArrowSnapshotBuilder {
-        type SnapshotData = Cursor<Vec<u8>>;
-
-        async fn build_snapshot(
-            &mut self,
-        ) -> Result<SnapshotOf<PcsTypeConfig, Self::SnapshotData>, std::io::Error> {
-            let db = self.db.lock().unwrap();
-            let payload = build_snapshot_bytes(&db)
-                .map_err(|e| std::io::Error::other(format!("build_snapshot: {e}")))?;
-
-            let meta = SnapshotMeta {
-                last_log_id: self.last_applied,
-                last_membership: self.last_membership.clone(),
-            };
-            Ok(Snapshot {
-                meta,
-                snapshot: Cursor::new(payload),
-            })
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -412,4 +384,4 @@ pub(crate) mod raft_impl {
 }
 
 #[cfg(feature = "distributed-raft")]
-pub use raft_impl::{ArrowSnapshotBuilder, build_snapshot_bytes, install_snapshot_bytes};
+pub use raft_impl::{build_snapshot_bytes, install_snapshot_bytes};

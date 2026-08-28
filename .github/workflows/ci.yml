@@ -37,6 +37,11 @@ jobs:
     - name: Install librdkafka build prerequisites
       run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
 
+    # raft-proto's prost-codec build invokes protoc; the raft stack compiles
+    # under `--all-features` and in the distributed_chaos job.
+    - name: Install protoc
+      run: sudo apt-get install -y protobuf-compiler
+
     - name: Cache cargo registry
       uses: actions/cache@v5
       with:
@@ -113,6 +118,11 @@ jobs:
     - name: Install librdkafka build prerequisites
       run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
 
+    # raft-proto's prost-codec build invokes protoc; the raft stack compiles
+    # under `--all-features` and in the distributed_chaos job.
+    - name: Install protoc
+      run: sudo apt-get install -y protobuf-compiler
+
     - name: Cache cargo registry
       uses: actions/cache@v5
       with:
@@ -140,6 +150,45 @@ jobs:
     - name: Full-stack distributed chaos test
       run: cargo nextest run -p pcs-service --features distributed-raft --test distributed_integration_chaos --run-ignored ignored-only
 
+  tikv_store:
+    name: TiKV Store
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    # pcs-service's dev-dependencies pull in pcs-connector-kafka, whose
+    # rdkafka-sys cmake build compiles rdkafka_conf.c's `#include
+    # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-tikv-store-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@0.9.143
+
+    # Docker is preinstalled on ubuntu-latest, so the PD + TiKV fixture runs
+    # for real. `--profile ci` runs the Docker-gated integration tests.
+    - name: Run TiKV store tests
+      run: cargo nextest run -p pcs-service --features tikv-store --test tikv_store --profile ci
+
   wasm_processor:
     name: WASM Processor (wasm32-wasip2)
     runs-on: ubuntu-latest
@@ -156,6 +205,11 @@ jobs:
     # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
     - name: Install librdkafka build prerequisites
       run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+    # raft-proto's prost-codec build invokes protoc; the raft stack compiles
+    # under `--all-features` and in the distributed_chaos job.
+    - name: Install protoc
+      run: sudo apt-get install -y protobuf-compiler
 
     - name: Cache cargo registry
       uses: actions/cache@v5
@@ -226,6 +280,11 @@ jobs:
     # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
     - name: Install librdkafka build prerequisites
       run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+    # raft-proto's prost-codec build invokes protoc; the raft stack compiles
+    # under `--all-features` and in the distributed_chaos job.
+    - name: Install protoc
+      run: sudo apt-get install -y protobuf-compiler
 
     - name: Cache cargo registry
       uses: actions/cache@v5

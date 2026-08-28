@@ -20,6 +20,9 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tokio::sync::RwLock;
 
 use pcs_service::PcsError;
+#[cfg(feature = "tikv-store")]
+use pcs_service::distributed::TikvStoreConfig;
+use pcs_service::service::TikvStateClient;
 use pcs_service::service::config::{LogFormat, ServiceConfig, ServiceMode};
 use pcs_service::service::factories::register_builtin_factories;
 use pcs_service::service::http::{ServiceModeLabel, ServiceState};
@@ -63,6 +66,33 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
     let (telemetry, inspector) =
         pcs_service::service::init_logging(&config.observability, config.node.id)?;
     tracing::info!(node_id = config.node.id, "pcs-service starting");
+    // With a `store` block configured, persist the raw config file (pre
+    // env-substitution, so `${VAR}` secrets stay as references) before the
+    // pipeline builds; an unreachable store fails startup here rather than
+    // mid-run. `validate` and `cluster init` do not write.
+    let tikv: Option<Arc<TikvStateClient>> = match &config.store {
+        #[cfg(feature = "tikv-store")]
+        Some(_) => {
+            let tcfg = TikvStoreConfig::try_from(config.store.as_ref().expect("matched Some"))?;
+            let client = Arc::new(TikvStateClient::connect(&tcfg).await?);
+            let raw = std::fs::read(config_path).map_err(|e| {
+                PcsError::configuration(format!(
+                    "reading config file {}: {e}",
+                    config_path.display()
+                ))
+            })?;
+            let name = config_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "pcs.kdl".to_string());
+            client.put_config(&name, &raw).await?;
+            tracing::info!(config = %name, "pipeline config persisted to TiKV");
+            Some(client)
+        }
+        #[cfg(not(feature = "tikv-store"))]
+        Some(_) => unreachable!("validate rejects `store` without tikv-store"),
+        None => None,
+    };
 
     let prometheus_registry = Arc::new(prometheus::Registry::new());
     let otel_exporter = exporter()
@@ -220,8 +250,9 @@ pub async fn run(global: &GlobalOpts, args: &ServeArgs) -> Result<(), PcsError> 
                             .map(|(_, lock)| lock.clone())
                     });
                     let cfg = runner_config.clone();
+                    let tikv = tikv.clone();
                     async move {
-                        pcs_service::service::run_standalone(b, &cfg, cancel_child, stats)
+                        pcs_service::service::run_standalone(b, &cfg, cancel_child, stats, tikv)
                             .await
                             .map(|_| ())
                     }

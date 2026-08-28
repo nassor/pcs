@@ -149,7 +149,8 @@ async fn native_latency() -> Vec<u64> {
     let cancel = CancellationToken::new();
     let cancel_runner = cancel.clone();
     let local = LocalSet::new();
-    let handle = local.spawn_local(async move { run_stream(service, cancel_runner, None).await });
+    let handle =
+        local.spawn_local(async move { run_stream(service, cancel_runner, None, None).await });
 
     let samples = local
         .run_until(async move {

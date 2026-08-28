@@ -468,6 +468,7 @@ connection url="nats://localhost:4222" password="hunter2"
             },
             workflows: vec![workflow],
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         }
     }
@@ -483,6 +484,7 @@ connection url="nats://localhost:4222" password="hunter2"
             },
             workflows,
             http: HttpConfig::default(),
+            store: None,
             observability: ObservabilityConfig::default(),
         }
     }

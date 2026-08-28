@@ -74,6 +74,8 @@ pub mod standalone;
 #[cfg(feature = "service")]
 pub mod stream;
 #[cfg(feature = "service")]
+pub mod tikv_state;
+#[cfg(feature = "service")]
 pub mod topology;
 #[cfg(feature = "service")]
 pub mod validation;
@@ -121,6 +123,8 @@ pub use span_metrics::SpanMetricsLayer;
 pub use standalone::{StandaloneStats, run_standalone};
 #[cfg(feature = "service")]
 pub use stream::run_stream;
+#[cfg(feature = "service")]
+pub use tikv_state::{SourceCursorMeta, TikvStateClient};
 #[cfg(feature = "service")]
 pub use topology::build_topology;
 #[cfg(feature = "service")]

@@ -1,41 +1,36 @@
 //! TCP transport for Arrow-IPC Raft consensus messages.
 //!
-//! Length-prefixed framing with a typed envelope that distinguishes message kinds on
-//! the wire:
+//! Length-prefixed framing with a typed envelope that distinguishes message
+//! kinds on the wire:
 //!
-//! - Control messages (`AppendEntries`, `Vote`) are serialised as `serde_json`.
-//! - Snapshot transfer uses a multi-frame chunked protocol (4 MiB per chunk).
+//! - Raft protocol messages travel as raw prost-encoded `eraftpb::Message`
+//!   bytes (the raft `prost-codec` wire format), fire-and-forget.
+//! - Forwarded proposals ride a separate tag, answered on the same connection.
 //!
-//! ```text
-//! ┌────────────────┬──────────────────────────┐
-//! │  length: u32   │  payload: [u8; length]   │
-//! │  (big-endian)  │                          │
-//! └────────────────┴──────────────────────────┘
-//! ```
-//!
-//! Each payload is a `serde_json`-encoded `RpcEnvelope`. The wire format is
-//! **append-only**: existing variant positions must never change, so rolling upgrades
-//! stay compatible.
+//! Each payload is `1 tag byte + body` (see `wire`) inside a
+//! length-prefixed frame. The wire format is **append-only**: existing tag
+//! values must never change, so rolling upgrades stay compatible.
 //!
 //! ## Layout
 //!
-//! This file owns the shared frame and snapshot constants plus the [`TransportError`]
-//! classification. `wire` holds the on-wire message types and the frame codec,
-//! `client` the outbound half ([`TcpNetwork`], the per-peer pool, proposal
-//! forwarding), and `server` the inbound half ([`RaftTcpServer`]).
+//! This file owns the shared frame and circuit constants plus the
+//! [`TransportError`] classification. `wire` holds the on-wire message types
+//! and the frame codec, `client` the outbound half ([`TransportHub`], the
+//! per-peer pool, proposal forwarding), and `server` the inbound half
+//! ([`RaftTcpServer`]).
 //!
-//! [`RaftTcpServer`] binds a listen address and dispatches incoming envelopes to the
-//! local [`Raft`](openraft::Raft) node. Start it once during node initialisation,
+//! [`RaftTcpServer`] binds a listen address and dispatches incoming envelopes
+//! to the local driver's inbox. Start it once during node initialisation,
 //! before any remote peer can contact the node.
 //!
-//! [`TcpNetwork`] keeps a per-peer pool of idle
-//! [`TcpStream`](tokio::net::TcpStream)s bounded by [`POOL_CAPACITY`]. Streams are
-//! acquired from the pool or freshly connected, returned on success, and dropped on
-//! error so a broken stream never re-enters the pool.
+//! [`TransportHub`] keeps a per-peer pool of idle
+//! [`TcpStream`](tokio::net::TcpStream)s bounded by [`POOL_CAPACITY`]. Streams
+//! are acquired from the pool or freshly connected, returned on success, and
+//! dropped on error so a broken stream never re-enters the pool.
 //!
-//! Read-frame calls on the RPC-response path use [`tokio::time::timeout`] with a
-//! deadline of [`RPC_READ_TIMEOUT`], connect attempts use [`CONNECT_TIMEOUT`], and
-//! write calls use [`RPC_WRITE_TIMEOUT`].
+//! Read-frame calls on the RPC-response path use [`tokio::time::timeout`] with
+//! a deadline of [`RPC_READ_TIMEOUT`], connect attempts use
+//! [`CONNECT_TIMEOUT`], and write calls use [`RPC_WRITE_TIMEOUT`].
 
 mod client;
 mod server;
@@ -47,32 +42,15 @@ use std::io;
 use std::time::Duration;
 
 #[cfg(feature = "distributed-raft")]
-use openraft::error::{NetworkError, RPCError, StreamingError, Unreachable};
-
-#[cfg(feature = "distributed-raft")]
-use crate::distributed::consensus::types::PcsTypeConfig;
-
-#[cfg(feature = "distributed-raft")]
-pub use client::TcpNetwork;
-pub use client::TcpNetworkFactory;
+pub use client::TransportHub;
 #[cfg(feature = "distributed-raft")]
 pub(crate) use client::forward_proposal;
 #[cfg(feature = "distributed-raft")]
 pub use server::RaftTcpServer;
-#[cfg(feature = "distributed-raft")]
-pub(crate) use wire::{RpcEnvelope, RpcResponse, SnapshotChunkMsg, SnapshotFinalMsg};
 
-/// Hard cap on a single TCP frame. Snapshot *chunks* are bounded by
-/// [`SNAPSHOT_CHUNK_BYTES`], which is well within this limit.
+/// Hard cap on a single TCP frame.
 #[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
-
-/// Maximum snapshot payload per chunk frame.
-///
-/// Chosen to keep each frame well below `MAX_FRAME_BYTES` while limiting the
-/// number of round-trips for typical state-machine snapshots (< 64 MiB).
-#[cfg(feature = "distributed-raft")]
-pub const SNAPSHOT_CHUNK_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Per-RPC read-response timeout. A peer that accepted the TCP connect but never
 /// replies is declared unreachable.
@@ -86,9 +64,10 @@ pub const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Read-response timeout used exclusively for [`forward_proposal`].
 ///
-/// Proposal forwarding waits for the remote leader to run `client_write`, which can
-/// block for a full Raft commit round-trip. Must be strictly greater than
-/// `CLUSTER_PROPOSE_TIMEOUT` (30 s) so the store layer's outer timeout fires first.
+/// Proposal forwarding waits for the remote leader to commit the proposal,
+/// which can block for a full Raft commit round-trip. Must be strictly greater
+/// than `CLUSTER_PROPOSE_TIMEOUT` (30 s) so the store layer's outer timeout
+/// fires first.
 #[cfg(feature = "distributed-raft")]
 const PROPOSAL_FORWARD_READ_TIMEOUT: Duration = Duration::from_secs(35);
 
@@ -108,31 +87,12 @@ const POOL_MAX_IDLE: Duration = Duration::from_secs(10);
 #[cfg(feature = "distributed-raft")]
 const MAX_ACCEPTED_CONNECTIONS: usize = 1024;
 
-/// Maximum total bytes buffered per in-flight snapshot transfer (256 MiB).
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_MAX_TRANSFER_BYTES: usize = 256 * 1024 * 1024;
-
-/// Maximum number of concurrent in-flight snapshot transfers per connection.
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_MAX_CONCURRENT_TRANSFERS: usize = 4;
-
-/// Idle timeout for a snapshot transfer (no chunk received for this duration).
-#[cfg(feature = "distributed-raft")]
-const SNAPSHOT_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Idle-read timeout on the server connection task.
 ///
 /// A peer that keeps TCP alive but stops sending is evicted. Well above Raft
 /// heartbeat intervals, typically 150-500 ms.
 #[cfg(feature = "distributed-raft")]
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Maximum per-chunk byte size enforced on the client before framing.
-///
-/// Matches the server-side cap so oversized chunks are caught client-side with
-/// a clear error rather than being rejected by the server after framing.
-#[cfg(feature = "distributed-raft")]
-const MAX_SNAPSHOT_CHUNK_BYTES: usize = SNAPSHOT_CHUNK_BYTES; // 4 MiB
 
 /// Number of consecutive RPC failures before a per-peer circuit opens.
 #[cfg(feature = "distributed-raft")]
@@ -142,20 +102,10 @@ const CIRCUIT_OPEN_THRESHOLD: u32 = 5;
 #[cfg(feature = "distributed-raft")]
 const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(30);
 
-/// Fine-grained transport error, mapped to the appropriate openraft error type.
+/// Fine-grained transport error surfaced by the connection pool.
 ///
-/// Mapping table:
-///
-/// | `TransportError` variant    | openraft mapping                          | Semantic                            |
-/// |-----------------------------|-------------------------------------------|-------------------------------------|
-/// | `ConnectFailed`             | `RPCError::Unreachable`                   | Peer is down / unreachable          |
-/// | `WriteFailed`               | `RPCError::Network` (transient)           | Lost connection mid-send            |
-/// | `WriteTimeout`              | `RPCError::Network` (transient)           | Peer alive but write buffer full    |
-/// | `ReadTimeout`               | `RPCError::Network` (transient)           | Peer alive but not responding       |
-/// | `FramingError`              | `RPCError::Network` (transient)           | Corrupt/truncated frame             |
-/// | `PeerReset`                 | `RPCError::Network` (transient)           | Peer closed connection cleanly      |
-/// | `EncodeError`               | `RPCError::Unreachable` (fatal-ish)       | Serialization bug, not transient    |
-/// | `Other`                     | `RPCError::Network` (transient)           | Miscellaneous I/O error             |
+/// The raft driver treats every variant as a retryable send failure and
+/// reports the peer unreachable, so raft re-probes on the next tick.
 #[cfg(feature = "distributed-raft")]
 #[derive(Debug)]
 pub enum TransportError {
@@ -178,102 +128,80 @@ pub enum TransportError {
 }
 
 #[cfg(feature = "distributed-raft")]
-impl TransportError {
-    /// Map to openraft `RPCError`. Connect failures and encode errors surface as
-    /// `Unreachable`, which makes openraft back off; everything else is `Network`,
-    /// transient with an immediate retry.
-    pub fn into_rpc_error(self) -> RPCError<PcsTypeConfig> {
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportError::ConnectFailed(e) => {
-                RPCError::Unreachable(Unreachable::from_string(format!("connect failed: {e}")))
-            }
-            TransportError::EncodeError(msg) => RPCError::Unreachable(Unreachable::from_string(
-                format!("encode error (bug): {msg}"),
-            )),
-            TransportError::ReadTimeout => {
-                RPCError::Network(NetworkError::new(&io::Error::other("RPC read timeout")))
-            }
-            TransportError::WriteTimeout => {
-                RPCError::Network(NetworkError::new(&io::Error::other("RPC write timeout")))
-            }
-            TransportError::WriteFailed(e) => RPCError::Network(NetworkError::new(
-                &io::Error::other(format!("write failed: {e}")),
-            )),
-            TransportError::FramingError(msg) => {
-                RPCError::Network(NetworkError::new(&io::Error::other(msg)))
-            }
-            TransportError::PeerReset => RPCError::Network(NetworkError::new(&io::Error::other(
-                "peer reset connection",
-            ))),
-            TransportError::Other(e) => RPCError::Network(NetworkError::new(&e)),
+            TransportError::ConnectFailed(e) => write!(f, "connect failed: {e}"),
+            TransportError::WriteFailed(e) => write!(f, "write failed: {e}"),
+            TransportError::WriteTimeout => write!(f, "write timeout"),
+            TransportError::ReadTimeout => write!(f, "read timeout"),
+            TransportError::FramingError(msg) => write!(f, "framing error: {msg}"),
+            TransportError::PeerReset => write!(f, "peer reset connection"),
+            TransportError::EncodeError(msg) => write!(f, "encode error: {msg}"),
+            TransportError::Other(e) => write!(f, "transport error: {e}"),
         }
-    }
-
-    pub fn into_streaming_error(self) -> StreamingError<PcsTypeConfig> {
-        StreamingError::from(self.into_rpc_error())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Only the Raft-gated tests below name items from this module; the helpers
-    // exist for the sibling test modules.
-    #[cfg(feature = "distributed-raft")]
     use super::*;
-    use std::net::SocketAddr;
-    use tokio::net::TcpListener;
 
-    use super::wire::{read_frame, write_frame};
+    use super::wire::{RpcEnvelope, read_frame};
 
-    pub(super) fn free_addr() -> SocketAddr {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    }
+    #[cfg(feature = "distributed-raft")]
+    use crate::distributed::consensus::types::ConsensusCommand;
 
-    pub(super) fn spawn_echo_server(addr: SocketAddr) {
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    while let Ok(Some(frame)) = read_frame(&mut stream).await {
-                        let _ = write_frame(&mut stream, &frame).await;
-                    }
-                });
-            }
-        });
-    }
-
-    /// `PeerReset`, `WriteFailed`, `FramingError`, and `Other` must all map to
-    /// the transient `RPCError::Network` variant.
+    /// The frame codec round-trips an envelope through an in-memory pair.
     #[cfg(feature = "distributed-raft")]
     #[tokio::test]
-    async fn test_transient_errors_map_to_network() {
-        let cases: Vec<TransportError> = vec![
-            TransportError::PeerReset,
-            TransportError::WriteFailed(io::Error::other("x")),
-            TransportError::WriteTimeout,
-            TransportError::FramingError("bad frame".to_string()),
-            TransportError::Other(io::Error::other("y")),
-        ];
-        for err in cases {
-            let rpc_err = err.into_rpc_error();
-            assert!(
-                matches!(rpc_err, RPCError::Network(_)),
-                "expected Network for transient error, got: {rpc_err:?}"
-            );
-        }
+    async fn test_frame_round_trip_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let (mut a, mut b) = duplex(64 * 1024);
+        let envelope = RpcEnvelope::ProposalForward {
+            command: ConsensusCommand::AckClaim {
+                claim_id: uuid::Uuid::nil(),
+                instance_id: uuid::Uuid::nil(),
+            },
+        };
+        let bytes = envelope.encode();
+        let len = (bytes.len() as u32).to_be_bytes();
+        a.write_all(&len).await.unwrap();
+        a.write_all(&bytes).await.unwrap();
+        a.flush().await.unwrap();
+        drop(a);
+
+        let mut len_buf = [0u8; 4];
+        b.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        b.read_exact(&mut payload).await.unwrap();
+        let decoded = RpcEnvelope::decode(&payload).unwrap();
+        assert!(matches!(decoded, RpcEnvelope::ProposalForward { .. }));
     }
 
-    /// `EncodeError` must map to `RPCError::Unreachable`, since serialization failures
-    /// are bugs rather than network hiccups.
-    #[cfg(feature = "distributed-raft")]
-    #[test]
-    fn test_encode_error_maps_to_unreachable() {
-        let err = TransportError::EncodeError("bad type".to_string());
-        let rpc_err = err.into_rpc_error();
-        assert!(
-            matches!(rpc_err, RPCError::Unreachable(_)),
-            "encode error must map to Unreachable, got: {rpc_err:?}"
-        );
+    /// The frame codec rejects an oversized frame with `InvalidData`.
+    #[tokio::test]
+    async fn test_frame_rejects_oversized() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(&(MAX_FRAME_BYTES as u32 + 1).to_be_bytes())
+                .await
+                .unwrap();
+            stream
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _server_stream = server.await.unwrap();
+        let err = read_frame(&mut client)
+            .await
+            .expect_err("oversized frame must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -215,7 +215,7 @@ async fn rows_served_over_http_come_back_out_of_the_http_sink() {
         .expect("both http halves resolve through the registry")
         .remove(0);
 
-    let stats = run_standalone(built, &config, CancellationToken::new(), None)
+    let stats = run_standalone(built, &config, CancellationToken::new(), None, None)
         .await
         .expect("one-shot run");
     assert_eq!(stats.iterations, 1);

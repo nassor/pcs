@@ -215,7 +215,7 @@ async fn stream_carries_runtime_state_across_items() {
     }
     drop(tx); // EOF
 
-    let stats = run_stream(service, CancellationToken::new(), None)
+    let stats = run_stream(service, CancellationToken::new(), None, None)
         .await
         .unwrap();
 
@@ -263,7 +263,8 @@ async fn stream_cancels_cleanly_mid_stream() {
     let cancel_clone = cancel.clone();
 
     let local = LocalSet::new();
-    let handle = local.spawn_local(async move { run_stream(service, cancel_clone, None).await });
+    let handle =
+        local.spawn_local(async move { run_stream(service, cancel_clone, None, None).await });
 
     let feed_schema = Arc::clone(&schema);
     let feeder = local.spawn_local(async move {
@@ -296,7 +297,7 @@ async fn stream_requires_at_least_one_source() {
     let schema = test_schema();
     let (service, _seen) = built_service(vec![], vec![], Arc::clone(&schema));
 
-    let err = run_stream(service, CancellationToken::new(), None)
+    let err = run_stream(service, CancellationToken::new(), None, None)
         .await
         .expect_err("a source-less stream must be rejected");
     assert_eq!(err.category(), "configuration", "got: {err}");
@@ -390,7 +391,7 @@ async fn stream_rotates_round_robin_across_two_sources() {
     drop(tx_a);
     drop(tx_b);
 
-    run_stream(built, CancellationToken::new(), None)
+    run_stream(built, CancellationToken::new(), None, None)
         .await
         .expect("run succeeds");
 
@@ -458,7 +459,8 @@ async fn stream_ingests_tcp_frames_and_survives_a_bad_connection() {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let local = LocalSet::new();
-    let handle = local.spawn_local(async move { run_stream(service, cancel_clone, None).await });
+    let handle =
+        local.spawn_local(async move { run_stream(service, cancel_clone, None, None).await });
 
     let stats = local
         .run_until(async move {
@@ -534,6 +536,7 @@ fn stream_config() -> ServiceConfig {
             links: Vec::new(),
         }],
         http: HttpConfig::default(),
+        store: None,
         observability: ObservabilityConfig::default(),
     }
 }
@@ -555,7 +558,7 @@ async fn run_standalone_dispatches_stream_mode() {
     drop(tx); // EOF
 
     let config = stream_config();
-    let stats = run_standalone(service, &config, CancellationToken::new(), None)
+    let stats = run_standalone(service, &config, CancellationToken::new(), None, None)
         .await
         .unwrap();
 
@@ -674,7 +677,7 @@ async fn stream_routing_processor_delivers_to_the_selected_branch() {
         .unwrap();
     drop(tx); // EOF
 
-    run_stream(built, CancellationToken::new(), None)
+    run_stream(built, CancellationToken::new(), None, None)
         .await
         .expect("run succeeds");
 
@@ -785,7 +788,7 @@ async fn stream_windowed_processor_tracks_watermark_across_items() {
     tx.send(ts_batch(2_500)).await.unwrap();
     drop(tx); // EOF
 
-    run_stream(built, CancellationToken::new(), None)
+    run_stream(built, CancellationToken::new(), None, None)
         .await
         .expect("run succeeds");
 

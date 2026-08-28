@@ -62,9 +62,9 @@ pub use queries::{
 pub use records::{BatchStatus, CheckpointRecord, ClaimRecord, InstanceRecord, MasterBatchRecord};
 pub use snapshot_io::{DumpedState, dump_state, restore_state};
 
-// Consumed by the openraft state-machine store, which only exists with Raft.
+// Consumed by the raft state-machine store, which only exists with Raft.
 #[cfg(feature = "distributed-raft")]
-pub(crate) use records::{KEY_SM_LAST_APPLIED, KEY_SM_LAST_MEMBERSHIP};
+pub(crate) use records::KEY_SM_LAST_APPLIED;
 
 /// Apply a committed Raft log entry to the redb application tables.
 ///

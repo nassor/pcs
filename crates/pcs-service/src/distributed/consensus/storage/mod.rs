@@ -5,10 +5,10 @@
 //! Arrow blob storage in the state machine competes with log storage for write I/O, so
 //! the two are kept strictly separate:
 //!
-//! - **Log store** (`ArrowRedbLogStore`, in `log_store`): Raft metadata (vote, purged
-//!   log id) and log entries only. No Arrow data lives here.
+//! - **Log store** ([`RaftRedbLogStore`], in `log_store`): Raft metadata (hard state,
+//!   conf state), log entries and the latest snapshot. No Arrow data lives here.
 //!
-//! - **State machine** (`ArrowRedbStateMachine`, in `state_machine_store`): drives the
+//! - **State machine** ([`AppStateMachine`], in `state_machine_store`): drives the
 //!   Arrow-IPC application state through `sm_apply`. Arrow IPC bytes are written in the
 //!   same transaction as the log apply, so the fsync is fate-shared.
 //!
@@ -17,7 +17,7 @@
 //!
 //! ## Blocking-I/O discipline
 //!
-//! All redb read/write transactions in `ArrowRedbLogStore` are wrapped in
+//! All redb read/write transactions are wrapped in
 //! [`tokio::task::spawn_blocking`]. redb's commit path issues `fsync`, which must not
 //! run on a tokio worker thread: blocking a worker for fsync latency stalls every
 //! other task on that runtime. The log store holds an `Arc<Database>` and no
@@ -25,17 +25,12 @@
 //! take `&self` and coordinate internally, so external serialization would only add
 //! lock contention.
 //!
-//! ## Log entry encoding
+//! ## Entry encoding
 //!
-//! Log entries are encoded with `postcard`. Log files written by `pre-1.0.0-alpha.1`
-//! builds used `serde_json` and are not decodable; wipe the Raft log and state-machine
-//! redb files before starting after an upgrade from those builds.
-//!
-//! Postcard is canonical by construction: the same input always produces the same
-//! bytes, which matters if log entries are ever content-hashed. It also avoids UTF-8
-//! encoding cost on append and apply, both of which run under spawn_blocking and
-//! contend for disk, and it has no JSON map-ordering ambiguity if a nested type grows
-//! a map field.
+//! Log entries are prost-encoded `eraftpb::Entry` (the raft `prost-codec` wire
+//! format); metadata rows (hard state, conf state) are `postcard`. Postcard is
+//! canonical by construction: the same input always produces the same bytes, and
+//! it has no JSON map-ordering ambiguity if a nested type grows a map field.
 
 #[cfg(feature = "distributed-raft")]
 #[path = "."]
@@ -45,27 +40,18 @@ pub(crate) mod raft_impl {
 
     use std::io;
 
-    use openraft::type_config::alias::LogIdOf;
     use redb::TableDefinition;
 
-    use crate::distributed::consensus::types::PcsTypeConfig;
     use crate::error::{PcsError, PcsResult};
 
-    pub use log_store::ArrowRedbLogStore;
-    pub use state_machine_store::ArrowRedbStateMachine;
-
-    /// Log-store tables (live in the log redb file).
-    const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("arrow_raft_meta");
-    const ENTRIES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("arrow_raft_entries");
-
-    const KEY_VOTE: &str = "vote";
-    const KEY_PURGED_LOG_ID: &str = "purged_log_id";
+    pub use log_store::RaftRedbLogStore;
+    pub use state_machine_store::AppStateMachine;
 
     /// State-machine metadata table (lives in the *app* redb file).
     ///
-    /// Stores `last_applied` and `last_membership` so they survive restarts.
-    /// Using a separate table keeps SM metadata writes fate-shared with the
-    /// application data in the same redb file, so one fsync covers both.
+    /// Stores `last_applied` so it survives restarts. Using a separate table keeps
+    /// SM metadata writes fate-shared with the application data in the same redb
+    /// file, so one fsync covers both.
     const SM_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("arrow_sm_meta");
 
     fn enc<T: serde::Serialize>(v: &T) -> io::Result<Vec<u8>> {
@@ -80,91 +66,71 @@ pub(crate) mod raft_impl {
         io::Error::other(e.to_string())
     }
 
-    /// Convert a `tokio::task::JoinError` to an `io::Error`. A JoinError means the
-    /// blocking task panicked or was cancelled; both are hard I/O failures, so openraft
-    /// can surface the storage error upward.
-    fn join_to_io(e: tokio::task::JoinError) -> io::Error {
-        io::Error::other(format!("blocking redb task failed: {e}"))
-    }
-
-    /// Validate that `last_applied` is not behind `last_purged_log_id`.
+    /// Validate that the state machine is not behind what the log store still
+    /// holds.
     ///
-    /// Call this after opening both `ArrowRedbLogStore` and
-    /// `ArrowRedbStateMachine` from the same node directory. A mismatch
-    /// indicates the files were restored from mismatched backups or the log
-    /// store was wiped while the state-machine file was retained.
+    /// Call this once from [`ArrowRaftDriver::start`] after opening both
+    /// halves of a node directory. A mismatch indicates the files were
+    /// restored from mismatched backups or the log store was wiped while the
+    /// state-machine file was retained.
     ///
-    /// Returns `Ok(())` when consistent. Returns `Err` with a diagnostic
-    /// message when the invariant is violated.
+    /// `first_index` is the log store's first retained index; `applied` is the
+    /// state machine's last applied index (`None` when nothing has applied).
+    /// The state machine is behind when `applied + 1 < first_index`.
     ///
     /// # Safety
     ///
     /// This is a diagnostic check only and modifies no state.
-    /// Pass `None` for either argument if the corresponding watermark has
-    /// not yet been written (e.g. a freshly-initialized node).
-    pub fn validate_store_consistency(
-        last_purged: Option<LogIdOf<PcsTypeConfig>>,
-        last_applied: Option<LogIdOf<PcsTypeConfig>>,
-    ) -> PcsResult<()> {
-        match (last_purged, last_applied) {
-            (Some(purged), None) => Err(PcsError::store(format!(
-                "store consistency violation: log store has purged up to index {} \
-                 but state machine last_applied is None — state machine is behind. \
+    pub fn validate_store_consistency(first_index: u64, applied: Option<u64>) -> PcsResult<()> {
+        if applied.is_some_and(|a| a + 1 < first_index) {
+            return Err(PcsError::store(format!(
+                "store consistency violation: log store's first retained index is {} \
+                 but state machine last_applied is index {} — state machine is behind. \
                  Do not mix log and state-machine redb files from different backups.",
-                purged.index
-            ))),
-            (Some(purged), Some(applied)) if applied.index < purged.index => {
-                Err(PcsError::store(format!(
-                    "store consistency violation: log store purged up to index {} \
-                     but state machine last_applied is index {} — state machine is behind. \
-                     Do not mix log and state-machine redb files from different backups.",
-                    purged.index, applied.index
-                )))
-            }
-            _ => Ok(()),
+                first_index,
+                applied.expect("checked is_some_and")
+            )));
         }
+        Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::distributed::consensus::state_machine::KEY_SM_LAST_APPLIED;
-        use openraft::entry::RaftEntry;
-        use openraft::type_config::alias::EntryOf;
+        use raft::eraftpb::Entry;
         use redb::{Database, ReadableDatabase};
         use tempfile::TempDir;
 
-        pub(super) fn make_store(dir: &TempDir) -> ArrowRedbLogStore {
-            ArrowRedbLogStore::open(dir.path().join("arrow_raft.db")).unwrap()
+        pub(super) fn make_store(dir: &TempDir) -> RaftRedbLogStore {
+            RaftRedbLogStore::open(dir.path().join("arrow_raft.db")).unwrap()
         }
 
-        pub(super) fn log_id(
-            term: u64,
-            index: u64,
-        ) -> openraft::type_config::alias::LogIdOf<PcsTypeConfig> {
-            use openraft::vote::RaftLeaderId;
-            openraft::LogId::new(
-                openraft::impls::leader_id_adv::LeaderId::new(term, 1u64),
+        /// A plain `(term, index)` tuple; the raft-rs world has no LogId type.
+        pub(super) fn log_id(term: u64, index: u64) -> (u64, u64) {
+            (term, index)
+        }
+
+        pub(super) fn blank_entry(index: u64) -> Entry {
+            Entry {
+                term: 1,
                 index,
-            )
+                data: Vec::new(),
+                ..Default::default()
+            }
         }
 
-        pub(super) fn blank_entry(index: u64) -> EntryOf<PcsTypeConfig> {
-            openraft::Entry::new_blank(log_id(1, index))
-        }
-
-        /// Verify postcard enc/dec round-trip for Option<LogId>.
+        /// Verify postcard enc/dec round-trip for Option<(term, index)>.
         #[test]
         fn test_postcard_log_id_round_trip() {
-            let lid = log_id(2, 10);
-            let opt: Option<LogIdOf<PcsTypeConfig>> = Some(lid);
+            let opt: Option<(u64, u64)> = Some(log_id(2, 10));
             let bytes = enc(&opt).unwrap();
-            let decoded: Option<LogIdOf<PcsTypeConfig>> = dec(&bytes).unwrap();
-            assert_eq!(decoded.map(|l| l.index), Some(10));
+            let decoded: Option<(u64, u64)> = dec(&bytes).unwrap();
+            assert_eq!(decoded, Some((2, 10)));
         }
 
         /// An empty begin_write + open_table + commit must not destroy data already in
-        /// the table. `ArrowRedbStateMachine::open()` relies on this to be restart-safe.
+        /// the table. `AppStateMachine::open()` relies on this to be restart-safe.
         #[test]
         fn test_redb_open_table_preserves_existing_data() {
             let dir = TempDir::new().unwrap();
@@ -205,36 +171,31 @@ pub(crate) mod raft_impl {
         }
 
         #[test]
-        fn test_validate_store_consistency_both_none() {
-            validate_store_consistency(None, None).expect("none/none is consistent");
+        fn test_validate_store_consistency_fresh_node() {
+            // A fresh log store's first retained index is 1 with nothing applied.
+            validate_store_consistency(1, None).expect("fresh node is consistent");
         }
 
         #[test]
         fn test_validate_store_consistency_no_purge() {
-            let applied = Some(log_id(1, 5));
-            validate_store_consistency(None, applied).expect("no purge, applied set: consistent");
+            validate_store_consistency(1, Some(5)).expect("applied set: consistent");
         }
 
         #[test]
         fn test_validate_store_consistency_applied_ahead() {
-            let purged = Some(log_id(1, 3));
-            let applied = Some(log_id(1, 10));
-            validate_store_consistency(purged, applied).expect("applied > purged: consistent");
+            validate_store_consistency(4, Some(10)).expect("applied > first_index: consistent");
         }
 
         #[test]
-        fn test_validate_store_consistency_applied_equals_purged() {
-            let lid = log_id(1, 5);
-            validate_store_consistency(Some(lid), Some(lid))
-                .expect("applied == purged: consistent");
+        fn test_validate_store_consistency_applied_equals_first_minus_one() {
+            // applied == first_index - 1 is the exact boundary.
+            validate_store_consistency(6, Some(5)).expect("applied == first_index - 1: consistent");
         }
 
         #[test]
-        fn test_validate_store_consistency_applied_behind_purged() {
-            let purged = Some(log_id(1, 10));
-            let applied = Some(log_id(1, 3));
-            let err = validate_store_consistency(purged, applied)
-                .expect_err("applied < purged: must be an error");
+        fn test_validate_store_consistency_applied_behind_first() {
+            let err = validate_store_consistency(11, Some(3))
+                .expect_err("applied + 1 < first_index: must be an error");
             assert!(
                 err.to_string().contains("state machine is behind"),
                 "error message must explain the skew: {err}"
@@ -242,18 +203,12 @@ pub(crate) mod raft_impl {
         }
 
         #[test]
-        fn test_validate_store_consistency_purged_set_applied_none() {
-            let purged = Some(log_id(1, 5));
-            let err = validate_store_consistency(purged, None)
-                .expect_err("purged set but applied None: must be an error");
-            assert!(
-                err.to_string()
-                    .contains("state machine last_applied is None"),
-                "error message must identify missing last_applied: {err}"
-            );
+        fn test_validate_store_consistency_applied_none_is_consistent() {
+            // Nothing applied yet: raft will apply from the first retained index.
+            validate_store_consistency(6, None).expect("applied None is consistent");
         }
     }
 }
 
 #[cfg(feature = "distributed-raft")]
-pub use raft_impl::{ArrowRedbLogStore, ArrowRedbStateMachine, validate_store_consistency};
+pub use raft_impl::{AppStateMachine, RaftRedbLogStore, validate_store_consistency};

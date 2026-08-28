@@ -55,10 +55,10 @@ unique across the whole workflow.
 | Node | Declares | Links |
 |---|---|---|
 | `transformer` | `format`, an optional `options` child | none: a source or sink names it |
-| `source` | `type`, `component`, optional `transformer`, a `config` child | outbound only |
+| `source` | `type`, `component`, optional `transformer`, optional `retry`, a `config` child | outbound only |
 | `wasm` | optional `module`, optional `sha3_256`, `config` and `window` children | inbound and outbound |
 | `plugin` | `library`, otherwise the same as `wasm` | inbound and outbound |
-| `sink` | `type`, `component`, optional `transformer`, a `config` child | inbound only |
+| `sink` | `type`, `component`, optional `transformer`, optional `retry`, a `config` child | inbound only |
 | `link` | `from`, `to`, optional `branch` | it is the edge |
 
 One source, one processor, one sink is the whole shape:
@@ -172,6 +172,38 @@ A `link` takes a `branch` name, and the upstream processor picks which branches
 each batch reaches: [Branching](@/service/branching.md). A `wasm` or `plugin`
 node takes a `window` block declaring event-time geometry, and the host tracks
 that node's watermark: [Windowing](@/service/windowing.md).
+
+### Retrying connector operations
+
+Every `source` and `sink` retries a failed operation with exponential backoff
+before the error reaches the runner: 4 attempts, a 100 ms base delay, 2.0x
+growth, a 30 s cap and 0.1 jitter, the same policy as a pipeline system retry.
+EOF from a source is not an error and is not retried.
+
+An optional `retry` child on a `source` or `sink` overrides the policy for that
+node. `max_attempts=1` disables retrying.
+
+```kdl,name=A source that retries with a longer backoff
+source "orders_in" type="NatsSource" component="Order" {
+    retry max_attempts=8 base_delay_ms=500 multiplier=2.0 max_delay_ms=30000 jitter=0.1
+    config subject="orders"
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_attempts` | 4 | total attempts including the first; 1 disables retrying |
+| `base_delay_ms` | 100 | delay before the second attempt |
+| `multiplier` | 2.0 | growth factor per attempt, at least 1.0 |
+| `max_delay_ms` | 30000 | ceiling on the computed delay |
+| `jitter` | 0.1 | fraction of the delay randomised, 0.0 to 1.0 |
+
+The wrapper retries every error, not just connection failures. A connector's
+own reconnect settings, such as the postgres `connection.reconnect` block,
+compose beneath it: the connector re-establishes the session, and if it still
+fails the wrapper retries the operation. `retry` must sit beside `config`,
+never inside it, because each connector's `config` is strict about its own
+keys.
 
 ## Pacing a standalone run
 

@@ -39,6 +39,22 @@ pub trait Source: Send + Sync {
     }
 }
 
+/// Delegating impl so a boxed source can be wrapped like a concrete one.
+#[async_trait]
+impl<S: Source + ?Sized> Source for Box<S> {
+    fn schema(&self) -> Arc<Schema> {
+        (**self).schema()
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
+        (**self).next_batch().await
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        (**self).estimated_rows()
+    }
+}
+
 /// Drain all batches from `source` into `dataset` under `component_name`.
 ///
 /// The component must already be registered (via

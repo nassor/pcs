@@ -143,8 +143,8 @@ mod tests {
     use super::*;
     use pcs_connector::{ConfigMap, ConfigValue};
     use pcs_service::service::config::{
-        HttpConfig, LinkSpec, NodeConfig, ObservabilityConfig, ServiceConfig, ServiceMode,
-        SinkSpec, SourceSpec, StandaloneConfig, WorkflowSpec,
+        HttpConfig, LinkSpec, NodeConfig, ObservabilityConfig, RetryConfig, ServiceConfig,
+        ServiceMode, SinkSpec, SourceSpec, StandaloneConfig, WorkflowSpec,
     };
     use std::path::PathBuf;
 
@@ -211,6 +211,7 @@ mod tests {
                 type_name: "ClickHouseSink".to_string(), // not built-in
                 transformer: None,
                 component: "orders".to_string(),
+                retry: RetryConfig::default(),
                 config: ConfigValue::Object(ConfigMap::new()),
             }],
         );
@@ -232,6 +233,7 @@ mod tests {
                 type_name: "MongoSource".to_string(), // not built-in
                 transformer: None,
                 component: "orders".to_string(),
+                retry: RetryConfig::default(),
                 config: ConfigValue::Object(ConfigMap::new()),
             }],
             vec![],

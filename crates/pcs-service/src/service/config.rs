@@ -41,11 +41,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use pcs_config::one_or_many;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PcsError, PcsResult};
+use pcs_core::retry::{RetryMode, SystemConfig};
 
 /// The configuration language, re-exported so an embedder that reads
 /// [`SourceSpec::config`] or writes a factory names one path.
@@ -57,6 +59,26 @@ pub use pcs_config::{ConfigMap, ConfigValue, from_kdl_str, substitute_env_vars};
 /// rejects.
 fn default_config() -> ConfigValue {
     ConfigValue::Object(ConfigMap::new())
+}
+/// Default total attempts (initial + retries) for a source or sink node.
+fn default_retry_attempts() -> u32 {
+    4
+}
+/// Default delay before the second attempt.
+fn default_retry_base_ms() -> u64 {
+    100
+}
+/// Default growth factor applied per attempt.
+fn default_retry_mult() -> f64 {
+    2.0
+}
+/// Default ceiling on the computed delay.
+fn default_retry_max_ms() -> u64 {
+    30_000
+}
+/// Default fraction of the delay randomised.
+fn default_retry_jitter() -> f64 {
+    0.1
 }
 
 // Flexible deserializers: accept either the native type, or a string that
@@ -597,6 +619,83 @@ pub struct TransformerSpec {
     pub options: ConfigValue,
 }
 
+/// Retry policy for a source or sink node.
+///
+/// An omitted `retry` block uses the same policy as
+/// `pcs_core::retry::SystemConfig::default()`: 4 attempts (3 retries) with
+/// 100 ms base delay, 2.0x multiplier, 30 s cap and 0.1 jitter.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    /// Total attempts including the initial one; 1 disables retrying.
+    #[serde(default = "default_retry_attempts")]
+    pub max_attempts: u32,
+    /// Delay before the second attempt.
+    #[serde(default = "default_retry_base_ms")]
+    pub base_delay_ms: u64,
+    /// Growth factor applied per attempt.
+    #[serde(default = "default_retry_mult")]
+    pub multiplier: f64,
+    /// Ceiling on the computed delay.
+    #[serde(default = "default_retry_max_ms")]
+    pub max_delay_ms: u64,
+    /// Fraction of the delay randomised, in `0.0..=1.0`.
+    #[serde(default = "default_retry_jitter")]
+    pub jitter: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_retry_attempts(),
+            base_delay_ms: default_retry_base_ms(),
+            multiplier: default_retry_mult(),
+            max_delay_ms: default_retry_max_ms(),
+            jitter: default_retry_jitter(),
+        }
+    }
+}
+
+impl RetryConfig {
+    fn validate(&self, what: &str) -> Result<(), PcsError> {
+        if self.max_attempts < 1 {
+            return Err(PcsError::configuration(format!(
+                "{what}: retry.max_attempts must be at least 1"
+            )));
+        }
+        if self.multiplier < 1.0 || self.multiplier.is_nan() {
+            return Err(PcsError::configuration(format!(
+                "{what}: retry.multiplier must be at least 1.0, got {}",
+                self.multiplier
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.jitter) {
+            return Err(PcsError::configuration(format!(
+                "{what}: retry.jitter must be within 0.0..=1.0, got {}",
+                self.jitter
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `pcs-core` retry policy this config drives.
+    pub fn to_system_config(&self) -> SystemConfig {
+        if self.max_attempts == 1 {
+            SystemConfig::minimal()
+        } else {
+            SystemConfig {
+                retry_mode: RetryMode::ExponentialBackoff {
+                    max_retries: (self.max_attempts - 1) as usize,
+                    base_delay: Duration::from_millis(self.base_delay_ms),
+                    multiplier: self.multiplier,
+                    max_delay: Duration::from_millis(self.max_delay_ms),
+                    jitter: self.jitter,
+                },
+            }
+        }
+    }
+}
+
 /// Declares an IO source that feeds rows into a component column.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -616,6 +715,10 @@ pub struct SourceSpec {
     /// Name of the component this source writes into. Checked against the
     /// runtime's `declared_components()` at load time.
     pub component: String,
+    /// Retry policy for every source operation. Omitted block uses the
+    /// defaults (4 attempts, exponential backoff).
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// Opaque per-source configuration.
     #[serde(default = "default_config")]
     pub config: ConfigValue,
@@ -640,6 +743,10 @@ pub struct SinkSpec {
     /// Name of the component this sink reads from. Checked against the
     /// runtime's `declared_components()` at load time.
     pub component: String,
+    /// Retry policy for every sink operation. Omitted block uses the
+    /// defaults (4 attempts, exponential backoff).
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// Opaque per-sink configuration.
     #[serde(default = "default_config")]
     pub config: ConfigValue,
@@ -1049,6 +1156,16 @@ impl WorkflowSpec {
                  with run_mode kind=\"stream\"",
                 live.type_name
             )));
+        }
+
+        // Every declared source and sink carries a valid retry block.
+        for spec in &self.sources {
+            spec.retry
+                .validate(&format!("workflow '{wf}' source '{}'", spec.id))?;
+        }
+        for spec in &self.sinks {
+            spec.retry
+                .validate(&format!("workflow '{wf}' sink '{}'", spec.id))?;
         }
 
         // 14. Every present link branch is a valid id.
@@ -1517,6 +1634,7 @@ peer id=2 addr="127.0.0.2:9000"
                     type_name: "MongoSource".to_string(),
                     transformer: None,
                     component: "orders".to_string(),
+                    retry: RetryConfig::default(),
                     config: default_config(),
                 }],
                 #[cfg(feature = "wasm")]
@@ -1529,6 +1647,7 @@ peer id=2 addr="127.0.0.2:9000"
                     type_name: "PostgresSink".to_string(),
                     transformer: None,
                     component: "orders".to_string(),
+                    retry: RetryConfig::default(),
                     config: default_config(),
                 }],
                 links: Vec::new(),
@@ -2840,6 +2959,133 @@ wasm "p" module="p.wasm" {
             .to_string();
         assert!(err.contains("window is invalid"), "got: {err}");
         assert!(err.contains("slide_ms"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------ retry
+
+    /// A standalone workflow whose source node carries `retry` as a child
+    /// node, so a test can vary the retry block's properties.
+    fn source_retry_kdl(retry: &str) -> String {
+        format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs-test"
+
+workflow "w" {{
+    source "in" type="NoopSource" component="X" {{
+        {retry}
+    }}
+    sink "out" type="NoopSink" component="X"
+    link from="in" to="out"
+}}
+"#
+        )
+    }
+
+    fn assert_exponential_backoff(
+        config: SystemConfig,
+        max_retries: usize,
+        base_delay_ms: u64,
+        multiplier: f64,
+        max_delay_ms: u64,
+        jitter: f64,
+    ) {
+        match config.retry_mode {
+            RetryMode::ExponentialBackoff {
+                max_retries: got_retries,
+                base_delay,
+                multiplier: got_multiplier,
+                max_delay,
+                jitter: got_jitter,
+            } => {
+                assert_eq!(got_retries, max_retries);
+                assert_eq!(base_delay, Duration::from_millis(base_delay_ms));
+                assert_eq!(got_multiplier, multiplier);
+                assert_eq!(max_delay, Duration::from_millis(max_delay_ms));
+                assert_eq!(got_jitter, jitter);
+            }
+            other => panic!("expected ExponentialBackoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_defaults_when_the_block_is_omitted() {
+        let cfg = parse(&minimal_standalone_kdl()).expect("parse should succeed");
+        let wf = &cfg.workflows[0];
+        assert_eq!(wf.sources[0].retry, RetryConfig::default());
+        assert_eq!(wf.sinks[0].retry, RetryConfig::default());
+        assert_exponential_backoff(
+            wf.sources[0].retry.to_system_config(),
+            3,
+            100,
+            2.0,
+            30_000,
+            0.1,
+        );
+    }
+
+    #[test]
+    fn a_retry_block_parses() {
+        let cfg = parse(&source_retry_kdl(
+            "retry max_attempts=8 base_delay_ms=500 multiplier=2.0 max_delay_ms=10000 jitter=0.1",
+        ))
+        .expect("parse should succeed");
+        let retry = &cfg.workflows[0].sources[0].retry;
+        assert_eq!(retry.max_attempts, 8);
+        assert_eq!(retry.base_delay_ms, 500);
+        assert_eq!(retry.multiplier, 2.0);
+        assert_eq!(retry.max_delay_ms, 10_000);
+        assert_eq!(retry.jitter, 0.1);
+    }
+
+    #[test]
+    fn max_attempts_one_disables_retrying() {
+        let cfg = parse(&source_retry_kdl("retry max_attempts=1")).expect("parse should succeed");
+        let sys = cfg.workflows[0].sources[0].retry.to_system_config();
+        assert!(matches!(sys.retry_mode, RetryMode::None));
+        assert_eq!(sys.retry_mode.max_attempts(), 1);
+    }
+
+    #[test]
+    fn custom_params_map_to_an_exponential_backoff() {
+        let cfg = parse(&source_retry_kdl(
+            "retry max_attempts=8 base_delay_ms=500 multiplier=2.0 max_delay_ms=10000 jitter=0.1",
+        ))
+        .expect("parse should succeed");
+        let sys = cfg.workflows[0].sources[0].retry.to_system_config();
+        assert_exponential_backoff(sys, 7, 500, 2.0, 10_000, 0.1);
+    }
+
+    #[test]
+    fn retry_max_attempts_zero_is_a_configuration_error() {
+        let cfg = parse(&source_retry_kdl("retry max_attempts=0")).expect("parse should succeed");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("retry.max_attempts must be at least 1"),
+            "got: {err}"
+        );
+        assert!(err.contains("source 'in'"), "got: {err}");
+    }
+
+    #[test]
+    fn retry_multiplier_below_one_is_a_configuration_error() {
+        let cfg = parse(&source_retry_kdl("retry multiplier=0.5")).expect("parse should succeed");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("retry.multiplier must be at least 1.0, got 0.5"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_jitter_out_of_range_is_a_configuration_error() {
+        let cfg = parse(&source_retry_kdl("retry jitter=1.5")).expect("parse should succeed");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("retry.jitter must be within 0.0..=1.0, got 1.5"),
+            "got: {err}"
+        );
     }
 
     #[cfg(feature = "windows")]

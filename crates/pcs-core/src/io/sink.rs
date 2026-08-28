@@ -41,6 +41,26 @@ pub trait Sink: Send {
     }
 }
 
+/// Delegating impl so a boxed sink can be wrapped like a concrete one.
+#[async_trait]
+impl<S: Sink + ?Sized> Sink for Box<S> {
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), PcsError> {
+        (**self).write_batch(batch).await
+    }
+
+    async fn finish(&mut self) -> Result<(), PcsError> {
+        (**self).finish().await
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        (**self).schema()
+    }
+
+    fn pending_rows(&self) -> Option<usize> {
+        (**self).pending_rows()
+    }
+}
+
 /// Write all rows of `component_name` from `dataset` to `sink`.
 ///
 /// Retrieves the raw [`RecordBatch`] for the component and calls

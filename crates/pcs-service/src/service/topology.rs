@@ -355,8 +355,8 @@ mod tests {
     use super::*;
     use crate::pipeline::Pipeline;
     use crate::service::config::{
-        HttpConfig, NodeConfig, ObservabilityConfig, SinkSpec, SourceSpec, StandaloneConfig,
-        WorkflowSpec,
+        HttpConfig, NodeConfig, ObservabilityConfig, RetryConfig, SinkSpec, SourceSpec,
+        StandaloneConfig, WorkflowSpec,
     };
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -432,6 +432,7 @@ connection url="nats://localhost:4222" password="hunter2"
                 type_name: "NatsSource".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: source_config,
             }],
             #[cfg(feature = "wasm")]
@@ -444,6 +445,7 @@ connection url="nats://localhost:4222" password="hunter2"
                 type_name: "PostgresSink".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: sink_config,
             }],
             links: vec![super::super::config::LinkSpec {
@@ -741,6 +743,7 @@ connection dsn="postgres://postgres:s3cret@127.0.0.1:5432/pcs"
                 type_name: "FileSource".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: default_config_value(),
             }],
             #[cfg(feature = "wasm")]
@@ -753,6 +756,7 @@ connection dsn="postgres://postgres:s3cret@127.0.0.1:5432/pcs"
                 type_name: "ChannelSink".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: cfg("name \"bridge\""),
             }],
             links: vec![super::super::config::LinkSpec {
@@ -771,6 +775,7 @@ connection dsn="postgres://postgres:s3cret@127.0.0.1:5432/pcs"
                 type_name: "ChannelSource".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: cfg("name \"bridge\""),
             }],
             #[cfg(feature = "wasm")]
@@ -783,6 +788,7 @@ connection dsn="postgres://postgres:s3cret@127.0.0.1:5432/pcs"
                 type_name: "FileSink".to_string(),
                 transformer: None,
                 component: "Order".to_string(),
+                retry: RetryConfig::default(),
                 config: default_config_value(),
             }],
             links: vec![super::super::config::LinkSpec {

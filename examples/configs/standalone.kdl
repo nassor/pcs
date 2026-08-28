@@ -39,6 +39,13 @@ workflow "orders" {
     // Sources feed rows into component columns before the pipeline runs.
     // FileSource requires path and schema_fields.
     source "csv_orders" type="FileSource" component="orders" transformer="csv_fmt" {
+        // Every source retries a failed read with exponential backoff before
+        // the error reaches the runner. The default is 4 attempts, a 100 ms
+        // base, 2.0x growth, a 30 s cap and 0.1 jitter; an explicit `retry`
+        // child overrides it for this node. Here the file reader gets more
+        // attempts with a gentler start.
+        retry max_attempts=6 base_delay_ms=200 multiplier=2.0 max_delay_ms=10000 jitter=0.1
+
         config {
             path "examples/configs/fixtures/orders.csv"
             schema_fields "id" type="Int64" nullable=#false

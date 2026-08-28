@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{PcsError, PcsResult};
+use pcs_core::io::retry::{RetryingSink, RetryingSource};
 use pcs_core::io::sink::Sink;
 use pcs_core::io::source::Source;
 use pcs_core::runtime::PipelineRuntime;
@@ -447,7 +448,11 @@ impl ServiceBuilder {
         if let Some(channels) = &self.channels {
             ctx = ctx.with_channels(channels.clone());
         }
-        let source = factory.build(&spec.config, &ctx)?;
+        let source = Box::new(RetryingSource::new(
+            factory.build(&spec.config, &ctx)?,
+            spec.retry.to_system_config(),
+            &spec.id,
+        ));
         Ok(BuiltNode {
             id: spec.id.clone(),
             name: spec.name.clone(),
@@ -488,7 +493,11 @@ impl ServiceBuilder {
         if let Some(channels) = &self.channels {
             ctx = ctx.with_channels(channels.clone());
         }
-        let sink = factory.build(&spec.config, &ctx)?;
+        let sink = Box::new(RetryingSink::new(
+            factory.build(&spec.config, &ctx)?,
+            spec.retry.to_system_config(),
+            &spec.id,
+        ));
         Ok(BuiltNode {
             id: spec.id.clone(),
             name: spec.name.clone(),
@@ -704,16 +713,18 @@ mod tests {
     use crate::dataset::Dataset;
     use crate::pipeline::Pipeline;
     use crate::service::config::{
-        HttpConfig, NodeConfig, ObservabilityConfig, ServiceMode, SinkSpec, SourceSpec,
-        StandaloneConfig, WorkflowSpec,
+        HttpConfig, NodeConfig, ObservabilityConfig, RetryConfig, ServiceMode, SinkSpec,
+        SourceSpec, StandaloneConfig, WorkflowSpec,
     };
     use crate::service::registry::{SinkFactory, SourceFactory};
     use crate::system::{System, SystemMeta};
+    use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use pcs_connector::{ConfigMap, ConfigValue};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -803,6 +814,7 @@ mod tests {
             type_name: "NoopSource".to_string(),
             transformer: None,
             component: "comp1".to_string(),
+            retry: RetryConfig::default(),
             config: ConfigValue::Object(ConfigMap::new()),
         });
         workflow.sinks.push(SinkSpec {
@@ -811,6 +823,7 @@ mod tests {
             type_name: "NoopSink".to_string(),
             transformer: None,
             component: "comp1".to_string(),
+            retry: RetryConfig::default(),
             config: ConfigValue::Object(ConfigMap::new()),
         });
         workflow.links.push(super::super::config::LinkSpec {
@@ -852,6 +865,7 @@ mod tests {
             type_name: "GhostSource".to_string(),
             transformer: None,
             component: "comp".to_string(),
+            retry: RetryConfig::default(),
             config: ConfigValue::Object(ConfigMap::new()),
         });
         let config = base_config(workflow);
@@ -870,6 +884,7 @@ mod tests {
             type_name: "GhostSink".to_string(),
             transformer: None,
             component: "comp".to_string(),
+            retry: RetryConfig::default(),
             config: ConfigValue::Object(ConfigMap::new()),
         });
         let config = base_config(workflow);
@@ -966,5 +981,246 @@ mod tests {
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].workflow_id, "a");
         assert_eq!(built[1].workflow_id, "b");
+    }
+
+    // ── Retry wrappers ────────────────────────────────────────────────────────
+
+    /// A source that fails the first `failures` `next_batch` calls, then
+    /// yields one 1-row batch. `calls` counts every `next_batch` invocation.
+    struct FlakySource {
+        failures_left: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Source for FlakySource {
+        fn schema(&self) -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
+        }
+
+        async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.failures_left > 0 {
+                self.failures_left -= 1;
+                Err(PcsError::generic("flaky source failure"))
+            } else {
+                let batch = RecordBatch::try_new(
+                    self.schema(),
+                    vec![Arc::new(Int32Array::from(vec![1_i32]))],
+                )
+                .expect("schema should build a batch");
+                Ok(Some(batch))
+            }
+        }
+    }
+
+    struct FlakySourceFactory {
+        failures: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SourceFactory for FlakySourceFactory {
+        fn type_name(&self) -> &'static str {
+            "FlakySource"
+        }
+
+        fn build(
+            &self,
+            _config: &ConfigValue,
+            _ctx: &ConnectorContext,
+        ) -> Result<Box<dyn Source>, PcsError> {
+            Ok(Box::new(FlakySource {
+                failures_left: self.failures,
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    /// A sink whose `write_batch` fails `failures` times, then succeeds.
+    struct FlakySink {
+        write_failures_left: usize,
+        write_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Sink for FlakySink {
+        async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<(), PcsError> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            if self.write_failures_left > 0 {
+                self.write_failures_left -= 1;
+                Err(PcsError::generic("flaky sink write failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn finish(&mut self) -> Result<(), PcsError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
+        }
+    }
+
+    struct FlakySinkFactory {
+        write_failures: usize,
+        write_calls: Arc<AtomicUsize>,
+    }
+
+    impl SinkFactory for FlakySinkFactory {
+        fn type_name(&self) -> &'static str {
+            "FlakySink"
+        }
+
+        fn build(
+            &self,
+            _config: &ConfigValue,
+            _ctx: &ConnectorContext,
+        ) -> Result<Box<dyn Sink>, PcsError> {
+            Ok(Box::new(FlakySink {
+                write_failures_left: self.write_failures,
+                write_calls: Arc::clone(&self.write_calls),
+            }))
+        }
+    }
+
+    /// A one-link workflow whose flaky source feeds a flaky sink, so
+    /// `build_all` produces a valid graph with both nodes retry-wrapped.
+    fn flaky_workflow(source_retry: RetryConfig, sink_retry: RetryConfig) -> WorkflowSpec {
+        let mut workflow = empty_workflow("w");
+        workflow.sources.push(SourceSpec {
+            id: "src1".to_string(),
+            name: None,
+            type_name: "FlakySource".to_string(),
+            transformer: None,
+            component: "comp1".to_string(),
+            retry: source_retry,
+            config: ConfigValue::Object(ConfigMap::new()),
+        });
+        workflow.sinks.push(SinkSpec {
+            id: "sink1".to_string(),
+            name: None,
+            type_name: "FlakySink".to_string(),
+            transformer: None,
+            component: "comp1".to_string(),
+            retry: sink_retry,
+            config: ConfigValue::Object(ConfigMap::new()),
+        });
+        workflow.links.push(super::super::config::LinkSpec {
+            from: "src1".to_string(),
+            to: "sink1".to_string(),
+            branch: None,
+        });
+        workflow
+    }
+
+    #[tokio::test]
+    async fn a_flaky_source_is_retried_until_it_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workflow = flaky_workflow(
+            RetryConfig {
+                base_delay_ms: 1,
+                ..Default::default()
+            },
+            RetryConfig::default(),
+        );
+        let mut service = ServiceBuilder::new()
+            .register_source(FlakySourceFactory {
+                failures: 2,
+                calls: Arc::clone(&calls),
+            })
+            .register_sink(FlakySinkFactory {
+                write_failures: 0,
+                write_calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .build_all(&base_config(workflow))
+            .unwrap_or_else(|e| panic!("build failed: {e}"))
+            .remove(0);
+
+        let node = service.nodes.remove(0);
+        let BuiltNodeKind::Source(mut source) = node.kind else {
+            panic!("expected a source node");
+        };
+        let out = source.next_batch().await.expect("retry should recover");
+        assert_eq!(out.unwrap().num_rows(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two failures then success");
+    }
+
+    #[tokio::test]
+    async fn a_source_with_retry_disabled_surfaces_the_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workflow = flaky_workflow(
+            RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            RetryConfig::default(),
+        );
+        let mut service = ServiceBuilder::new()
+            .register_source(FlakySourceFactory {
+                failures: 2,
+                calls: Arc::clone(&calls),
+            })
+            .register_sink(FlakySinkFactory {
+                write_failures: 0,
+                write_calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .build_all(&base_config(workflow))
+            .unwrap_or_else(|e| panic!("build failed: {e}"))
+            .remove(0);
+
+        let node = service.nodes.remove(0);
+        let BuiltNodeKind::Source(mut source) = node.kind else {
+            panic!("expected a source node");
+        };
+        let err = source.next_batch().await.unwrap_err();
+        let PcsError::RetryExhausted { attempts, .. } = err else {
+            panic!("expected the first error wrapped as RetryExhausted");
+        };
+        assert_eq!(attempts, 1, "single attempt");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "single attempt");
+    }
+
+    #[tokio::test]
+    async fn a_flaky_sink_is_retried_until_it_succeeds() {
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let workflow = flaky_workflow(
+            RetryConfig::default(),
+            RetryConfig {
+                base_delay_ms: 1,
+                ..Default::default()
+            },
+        );
+        let mut service = ServiceBuilder::new()
+            .register_source(FlakySourceFactory {
+                failures: 0,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .register_sink(FlakySinkFactory {
+                write_failures: 1,
+                write_calls: Arc::clone(&write_calls),
+            })
+            .build_all(&base_config(workflow))
+            .unwrap_or_else(|e| panic!("build failed: {e}"))
+            .remove(0);
+
+        let node = service.nodes.remove(1);
+        let BuiltNodeKind::Sink(mut sink) = node.kind else {
+            panic!("expected a sink node");
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .expect("schema should build a batch");
+        sink.write_batch(&batch)
+            .await
+            .expect("retry should recover");
+        assert_eq!(
+            write_calls.load(Ordering::SeqCst),
+            2,
+            "one failure then success"
+        );
     }
 }

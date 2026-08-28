@@ -57,6 +57,15 @@ always names its `transformer` explicitly, there is no implicit default format.
 | `tcp`           | Dials a peer and writes one length-prefixed frame per message | `connect`, `schema_fields` | `pcs-connector-tcp` | `connector-tcp` |
 | `ChannelSink`   | In-process channel (testing/internal)     | `schema_fields`           | `pcs-connector-channel` | `connector-channel` |
 
+### Retry
+
+Every `source` and `sink` retries a failed operation with exponential backoff
+by default: 4 attempts, a 100 ms base, 2.0x growth, a 30 s cap and 0.1 jitter.
+An optional `retry` child on a `source` or `sink` overrides the policy per
+node; `max_attempts=1` disables retrying. `standalone.kdl` and
+`postgresql.kdl` carry explicit `retry` blocks, and
+`docs/content/service/configuration.md` documents every key.
+
 ### Transformers
 
 A workflow declares each byte format it needs as its own `transformer "id"

@@ -81,6 +81,8 @@ source "orders_in" type="KafkaSource" component="Order" transformer="orders_json
 | `auto_offset_reset` | `"earliest"`, one of `earliest`, `latest`, `none` |
 | `commit_on_drain` | `true` |
 | `stop_at_end` | `false` |
+| `compacted` | `false`, one-shot materialized snapshot: latest value per key, tombstones remove keys, read from log start to a captured high watermark, then EOF; requires `key_field` |
+| `key_field` | absent, column the raw message key is written to; compacted mode only |
 | `provision` | see below |
 | `properties` | empty |
 | `schema_fields` | empty |
@@ -92,6 +94,7 @@ source "orders_in" type="KafkaSource" component="Order" transformer="orders_json
 | `brokers` | required |
 | `topic` | required, one topic |
 | `key_field` | absent |
+| `tombstones` | `false`, a row whose columns other than `key_field` are all null is produced with a NULL payload, a Kafka tombstone; requires `key_field` |
 | `flush_timeout_ms` | `30000` |
 | `provision` | see below |
 | `properties` | empty |
@@ -124,17 +127,17 @@ The `properties` node is applied last, after this connector's own defaults, so i
 them and there is no second way to set the same thing. One key is refused:
 `KafkaSource config: set the brokers with 'brokers', not properties.bootstrap.servers`.
 
-## Stream mode and stop_at_end
+## Stream mode, stop_at_end and compacted
 
 <div class="note note-warn">
 <span class="note-label">Stream mode required</span>
 <p>
-<code>KafkaSource</code> counts as a live source unless <code>stop_at_end=#true</code>, and
-config validation refuses a live source outside stream mode:
+<code>KafkaSource</code> counts as a live source unless <code>stop_at_end=#true</code> or
+<code>compacted=#true</code>, and config validation refuses a live source outside stream mode:
 <code>source type 'KafkaSource' never reaches EOF; it requires standalone mode with run_mode
-kind="stream"</code>. Stream mode allows any number of sources, pulled round-robin. The opt-out is read off the raw
-config table, so it has to be a real boolean: <code>stop_at_end="true"</code> in quotes is ignored
-and the source stays live.
+kind="stream"</code>. Stream mode allows any number of sources, pulled round-robin. Both opt-outs
+are read off the raw config table, so each has to be a real boolean: <code>stop_at_end="true"</code>
+in quotes is ignored and the source stays live.
 </p>
 </div>
 
@@ -177,5 +180,5 @@ cargo run --features connector-kafka,wasm --bin pcs-service -- \
 
 </div>
 
-`crates/pcs-connector-kafka/tests/kafka_roundtrip.rs` runs nine tests against a real broker in a
-container, and prints `SKIP:` and passes when no Docker daemon is reachable.
+`crates/pcs-connector-kafka/tests/kafka_roundtrip.rs` runs fourteen tests against a real broker in
+a container, and prints `SKIP:` and passes when no Docker daemon is reachable.

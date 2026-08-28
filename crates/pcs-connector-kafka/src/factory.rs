@@ -192,4 +192,39 @@ schema_fields "id" type="int64"
             .build(&value, &context(NdjsonTransformerFactory))
             .expect("well-formed config must build");
     }
+
+    #[tokio::test]
+    async fn a_compacted_source_config_reaches_the_source() {
+        // `key_field` naming a declared column is checked by `KafkaSource::new`,
+        // so a build that succeeds proves both keys crossed the factory.
+        let value =
+            from_kdl_str(&SOURCE.replace("topic ", "compacted #true\nkey_field \"id\"\ntopic "))
+                .expect("parse kdl");
+        KafkaSourceFactory
+            .build(&value, &context(NdjsonTransformerFactory))
+            .expect("a compacted config must build");
+    }
+
+    #[tokio::test]
+    async fn a_compacted_source_keyed_on_an_undeclared_column_is_rejected() {
+        let value = from_kdl_str(
+            &SOURCE.replace("topic ", "compacted #true\nkey_field \"absent\"\ntopic "),
+        )
+        .expect("parse kdl");
+        let Err(err) = KafkaSourceFactory.build(&value, &context(NdjsonTransformerFactory)) else {
+            panic!("'absent' is not one of the declared schema_fields");
+        };
+        assert_eq!(err.category(), "configuration");
+        assert!(err.message().contains("absent"), "got: {err}");
+    }
+
+    #[test]
+    fn a_tombstone_sink_config_reaches_the_sink() {
+        let value =
+            from_kdl_str(&SINK.replace("topic ", "tombstones #true\nkey_field \"id\"\ntopic "))
+                .expect("parse kdl");
+        KafkaSinkFactory
+            .build(&value, &context(NdjsonTransformerFactory))
+            .expect("a tombstone-enabled config must build");
+    }
 }

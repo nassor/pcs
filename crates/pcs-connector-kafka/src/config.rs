@@ -83,6 +83,18 @@ pub struct KafkaSourceConfig {
     /// live source.
     #[serde(default)]
     pub stop_at_end: bool,
+    /// Column the raw message key is written to. Compacted mode only: the key
+    /// is what a snapshot deduplicates on, and it must name a field the
+    /// declared schema carries. A source that is not `compacted` decodes the
+    /// payload alone and rejects this key rather than ignoring it.
+    #[serde(default)]
+    pub key_field: Option<String>,
+    /// Read the topic as a compacted keyed log: one point-in-time snapshot of
+    /// the latest value per key, chunked into `batch_size` batches, then EOF.
+    /// Committed group offsets are ignored, because a snapshot is always the
+    /// whole state.
+    #[serde(default)]
+    pub compacted: bool,
     /// Topic provisioning.
     #[serde(default)]
     pub provision: TopicProvision,
@@ -108,6 +120,12 @@ pub struct KafkaSinkConfig {
     /// formats only.
     #[serde(default)]
     pub key_field: Option<String>,
+    /// Produce a NULL payload — a Kafka tombstone, the delete marker a
+    /// compacted topic reads as "this key is gone" — for a row whose columns
+    /// other than `key_field` are all null. Every other row is produced
+    /// exactly as it would be with this off.
+    #[serde(default)]
+    pub tombstones: bool,
     /// How long `finish` waits for the producer queue to drain.
     #[serde(default = "default_flush_timeout_ms")]
     pub flush_timeout_ms: u64,
@@ -147,6 +165,25 @@ impl KafkaSourceConfig {
                 "{what} config: 'auto_offset_reset' must be earliest, latest or none"
             )));
         }
+        match (self.compacted, self.key_field.as_deref()) {
+            (true, None) => {
+                return Err(PcsError::configuration(format!(
+                    "{what} config: 'compacted' needs 'key_field': a snapshot of a compacted \
+                     topic is keyed by the message key"
+                )));
+            }
+            (true, Some(field)) if field.trim().is_empty() => {
+                return Err(PcsError::configuration(format!(
+                    "{what} config: 'key_field' must name a column"
+                )));
+            }
+            (false, Some(_)) => {
+                return Err(PcsError::configuration(format!(
+                    "{what} config: 'key_field' is read only with 'compacted' #true"
+                )));
+            }
+            _ => {}
+        }
 
         validate_provision(what, &self.provision)?;
         validate_properties(what, &self.properties)?;
@@ -177,6 +214,13 @@ impl KafkaSinkConfig {
         // Whether `key_field` is honourable depends on the format's message
         // shape, which only the resolved transformer knows, so `KafkaSink::new`
         // checks it rather than this method.
+
+        if self.tombstones && self.key_field.is_none() {
+            return Err(PcsError::configuration(format!(
+                "{what} config: 'tombstones' needs 'key_field': a delete marker names the key \
+                 it deletes"
+            )));
+        }
 
         validate_provision(what, &self.provision)?;
         validate_properties(what, &self.properties)?;
@@ -295,6 +339,8 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, "earliest");
         assert!(cfg.commit_on_drain);
         assert!(!cfg.stop_at_end);
+        assert_eq!(cfg.key_field, None);
+        assert!(!cfg.compacted);
         assert!(cfg.provision.create);
         assert_eq!(cfg.provision.partitions, 1);
         assert_eq!(cfg.provision.replication_factor, 1);
@@ -308,6 +354,7 @@ mod tests {
     fn sink_defaults_are_populated_when_omitted() {
         let cfg = sink("");
         assert_eq!(cfg.key_field, None);
+        assert!(!cfg.tombstones);
         assert_eq!(cfg.flush_timeout_ms, 30_000);
         assert!(cfg.provision.create);
         assert!(cfg.properties.is_empty());
@@ -412,5 +459,59 @@ mod tests {
         );
         assert_eq!(cfg.get("group.id"), Some("pcs"));
         assert_eq!(cfg.get("enable.auto.commit"), Some("false"));
+    }
+
+    #[test]
+    fn a_compacted_source_parses_its_key_field() {
+        let cfg = source("compacted #true\nkey_field \"id\"\n");
+        assert!(cfg.compacted);
+        assert_eq!(cfg.key_field.as_deref(), Some("id"));
+        cfg.validate().expect("a keyed compacted source is valid");
+    }
+
+    #[test]
+    fn a_compacted_source_without_a_key_field_is_a_configuration_error() {
+        let cfg = source("compacted #true\n");
+        let err = cfg.validate().expect_err("compacted must name its key");
+        assert_eq!(err.category(), "configuration");
+        assert!(
+            err.message().contains("'compacted' needs 'key_field'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_compacted_source_with_a_blank_key_field_is_a_configuration_error() {
+        let cfg = source("compacted #true\nkey_field \"  \"\n");
+        let err = cfg.validate().expect_err("a blank key_field must fail");
+        assert!(err.message().contains("'key_field'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_key_field_without_compacted_is_a_configuration_error() {
+        // Nothing reads the source's key outside compacted mode, and this
+        // connector rejects a key it cannot honour rather than dropping it.
+        let cfg = source("key_field \"id\"\n");
+        let err = cfg.validate().expect_err("an unread key_field must fail");
+        assert_eq!(err.category(), "configuration");
+        assert!(err.message().contains("'compacted' #true"), "got: {err}");
+    }
+
+    #[test]
+    fn a_tombstone_sink_parses_with_a_key_field() {
+        let cfg = sink("tombstones #true\nkey_field \"id\"\n");
+        assert!(cfg.tombstones);
+        cfg.validate().expect("a keyed tombstone sink is valid");
+    }
+
+    #[test]
+    fn a_tombstone_sink_without_a_key_field_is_a_configuration_error() {
+        let cfg = sink("tombstones #true\n");
+        let err = cfg.validate().expect_err("a tombstone must name its key");
+        assert_eq!(err.category(), "configuration");
+        assert!(
+            err.message().contains("'tombstones' needs 'key_field'"),
+            "got: {err}"
+        );
     }
 }

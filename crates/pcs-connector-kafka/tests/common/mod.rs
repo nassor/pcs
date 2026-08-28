@@ -17,9 +17,10 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rdkafka::ClientConfig;
-use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::RDKafkaErrorCode;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -147,4 +148,36 @@ pub async fn describe_topic_config(brokers: &str, topic: &str, key: &str) -> Opt
         .ok()?;
     let resource = results.into_iter().next()?.ok()?;
     resource.entry_map().get(key)?.value.clone()
+}
+
+/// Create `topic` on `brokers` with `partitions` partitions and log
+/// compaction enabled (`cleanup.policy=compact`), treating an existing
+/// topic as success.
+///
+/// Mirrors `pcs_connector_kafka::admin::ensure_topics`'s idempotent create,
+/// which integration tests cannot call directly because it is `pub(crate)`.
+pub async fn create_compacted_topic(
+    brokers: &str,
+    topic: &str,
+    partitions: i32,
+) -> anyhow::Result<()> {
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", brokers);
+    let admin: AdminClient<DefaultClientContext> = cfg.create()?;
+
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1))
+        .set("cleanup.policy", "compact");
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_millis(10_000)));
+
+    let results = admin.create_topics(&[new_topic], &opts).await?;
+    for result in results {
+        match result {
+            Ok(_) => {}
+            Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((name, code)) => {
+                anyhow::bail!("cannot create compacted topic '{name}': {code}");
+            }
+        }
+    }
+    Ok(())
 }

@@ -1420,14 +1420,20 @@ impl ServiceConfig {
 }
 
 /// A source that never reports EOF, so only the stream runner may drive it.
+///
+/// A compacted `KafkaSource` is one-shot regardless of `stop_at_end`: it
+/// always reaches EOF once its snapshot is read.
 fn is_live_source(spec: &SourceSpec) -> bool {
+    let config_flag = |key: &str| {
+        spec.config
+            .get(key)
+            .and_then(ConfigValue::as_bool)
+            .unwrap_or(false)
+    };
     match spec.type_name.as_str() {
         "tcp" => true,
-        "KafkaSource" | "NatsSource" => !spec
-            .config
-            .get("stop_at_end")
-            .and_then(ConfigValue::as_bool)
-            .unwrap_or(false),
+        "KafkaSource" => !(config_flag("stop_at_end") || config_flag("compacted")),
+        "NatsSource" => !config_flag("stop_at_end"),
         _ => false,
     }
 }
@@ -1959,6 +1965,32 @@ workflow "w" {
         let cfg = parse(raw_stop_at_end).expect("parse");
         cfg.validate()
             .expect("stop_at_end=#true makes a KafkaSource usable outside stream mode");
+    }
+
+    #[test]
+    fn test_kafka_source_compacted_is_accepted_outside_stream_mode_without_stop_at_end() {
+        // A compacted KafkaSource is one-shot regardless of stop_at_end: it
+        // always reaches EOF once its snapshot is read, so it needs no
+        // stream mode either.
+        let raw = r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+workflow "w" {
+    source "orders_in" type="KafkaSource" component="Order" {
+        config {
+            compacted #true
+            key_field "id"
+        }
+    }
+    sink "out" type="NoopSink" component="Order"
+    link from="orders_in" to="out"
+}
+"#;
+        let cfg = parse(raw).expect("parse");
+        cfg.validate()
+            .expect("compacted=#true makes a KafkaSource usable outside stream mode");
     }
 
     #[test]

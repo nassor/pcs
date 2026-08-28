@@ -47,7 +47,7 @@ for a format that counts rows without reading them.
 ## In service config
 
 <div class="code">
-<div class="code-cap"><span>KDL</span><em>the transformer node and the source that names it, both inside one workflow</em></div>
+<div class="code-cap"><span>KDL</span><em>the transformer node and the source and sink that name it, all inside one workflow</em></div>
 
 ```kdl
 transformer "orders_csv" format="csv" {
@@ -56,6 +56,12 @@ transformer "orders_csv" format="csv" {
 
 source "orders_in" type="FileSource" component="Order" transformer="orders_csv" {
     config path="/data/orders.csv" {
+        schema_fields "id" type="Int64" nullable=#false
+    }
+}
+
+sink "orders_out" type="FileSink" component="Order" transformer="orders_csv" {
+    config path="/data/orders-out.csv" {
         schema_fields "id" type="Int64" nullable=#false
     }
 }
@@ -105,8 +111,12 @@ sink.
 | `FileSource config requires a 'path' string field` | the factory, before construction |
 | `FileSource moves bytes and needs a 'transformer' key naming a declared transformer` | the shared context, when the node declared none |
 | `FileSource: cannot open {path:?}: {e}` | opening the input |
+| `FileSource: spawn_blocking panic: {e}` | open_async when the blocking task panics |
+| `FileSink config requires a 'path' string field` | the factory, before construction |
 | `FileSink: cannot create {path:?}: {e}` | creating the output |
+| `FileSink: cannot clone handle for {path:?}: {e}` | creating the output handle |
 | `FileSink: write_batch called after finish` | writing to a finished sink |
+| `FileSink: sync failed: {e}` | syncing the file after a batch, or at finish |
 
 ## Worked example
 

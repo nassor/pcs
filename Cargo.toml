@@ -6,6 +6,7 @@ members = [
     "crates/pcs-connector-channel",
     "crates/pcs-connector-datafusion",
     "crates/pcs-connector-file",
+    "crates/pcs-connector-http",
     "crates/pcs-connector-kafka",
     "crates/pcs-connector-nats",
     "crates/pcs-connector-postgresql",

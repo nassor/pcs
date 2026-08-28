@@ -206,6 +206,8 @@ crates/
 ├── pcs-connector-channel/     # ChannelSource, ChannelSink: in-memory mpsc transport.
 ├── pcs-connector-datafusion/  # DataFusionSource. No factory: it needs a live SessionContext.
 ├── pcs-connector-file/        # FileSource, FileSink: local-file IO, format from a transformer.
+├── pcs-connector-http/        # HttpSource, HttpSink: one GET spooled through a transformer, and one
+│                              # self-contained document per batch back out. No request at build.
 ├── pcs-connector-kafka/       # KafkaSource, KafkaSink: librdkafka-backed, one topic or several.
 ├── pcs-connector-nats/        # NatsSource, NatsSink: core subject pub/sub or JetStream, chosen by
 │                              # a mode node's kind key.
@@ -355,13 +357,13 @@ binary with no flags. `connector-kafka` stays opt-in because `librdkafka-sys` bu
 needs `cmake` plus a C toolchain; `distributed-raft` and `service-cluster` stay opt-in because a
 cluster node is a deliberate deployment choice.
 
-  `connector-channel`, `connector-file`, `connector-kafka`, `connector-nats`,
+  `connector-channel`, `connector-file`, `connector-http`, `connector-kafka`, `connector-nats`,
   `connector-postgresql`, `connector-s3`, `connector-tcp`: one per connector crate. Each pulls
   the crate in and registers its factories in `register_builtin_factories` (each implies
   `service`).
   `connector-kafka` and `connector-nats` imply `transformer-ndjson` and `connector-tcp` implies
-  `transformer-arrow-ipc`, their default formats. `connector-file` implies no transformer:
-  `format` is required there, so the config picks.
+  `transformer-arrow-ipc`, their default formats. `connector-file` and `connector-http` imply no
+  transformer: `format` is required there, so the config picks.
 - `transformer-arrow-ipc`, `transformer-avro`, `transformer-csv`, `transformer-ndjson`,
   `transformer-parquet`: one per transformer crate, registering its factory under its `format`
   name (each implies `service`).

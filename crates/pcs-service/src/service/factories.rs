@@ -8,6 +8,7 @@
 //!
 //! - `connector-channel`: [`ChannelSourceFactory`], [`ChannelSinkFactory`]
 //! - `connector-file`: [`FileSourceFactory`], [`FileSinkFactory`]
+//! - `connector-http`: [`HttpSourceFactory`], [`HttpSinkFactory`]
 //! - `connector-kafka`: [`KafkaSourceFactory`], [`KafkaSinkFactory`]
 //! - `connector-nats`: [`NatsSourceFactory`], [`NatsSinkFactory`]
 //! - `connector-s3`: [`S3SourceFactory`], [`S3SinkFactory`]
@@ -25,6 +26,8 @@
 pub use pcs_connector_channel::{ChannelSinkFactory, ChannelSourceFactory};
 #[cfg(feature = "connector-file")]
 pub use pcs_connector_file::{FileSinkFactory, FileSourceFactory};
+#[cfg(feature = "connector-http")]
+pub use pcs_connector_http::{HttpSinkFactory, HttpSourceFactory};
 #[cfg(feature = "connector-kafka")]
 pub use pcs_connector_kafka::{KafkaSinkFactory, KafkaSourceFactory};
 #[cfg(feature = "connector-nats")]
@@ -96,6 +99,11 @@ pub fn register_builtin_factories(builder: ServiceBuilder) -> ServiceBuilder {
     let builder = builder
         .register_source(FileSourceFactory)
         .register_sink(FileSinkFactory);
+
+    #[cfg(feature = "connector-http")]
+    let builder = builder
+        .register_source(HttpSourceFactory)
+        .register_sink(HttpSinkFactory);
 
     #[cfg(feature = "connector-kafka")]
     let builder = builder

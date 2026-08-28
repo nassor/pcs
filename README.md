@@ -161,6 +161,7 @@ languages](./examples/polyglot/PINS.md).
 | `pcs-connector-channel` | In-memory mpsc `Source` and `Sink`. |
 | `pcs-connector-datafusion` | `Source` over a DataFusion SQL query. |
 | `pcs-connector-file` | Local-file `Source` and `Sink`. A transformer supplies the format. |
+| `pcs-connector-http` | HTTP and HTTPS `Source` and `Sink`. One GET in, one request per batch out. |
 | `pcs-connector-kafka` | Kafka `Source` and `Sink`. |
 | `pcs-connector-nats` | NATS `Source` and `Sink`, core subjects or JetStream. |
 | `pcs-connector-postgresql` | PostgreSQL `Source` and `Sink`. |

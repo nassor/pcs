@@ -115,6 +115,9 @@ path = "@/connectors/datafusion.md"
 [[extra.nav.items.children]]
 title = "S3"
 path = "@/connectors/s3.md"
+[[extra.nav.items.children]]
+title = "HTTP"
+path = "@/connectors/http.md"
 [[extra.nav.items]]
 title = "Transformers"
 path = "@/transformers/_index.md"

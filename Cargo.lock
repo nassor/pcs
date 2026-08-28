@@ -4238,6 +4238,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcs-connector-http"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "pcs-connector",
+ "pcs-core",
+ "pcs-transformer",
+ "pcs-transformer-csv",
+ "reqwest 0.13.4",
+ "rustls",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pcs-connector-kafka"
 version = "0.1.0"
 dependencies = [
@@ -4485,6 +4502,7 @@ dependencies = [
  "pcs-connector",
  "pcs-connector-channel",
  "pcs-connector-file",
+ "pcs-connector-http",
  "pcs-connector-kafka",
  "pcs-connector-nats",
  "pcs-connector-postgresql",

@@ -28,6 +28,7 @@ default = [
     "parquet-checkpoint",
     "connector-channel",
     "connector-file",
+    "connector-http",
     "connector-nats",
     "connector-postgresql",
     "connector-s3",
@@ -101,6 +102,9 @@ connector-channel = ["service", "dep:pcs-connector-channel"]
 # node names its declared `transformer` explicitly, so the user picks which
 # formats the binary can honour.
 connector-file = ["service", "dep:pcs-connector-file"]
+# Like `connector-file`, an HTTP node names its `transformer` explicitly, so no
+# `transformer-*` feature is implied: the config picks the formats.
+connector-http = ["service", "dep:pcs-connector-http"]
 # Kafka, NATS and TCP each pull in one transformer feature as a convenience
 # default so the feature alone is runnable; none of the three connectors
 # resolves a format implicitly anymore, every byte-carrying node names its
@@ -145,6 +149,7 @@ pcs-plugin-abi = { path = "../pcs-plugin-abi", version = "0.1.0", optional = tru
 pcs-inspector-wire = { path = "../pcs-inspector-wire", version = "0.1.0", optional = true }
 pcs-connector-channel = { path = "../pcs-connector-channel", version = "0.1.0", optional = true }
 pcs-connector-file = { path = "../pcs-connector-file", version = "0.1.0", optional = true }
+pcs-connector-http = { path = "../pcs-connector-http", version = "0.1.0", optional = true }
 pcs-connector-kafka = { path = "../pcs-connector-kafka", version = "0.1.0", optional = true }
 pcs-connector-nats = { path = "../pcs-connector-nats", version = "0.1.0", optional = true }
 pcs-connector-postgresql = { path = "../pcs-connector-postgresql", version = "0.1.0", optional = true }

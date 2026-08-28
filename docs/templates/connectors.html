@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Connectors — PCS{% endblock %}
-{% block description %}One page per connector PCS ships: the crate, the pcs-service feature, the Rust constructor, and the config node. Channel, File, PostgreSQL, Kafka, NATS, TCP, DataFusion SQL, S3.{% endblock %}
+{% block description %}One page per connector PCS ships: the crate, the pcs-service feature, the Rust constructor, and the config node. Channel, File, PostgreSQL, Kafka, NATS, TCP, DataFusion SQL, S3, HTTP.{% endblock %}
 {% block og_title %}Connectors — PCS{% endblock %}
 {% block og_description %}One page per connector: what to depend on, what to call, and what its config node accepts.{% endblock %}
 
@@ -11,7 +11,7 @@
 <h1>Connectors</h1>
 
 <p class="page-lede">
-    Seven crates implement <code>Source</code> and <code>Sink</code>. Each one has its own page,
+    Eight crates implement <code>Source</code> and <code>Sink</code>. Each one has its own page,
     naming the crate to depend on, the constructor to call, and the keys its config node
     accepts.
 </p>
@@ -37,7 +37,7 @@
     {% endfor %}
 </div>
 
-<h2 id="matrix">The eight at a glance</h2>
+<h2 id="matrix">The nine at a glance</h2>
 
 <table class="rule-table">
     <thead>
@@ -108,6 +108,14 @@
             <td>any</td>
             <td><code>connector-s3</code></td>
         </tr>
+        <tr>
+            <td><strong><a href="{{ get_url(path='@/connectors/http.md') }}">HTTP</a></strong></td>
+            <td><code>HttpSource</code>, <code>HttpSink</code></td>
+            <td>source and sink</td>
+            <td>required</td>
+            <td>any</td>
+            <td><code>connector-http</code></td>
+        </tr>
     </tbody>
 </table>
 
@@ -122,7 +130,7 @@
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>TOML</span><em>the dependency form is the same for all seven</em></div>
+    <div class="code-cap"><span>TOML</span><em>the dependency form is the same for all eight</em></div>
     <pre><code class="language-toml"># In a clone of the repository.
 pcs-connector-file = { path = "crates/pcs-connector-file" }
 

@@ -1,6 +1,6 @@
 +++
 title = "Connectors"
-description = "One transport per crate: what to depend on, what to call, and what its config node accepts. Channel, File, PostgreSQL, Kafka, NATS, TCP, DataFusion SQL, S3."
+description = "One transport per crate: what to depend on, what to call, and what its config node accepts. Channel, File, PostgreSQL, Kafka, NATS, TCP, DataFusion SQL, S3, HTTP."
 template = "connectors.html"
 sort_by = "weight"
 +++

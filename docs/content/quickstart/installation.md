@@ -31,12 +31,12 @@ cargo install --path crates/pcs-service
 No `--features` flag. The default bundle is what a running service needs:
 `service` for the binary target itself, `wasm` for the component runtime,
 `mimalloc` for the allocator, `windows` for the platform shims,
-`parquet-checkpoint` for checkpoint encoding, five connectors and five
+`parquet-checkpoint` for checkpoint encoding, seven connectors and five
 transformers.
 
 | Group | In the default bundle |
 |---|---|
-| Connectors | `connector-channel`, `connector-file`, `connector-nats`, `connector-postgresql`, `connector-tcp` |
+| Connectors | `connector-channel`, `connector-file`, `connector-http`, `connector-nats`, `connector-postgresql`, `connector-s3`, `connector-tcp` |
 | Transformers | `transformer-ndjson`, `transformer-csv`, `transformer-parquet`, `transformer-avro`, `transformer-arrow-ipc` |
 | Runtime | `service`, `wasm`, `mimalloc`, `windows`, `parquet-checkpoint` |
 

@@ -244,6 +244,19 @@ fn pack_nuget(ctx: &Ctx, packages: &Path, dist: &Path) -> Result<()> {
 /// Publish the Kotlin packages into `docs/static/maven/` and archive them.
 fn publish_maven(ctx: &Ctx, packages: &Path, version: &str) -> Result<()> {
     ctx.log("publishing the Kotlin packages into docs/static/maven/...");
+
+    // pcs-sdk-kt-ksp's build.gradle.kts resolves `io.github.nassor:pcs-sdk-kt`
+    // from mavenLocal() at configure time (see that file), so this task must
+    // populate it itself rather than relying on `cargo xtask polyglot` (which
+    // publishes there too, for its own unrelated stage build) having already
+    // run in the same environment: `pack-sdk` is run standalone in CI and
+    // must be self-sufficient.
+    ctx.cmd("gradle")?
+        .arg("-p")
+        .arg(packages.join("pcs-sdk-kt"))
+        .args(["--quiet", "--console=plain", "publishToMavenLocal"])
+        .run()?;
+
     for project in ["pcs-sdk-kt", "pcs-sdk-kt-ksp"] {
         ctx.cmd("gradle")?
             .arg("-p")

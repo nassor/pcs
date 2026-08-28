@@ -48,7 +48,8 @@ use super::config::ServiceMode;
 ///
 /// The keys are the strings `SourceFactory::type_name` / `SinkFactory::type_name`
 /// return, which is what a config's `type =` names — not the Rust type names.
-/// `TcpIngestSource` registers itself as `"tcp"`, so that is the entry here.
+/// Both TCP halves register as `"tcp"`, so that one entry covers the source's
+/// `bind` and the sink's `connect`.
 ///
 /// Dotted keys walk nested tables (`mode.subject` reads `[sources.config.mode]`
 /// then `subject`). A `type` absent from this table gets no detail at all: an
@@ -65,7 +66,7 @@ const DETAIL_ALLOWLIST: &[(&str, &[&str])] = &[
     ("FileSink", &["path"]),
     ("KafkaSource", &["topic"]),
     ("KafkaSink", &["topic"]),
-    ("tcp", &["bind"]),
+    ("tcp", &["bind", "connect"]),
     ("ChannelSource", &["name"]),
     ("ChannelSink", &["name"]),
 ];

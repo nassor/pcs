@@ -293,7 +293,7 @@ arrives with one `connector-*` feature.
 |---|---|---|---|
 | `FileSource` | `FileSink` | `connector-file` | `path`, plus `schema_fields` where the format needs it |
 | `PostgresSource` | `PostgresSink` | `connector-postgresql` | `name`, `connection`, `schema_fields`, plus `mode` or `table` |
-| `tcp` | | `connector-tcp` | `bind`, `schema_fields` |
+| `tcp` | `tcp` | `connector-tcp` | `bind` on the source, `connect` on the sink, `schema_fields` on both |
 | `ChannelSource` | `ChannelSink` | `connector-channel` | `schema_fields`. In-process, for tests |
 | `KafkaSource` | `KafkaSink` | `connector-kafka` | `brokers`, `topic`, `schema_fields` |
 | `NatsSource` | `NatsSink` | `connector-nats` | `connection`, `mode`, `schema_fields` |

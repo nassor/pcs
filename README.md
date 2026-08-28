@@ -164,7 +164,7 @@ languages](./examples/polyglot/PINS.md).
 | `pcs-connector-kafka` | Kafka `Source` and `Sink`. |
 | `pcs-connector-nats` | NATS `Source` and `Sink`, core subjects or JetStream. |
 | `pcs-connector-postgresql` | PostgreSQL `Source` and `Sink`. |
-| `pcs-connector-tcp` | Live TCP ingest `Source`. |
+| `pcs-connector-tcp` | Live TCP `Source` that listens and `Sink` that dials, over one length-prefixed frame. |
 | `pcs-processor` | Processor SDK. Re-exports `pcs-core`, provides `export_pipeline!`, owns the canonical WIT at `wit/pipeline.wit`. |
 | `pcs-processor-smoketest` | Minimal processor component used by CI to gate the Arrow IPC wire format. |
 | `pcs-plugin` | Native plugin host: loads a shared library through the `pcs-plugin-abi` C ABI. |

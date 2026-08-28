@@ -1,19 +1,28 @@
-//! The TCP ingest source factory.
+//! The TCP source and sink factories.
+//!
+//! Both register as `type="tcp"`: the registry keeps its source and sink maps
+//! apart, so one string names the listening half in a `source` node and the
+//! connecting half in a `sink` node.
 //!
 //! [`TcpIngestSource`] is a live source: it never reaches EOF, so it only works
-//! under standalone stream mode (`run_mode kind="stream"`).
-//! The service config validator rejects `type="tcp"` in any other mode.
+//! under standalone stream mode (`run_mode kind="stream"`). The service config
+//! validator rejects `type="tcp"` on a `source` node in any other mode. That
+//! rule reads source nodes only, so a `tcp` sink runs in every mode.
 //!
-//! Producers write a `u32` big-endian length plus one payload per frame. What
-//! the payload bytes are is the transformer's business: the source's
-//! `transformer` key names a declared `transformer` node, and that node's
-//! format decides how each frame decodes. There is no default.
+//! Producers write a `u32` big-endian length plus one payload per frame, and
+//! [`TcpSink`] writes the same. What the payload bytes are is the transformer's
+//! business: the node's `transformer` key names a declared `transformer` node,
+//! and that node's format decides how each frame encodes or decodes. There is
+//! no default.
 
-use pcs_connector::{ConfigValue, ConnectorContext, SourceFactory, parse_schema_fields};
+use pcs_connector::{
+    ConfigValue, ConnectorContext, SinkFactory, SourceFactory, parse_schema_fields,
+};
 use pcs_core::error::PcsError;
+use pcs_core::io::sink::Sink;
 use pcs_core::io::source::Source;
 
-use crate::TcpIngestSource;
+use crate::{TcpIngestSource, TcpSink};
 
 /// Default number of decoded batches queued before backpressure.
 const DEFAULT_BUFFER: usize = 64;
@@ -70,6 +79,43 @@ impl SourceFactory for TcpSourceFactory {
             max_frame_bytes,
             transformer,
         )?))
+    }
+}
+
+/// Factory for [`TcpSink`].
+///
+/// Config fields:
+/// - `connect` (string, required): peer address to dial, e.g.
+///   `"collector.internal:9500"`.
+/// - `schema_fields` (list, required): Arrow schema definition.
+///
+/// Each batch is encoded by the transformer the host bound to this node from
+/// its `transformer` key, reached through the [`ConnectorContext`] rather than
+/// read out of `config`. The address is resolved here and dialled on the first
+/// batch, so a peer that is down fails at serve time, not at validate time.
+pub struct TcpSinkFactory;
+
+impl SinkFactory for TcpSinkFactory {
+    fn type_name(&self) -> &'static str {
+        "tcp"
+    }
+
+    fn build(
+        &self,
+        config: &ConfigValue,
+        ctx: &ConnectorContext,
+    ) -> Result<Box<dyn Sink>, PcsError> {
+        let connect = config
+            .get("connect")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                PcsError::configuration("tcp sink config requires a 'connect' string")
+            })?;
+
+        let schema = parse_schema_fields(config, "tcp")?;
+        let transformer = ctx.transformer("tcp")?;
+
+        Ok(Box::new(TcpSink::connect(connect, schema, transformer)?))
     }
 }
 
@@ -143,5 +189,68 @@ schema_fields "v" type="Int64"
             .expect("build must fail");
         assert_eq!(err.category(), "configuration", "got: {err}");
         assert!(err.to_string().contains("schema_fields"), "got: {err}");
+    }
+
+    fn sink_config() -> ConfigValue {
+        from_kdl_str(
+            r#"
+connect "127.0.0.1:9500"
+
+schema_fields "v" type="Int64" nullable=#false
+"#,
+        )
+        .expect("parse test config")
+    }
+
+    #[test]
+    fn the_sink_builds_from_connect_and_schema_fields() {
+        let sink = TcpSinkFactory
+            .build(&sink_config(), &ConnectorContext::new(Some(transformer())))
+            .expect("build");
+        assert_eq!(sink.schema().fields().len(), 1);
+    }
+
+    /// One config `type` names both halves; the registry keeps them apart.
+    #[test]
+    fn both_halves_register_as_tcp() {
+        assert_eq!(TcpSourceFactory.type_name(), "tcp");
+        assert_eq!(TcpSinkFactory.type_name(), "tcp");
+    }
+
+    #[test]
+    fn sink_missing_connect_is_a_configuration_error() {
+        let cfg = from_kdl_str(
+            r#"
+schema_fields "v" type="Int64"
+"#,
+        )
+        .unwrap();
+        let err = TcpSinkFactory
+            .build(&cfg, &ConnectorContext::new(None))
+            .err()
+            .expect("build must fail");
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(err.to_string().contains("'connect'"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_missing_schema_fields_is_a_configuration_error() {
+        let cfg = from_kdl_str("connect \"127.0.0.1:9500\"\n").unwrap();
+        let err = TcpSinkFactory
+            .build(&cfg, &ConnectorContext::new(None))
+            .err()
+            .expect("build must fail");
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(err.to_string().contains("schema_fields"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sink_missing_its_transformer_is_a_configuration_error() {
+        let err = TcpSinkFactory
+            .build(&sink_config(), &ConnectorContext::new(None))
+            .err()
+            .expect("build must fail");
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(err.message().contains("'transformer'"), "got: {err}");
     }
 }

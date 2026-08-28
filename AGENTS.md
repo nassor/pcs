@@ -213,8 +213,9 @@ crates/
 │                              # polling / cdc_trigger / cdc_logical read modes.
 ├── pcs-connector-s3/          # S3Source, S3Sink: any S3-compatible endpoint, timestamped
 │                              # object keys, row/byte/age flush thresholds.
-├── pcs-connector-tcp/         # TcpIngestSource: live length-prefixed frames, decoded by a
-│                              # transformer. Framing is transport, decoding is format.
+├── pcs-connector-tcp/         # TcpIngestSource, TcpSink: live length-prefixed frames, decoded and
+│                              # encoded by a transformer. The source listens, the sink dials, both
+│                              # register as "tcp". Framing is transport, decoding is format.
 ├── pcs-processor/           # Processor SDK: re-exports pcs-core, the export_pipeline! macro, and
 │                            # pcs_macros::{Component, transform, fold, processor} plus
 │                            # Config/Error/Result, so a processor crate depends only on

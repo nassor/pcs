@@ -17,6 +17,7 @@ feature that registers its factory. Build with:
 | `postgresql.kdl` | `connector-postgresql,wasm` |
 | `s3.kdl` | `connector-s3,transformer-csv,wasm` |
 | `cluster.kdl` | `service-cluster,connector-file,transformer-csv,wasm` |
+| `tcp.kdl` | `connector-tcp,wasm` |
 
 ## Built-in factories
 
@@ -39,7 +40,7 @@ always names its `transformer` explicitly, there is no implicit default format.
 | `PostgresSource`  | Polling, outbox or `pgoutput` reads      | `name`, `connection`, `mode`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
 | `KafkaSource`     | Consumes a Kafka topic                   | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
 | `S3Source`        | Lists a prefix once and drains every object in key order | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
-| `tcp`             | Live framed messages, stream mode only   | `bind`, `schema_fields`   | `pcs-connector-tcp` | `connector-tcp` |
+| `tcp`             | Live framed messages off a listener, stream mode only | `bind`, `schema_fields`   | `pcs-connector-tcp` | `connector-tcp` |
 | `ChannelSource`   | In-process channel (testing/internal)    | `schema_fields`           | `pcs-connector-channel` | `connector-channel` |
 
 ### Sinks
@@ -50,6 +51,7 @@ always names its `transformer` explicitly, there is no implicit default format.
 | `PostgresSink`  | `COPY FORMAT binary`, optional upsert     | `name`, `connection`, `table`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
 | `KafkaSink`     | Produces to a Kafka topic                 | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
 | `S3Sink`        | Accumulates rows and uploads one object per flush | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
+| `tcp`           | Dials a peer and writes one length-prefixed frame per message | `connect`, `schema_fields` | `pcs-connector-tcp` | `connector-tcp` |
 | `ChannelSink`   | In-process channel (testing/internal)     | `schema_fields`           | `pcs-connector-channel` | `connector-channel` |
 
 ### Transformers
@@ -133,6 +135,7 @@ declare either.
 | `kafka.kdl`               | Runnable config driving Kafka at both ends, needs a broker |
 | `nats.kdl`                | Runnable config driving NATS at both ends, needs a server |
 | `s3.kdl`                  | Runnable config driving S3 at both ends, needs a bucket |
+| `tcp.kdl`                 | Runnable config driving TCP at both ends, listens and dials |
 
 ---
 

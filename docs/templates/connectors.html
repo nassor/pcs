@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Connectors — PCS{% endblock %}
-{% block description %}One page per connector PCS ships: the crate, the pcs-service feature, the Rust constructor, and the config node. Channel, File, PostgreSQL, Kafka, NATS, TCP ingest, DataFusion SQL, S3.{% endblock %}
+{% block description %}One page per connector PCS ships: the crate, the pcs-service feature, the Rust constructor, and the config node. Channel, File, PostgreSQL, Kafka, NATS, TCP, DataFusion SQL, S3.{% endblock %}
 {% block og_title %}Connectors — PCS{% endblock %}
 {% block og_description %}One page per connector: what to depend on, what to call, and what its config node accepts.{% endblock %}
 
@@ -85,11 +85,11 @@
             <td><code>connector-nats</code></td>
         </tr>
         <tr>
-            <td><strong><a href="{{ get_url(path='@/connectors/tcp.md') }}">TCP ingest</a></strong></td>
+            <td><strong><a href="{{ get_url(path='@/connectors/tcp.md') }}">TCP</a></strong></td>
             <td><code>tcp</code></td>
-            <td>source</td>
+            <td>source and sink</td>
             <td>optional, <code>arrow-ipc</code></td>
-            <td>stream only</td>
+            <td>stream for the source, any for the sink</td>
             <td><code>connector-tcp</code></td>
         </tr>
         <tr>

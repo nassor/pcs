@@ -107,7 +107,7 @@ path = "@/connectors/kafka.md"
 title = "NATS"
 path = "@/connectors/nats.md"
 [[extra.nav.items.children]]
-title = "TCP ingest"
+title = "TCP"
 path = "@/connectors/tcp.md"
 [[extra.nav.items.children]]
 title = "DataFusion SQL"

@@ -1,11 +1,15 @@
-//! `pcs-connector-tcp`: a live TCP [`Source`] for PCS stream mode.
+//! `pcs-connector-tcp`: a live TCP [`Source`] and a client-mode TCP [`Sink`]
+//! for PCS.
 //!
 //! [`Source`]: pcs_core::io::source::Source
+//! [`Sink`]: pcs_core::io::sink::Sink
 //!
 //! [`TcpIngestSource`] listens on `bind` and yields one `RecordBatch` per
-//! received frame. A frame is a `u32` big-endian length prefix followed by that
-//! many payload bytes; the [`Transformer`](pcs_transformer::Transformer) the
-//! host resolved from the source's `transformer` key decodes them.
+//! received frame. [`TcpSink`] dials `connect` and writes one frame per encoded
+//! message. A frame is a `u32` big-endian length prefix followed by that many
+//! payload bytes, so the two halves are wire compatible; the
+//! [`Transformer`](pcs_transformer::Transformer) the host resolved from the
+//! node's `transformer` key decodes or encodes them.
 //!
 //! Framing is transport and belongs here; decoding is format and does not. That
 //! split is why the same listener carries Arrow IPC or newline-delimited JSON
@@ -13,7 +17,8 @@
 //!
 //! The source never reaches EOF, so only the stream runner can drive it. Its
 //! `config` table takes `bind`, an optional `buffer` and `max_frame_bytes`, and
-//! a `schema_fields` array declaring the Arrow schema.
+//! a `schema_fields` array declaring the Arrow schema. The sink's takes
+//! `connect` and `schema_fields`, and it runs under any run mode.
 //!
 //! ```kdl
 //! transformer "frames-ipc" name="Frames Arrow IPC" format="arrow-ipc"
@@ -23,10 +28,18 @@
 //!         schema_fields "v" type="Int64" nullable=#false
 //!     }
 //! }
+//!
+//! sink "forward" type="tcp" transformer="frames-ipc" component="Reading" {
+//!     config connect="collector.internal:9600" {
+//!         schema_fields "v" type="Int64" nullable=#false
+//!     }
+//! }
 //! ```
 
 pub mod factory;
+pub mod sink;
 pub mod source;
 
-pub use factory::TcpSourceFactory;
+pub use factory::{TcpSinkFactory, TcpSourceFactory};
+pub use sink::TcpSink;
 pub use source::TcpIngestSource;

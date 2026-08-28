@@ -11,7 +11,7 @@
 //! - `connector-kafka`: [`KafkaSourceFactory`], [`KafkaSinkFactory`]
 //! - `connector-nats`: [`NatsSourceFactory`], [`NatsSinkFactory`]
 //! - `connector-s3`: [`S3SourceFactory`], [`S3SinkFactory`]
-//! - `connector-tcp`: [`TcpSourceFactory`]
+//! - `connector-tcp`: [`TcpSourceFactory`], [`TcpSinkFactory`]
 //! - `transformer-arrow-ipc`: [`ArrowIpcTransformerFactory`]
 //! - `transformer-avro`: [`AvroTransformerFactory`]
 //! - `transformer-csv`: [`CsvTransformerFactory`]
@@ -34,7 +34,7 @@ pub use pcs_connector_postgresql::{PostgresSinkFactory, PostgresSourceFactory};
 #[cfg(feature = "connector-s3")]
 pub use pcs_connector_s3::{S3SinkFactory, S3SourceFactory};
 #[cfg(feature = "connector-tcp")]
-pub use pcs_connector_tcp::TcpSourceFactory;
+pub use pcs_connector_tcp::{TcpSinkFactory, TcpSourceFactory};
 #[cfg(feature = "transformer-arrow-ipc")]
 pub use pcs_transformer_arrow_ipc::ArrowIpcTransformerFactory;
 #[cfg(feature = "transformer-avro")]
@@ -118,7 +118,9 @@ pub fn register_builtin_factories(builder: ServiceBuilder) -> ServiceBuilder {
         .register_sink(S3SinkFactory);
 
     #[cfg(feature = "connector-tcp")]
-    let builder = builder.register_source(TcpSourceFactory);
+    let builder = builder
+        .register_source(TcpSourceFactory)
+        .register_sink(TcpSinkFactory);
 
     builder
 }

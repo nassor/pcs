@@ -115,8 +115,8 @@ exit.
 Three source types need it. `type="tcp"` is always live; `NatsSource` and
 `KafkaSource` are live unless their config sets `stop_at_end #true`. A live
 source never reaches EOF, so config validation rejects one outside stream mode
-with `source type '<name>' never reaches EOF`. The `tcp` frame format lives in
-[TCP ingest](@/connectors/tcp.md).
+with `source type '<name>' never reaches EOF`. The `tcp` frame format, which the
+matching sink writes, lives in [TCP](@/connectors/tcp.md).
 
 [Running it!](@/quickstart/running-it.md) drives a live NATS source end to end,
 with a publisher you can start and stop.

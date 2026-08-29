@@ -21,13 +21,59 @@ Three rules carry most of the weight:
 |---|---|---|
 | `README.md` | the pitch and the first command | simplest, shortest |
 | `docs/content/*.md` (top level) | front matter only; prose sits in `docs/templates/<name>.html` | n/a |
-| `docs/templates/*.html` | the concept pages: dataset, systems, pipeline, service, ... | simple, worked examples |
+| `docs/templates/*.html` | the concept pages: dataset, systems, pipeline, scheduler, io, distributed, ... | simple, worked examples |
 | `docs/content/{native,processors,operations,reference,benchmarks}/` | markdown pages with prose and inline SVG. A `template = "page.html"` page must open its body with its own `#` heading, because that template renders no title | simple, longer |
 | `AGENTS.md` | the workspace map for agents | dense, terse |
 | `//!` and `///` | API reference | precise, example driven |
 
 README and the docs site are the simple tier. If a sentence needs extra clauses to stay exact, put
 the exactness in `AGENTS.md` or a doc comment and keep the page plain.
+## Four kinds of documentation
+
+Diátaxis sorts every page into one of four kinds by reader need. Name the kind before you write; one page serves one need.
+
+| Kind | Serves | Voice |
+|---|---|---|
+| Tutorial | learning: the reader follows along and ends with a working result | guide by doing, show each result, keep explanation out |
+| How-to | work: the reader has a real problem and wants it solved | numbered steps, action only, no background |
+| Reference | work: the reader consults facts for exactness | state exactly and completely, never instruct |
+| Explanation | study: the reader wants to understand | reason about why the design is this way now, never history or steps |
+
+Two axes place a page: the reader learns or works, and the page leads from the reader's use of the product or from the product's own workings. Tutorial and explanation serve study; how-to and reference serve work.
+
+## Where each surface sits
+
+| Surface | Kind |
+|---|---|
+| `docs/content/quickstart/`, `docs/content/native/tutorial.md` | tutorial |
+| `docs/content/operations/`, `docs/content/service/dashboard.md`, README "Quick start" block | how-to |
+| `docs/content/reference/`, `docs/content/service/{configuration,observability}.md`, `docs/content/connectors/`, `docs/content/transformers/`, `docs/content/benchmarks/`, `//!` and `///`, `AGENTS.md` | reference |
+| `docs/templates/{dataset,systems,pipeline,scheduler,distributed,io,connectors,transformers,tracing}.html`, `docs/content/service/{windowing,branching}.md` | explanation |
+| `docs/content/processors/`: `_index.md` explains, `wit-contract.md` states facts, the per-language pages guide | split |
+| `README.md` | pitch (outside the four kinds) plus a how-to Quick start block |
+
+## Mixing kinds
+
+- A how-to interrupted by background drifts into explanation; keep the background out or link it.
+- Reference that teaches or guides instead of stating; state the fact and link the how-to.
+- A tutorial with no concrete result; every step ends in a visible result.
+- Explanation that becomes history or instructions; reason about the design as it is now.
+- Adjacent kinds link to one another: a tutorial links to explanation for concepts and reference
+  for exact options instead of absorbing them.
+
+Name the kind of every page you touch before you finish. A page that serves two needs splits or picks one.
+
+## Quickstarts
+
+The canonical quickstart is `docs/content/quickstart/`, installation.md then running-it.md; the
+README "Quick start" block is its short form. One default route:
+
+- Prerequisites stated before step 1.
+- Commands complete and copy-pasteable.
+- Expected output or a verification step after each important transition.
+- A working demo at the end, not an installation.
+- Production hardening after first success.
+- 15 minutes or less end to end.
 
 ## Current state only
 
@@ -45,6 +91,20 @@ After:  run_sync lets the scheduler skip the boxed future.
 
 Benchmark numbers are a current measurement plus method, never a trend across runs.
 
+## Ground in the code
+
+Every normative claim has an authoritative source in this repository. Find it before writing a
+config key, a default, a limit, a flag, a metric series name, or a behavior.
+
+- Implementation: `crates/pcs-service/src/`.
+- Tests: `crates/*/tests/` and unit tests next to the code.
+- Workspace map: `AGENTS.md`.
+- Examples: `examples/`.
+- Conformance corpus: `packages/arrow-ipc-conformance/`.
+
+Never invent a fact to fill a gap; mark the unknown as unknown. When sources contradict each
+other, say so instead of resolving it silently.
+
 ## Simplify
 
 A docs paragraph is one claim, its mechanism, then a number or a command. Four sentences at most.
@@ -55,6 +115,10 @@ A docs paragraph is one claim, its mechanism, then a number or a command. Four s
   component acquisition".
 - Cut hedges: simply, basically, essentially, quite, very, in order to.
 - Past two paragraphs, it is two topics, or it wants to be a code example.
+- One canonical term per concept; descriptive, stable headings.
+- Warn only for real risk: data loss or security.
+- Say where a command runs when the page leaves it ambiguous; separate the command from its
+  expected output.
 
 ```text
 Before: It is important to note that, in general, the scheduler will typically
@@ -127,6 +191,10 @@ Code is the exception to the diagram rule: ASCII sketches and aligned tables are
 `//!` comments, up to roughly ten lines.
 
 - Explain why, not what. The signature already says what.
+- High-value comments explain invariants, concurrency ordering, protocol or spec constraints,
+  security boundaries, deviations from a simpler approach, performance workarounds, and
+  compatibility requirements.
+- Delete comments that restate syntax or narrate control flow.
 - No ticket ids, dates, author names, prompt references, or "changed in round 2". Delete a stale
   comment instead of annotating its history.
 - `///` opens with one sentence; link types as ``[`Dataset`]`` so rustdoc resolves them.
@@ -137,6 +205,9 @@ Code is the exception to the diagram rule: ASCII sketches and aligned tables are
 - Search the diff for the banned words above, and for `—`, `–`, a mermaid fence, and box characters
   such as `┌ │ └ +---`. Nothing should match in docs.
 - Re-read each new paragraph and cut one sentence. If nothing was lost, leave it cut.
+- Each technical claim traces to a source in the code; an unsourced claim is an unknown, not a fact.
+- Each example is complete enough to execute and shows its expected output.
+- Each important step ends in something the reader can observe.
 - Touched `bench_figures.py`: rerun it, confirm the diff moved numbers only.
 - Touched doc comments: `cargo test --workspace --all-features --doc`.
 - Touched templates or content: `cd docs && python3 build-local.py`, then open

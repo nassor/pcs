@@ -307,7 +307,7 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         <tr>
             <td><code>pcs_service::service::stream</code></td>
             <td>debug spans, info, warn, error</td>
-            <td>The same span set per arriving item, minus <code>source.drain</code>: the wait for input precedes the item and would otherwise dominate its latency. Because those spans are <code>debug</code> and the default level omits them, every error and warning here names its own <code>workflow</code>, <code>iteration</code> and node rather than relying on a parent span's fields, and renders as a root record in the Logs tab. Events carry <code>source_name</code>, <code>sink_name</code>, <code>component</code>, <code>error</code>.</td>
+            <td>The same span set per arriving item, minus <code>source.drain</code>: the wait for input precedes the item and would otherwise dominate its latency. Because those spans are <code>debug</code> and the default level omits them, every error and warning here names its own <code>workflow</code>, <code>iteration</code> and node rather than relying on a parent span's fields, and renders as a root record in the Logs tab. Events carry <code>source</code>, <code>sink</code>, <code>processor</code> and <code>error</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::distributed::runner</code></td>

@@ -235,8 +235,10 @@ pub trait Sink: Send {
     <code>pending_rows</code> is the only optional method with a real consumer:
     <code>Pipeline::sink_pending_rows(component)</code> surfaces it, and a
     <code>BackpressureSpec::Predicate</code> closure can consult it to skip a pipeline whose
-    downstream sink is filling up. Of the built-in sinks, only <code>ChannelSink</code>
-    implements it. A file sink has no meaningful queue depth.
+    downstream sink is filling up. Three built-in sinks implement it:
+    <code>ChannelSink</code> (batches in flight), <code>PostgresSink</code> (rows buffered
+    but not yet copied) and <code>S3Sink</code> (rows in the open object). A file sink has
+    no meaningful queue depth.
 </p>
 
 <p>Implementing a source is one method plus a schema:</p>
@@ -711,6 +713,7 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
     the registry: <code>connector-channel</code>, <code>connector-file</code>,
     <code>connector-http</code>, <code>connector-kafka</code>, <code>connector-nats</code>,
     <code>connector-postgresql</code>,
+    <code>connector-s3</code>,
     <code>connector-tcp</code>, <code>transformer-arrow-ipc</code>,
     <code>transformer-avro</code>, <code>transformer-csv</code>,
     <code>transformer-ndjson</code> and
@@ -810,9 +813,13 @@ assert!(src.next_batch().await?.is_none());</code></pre>
 
 <p>
     One caveat if you reach these through the config file: <code>ChannelSourceFactory</code> and
-    <code>ChannelSinkFactory</code> cannot hand the other endpoint back to you, so they build
-    a pair whose sender is dropped immediately, an instant-EOF source. For real use, construct
-    the channel yourself and pass the endpoint in programmatically.
+    <code>ChannelSinkFactory</code> resolve the halves through the host's channel registry, so
+    neither hands the other endpoint back to you: the source takes the receiver, its paired
+    sink the sender, and the source's EOF is that sink being dropped. A half whose counterpart
+    never builds waits on a channel nothing will fill, which is why
+    <code>ServiceConfig::validate</code> requires every channel <code>name</code> to pair
+    exactly one <code>ChannelSink</code> with one <code>ChannelSource</code>. For real use,
+    construct the channel yourself and pass the endpoint in programmatically.
 </p>
 
 <h2 id="datafusion">SQL results as a Source</h2>

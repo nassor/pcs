@@ -75,6 +75,34 @@ README "Quick start" block is its short form. One default route:
 - Production hardening after first success.
 - 15 minutes or less end to end.
 
+## Commands on every platform
+
+PCS runs on Linux, macOS and Windows, and every terminal command in the docs must work for a
+reader on each. Always provide a Linux/macOS form and a Windows (PowerShell) form. Linux and
+macOS share one block when the command is identical on both, and split into separate blocks
+when it is not; a command identical on all three platforms may be given once with a note that
+it runs the same everywhere.
+
+PowerShell is not bash with a different prompt: environment variables are `$env:NAME = "value"`,
+`&&` does not join commands on Windows PowerShell 5.1 (`;` does), paths use backslashes, and
+case sensitivity rules differ. A bash-only command is a broken step for a Windows reader.
+
+```text
+Runs the same on Linux, macOS and Windows (PowerShell):
+
+    cargo build
+
+Linux/macOS:
+
+    export PCS_CONFIG=dev.kdl
+    pcs-service serve
+
+Windows (PowerShell):
+
+    $env:PCS_CONFIG = "dev.kdl"
+    pcs-service serve
+```
+
 ## Current state only
 
 Every sentence describes what is true now. None narrate how the code got here.
@@ -207,11 +235,14 @@ Code is the exception to the diagram rule: ASCII sketches and aligned tables are
 - Re-read each new paragraph and cut one sentence. If nothing was lost, leave it cut.
 - Each technical claim traces to a source in the code; an unsourced claim is an unknown, not a fact.
 - Each example is complete enough to execute and shows its expected output.
+- Every terminal command carries its Linux/macOS and Windows (PowerShell) forms, split into
+  separate blocks whenever the commands differ.
 - Each important step ends in something the reader can observe.
 - Touched `bench_figures.py`: rerun it, confirm the diff moved numbers only.
 - Touched doc comments: `cargo test --workspace --all-features --doc`.
-- Touched templates or content: `cd docs && python3 build-local.py`, then open
-  `docs/public/index.html`. Checking search needs a server: `python3 -m http.server -d public`.
+- Touched templates or content: `cd docs && python3 build-local.py` (Windows PowerShell:
+  `cd docs; python3 build-local.py`), then open `docs/public/index.html`. Checking search needs
+  a server: `python3 -m http.server -d public`, which runs the same on all three platforms.
 
 ## Common mistakes
 
@@ -225,3 +256,4 @@ Code is the exception to the diagram rule: ASCII sketches and aligned tables are
 | Hand-edited chart inside the benchmarks page | Edit `bench_figures.py` and rerun it |
 | A new hyphenated coinage | Use the words |
 | Inline `fill="#e8a33d"` on a page diagram | The `blk-data` class |
+| A command shown in one shell only, bash syntax on a Windows step | The Linux/macOS and Windows (PowerShell) forms, separate blocks when they differ |

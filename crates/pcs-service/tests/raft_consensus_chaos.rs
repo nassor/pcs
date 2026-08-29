@@ -44,15 +44,14 @@ async fn isolate_leader_elects_new() -> anyhow::Result<()> {
 
     isolate(&harness, (leader_id - 1) as usize)?;
 
-    // A new leader must be elected on the remaining quorum.
-    // The isolated node keeps reporting itself leader, and `await_leader`
-    // returns whichever node answers first, so poll for a *different* leader
-    // and tolerate windows with none at all.
+    // The isolated node never steps down (raft-rs defaults:
+    // `check_quorum = false`), so its stale self-report must be excluded:
+    // `await_leader` returns whichever node answers first, and when the
+    // isolated leader is `nodes[0]` that self-report would satisfy the poll
+    // forever. Still tolerate windows with no leader at all.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let new_leader = loop {
-        if let Ok(candidate) = harness.await_leader().await
-            && candidate != leader_id
-        {
+        if let Ok(candidate) = harness.await_leader_excluding(leader_id).await {
             break candidate;
         }
         anyhow::ensure!(

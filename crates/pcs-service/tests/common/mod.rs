@@ -492,6 +492,34 @@ impl RaftClusterHarness {
         }
     }
 
+    /// Poll until a node reports a leader other than `excluded`, or error
+    /// after 10 seconds.
+    ///
+    /// `await_leader` returns whichever node answers first in list order,
+    /// which an isolated leader can satisfy forever: with raft-rs defaults
+    /// (`check_quorum = false`) a leader cut off from its quorum never steps
+    /// down and keeps reporting itself. Excluding its stale self-report makes
+    /// post-isolation waits meaningful.
+    pub async fn await_leader_excluding(&self, excluded: u64) -> anyhow::Result<u64> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            for node in &self.nodes {
+                if let Some(leader_id) = node.handle.metrics().leader_id
+                    && leader_id != excluded
+                {
+                    return Ok(leader_id);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for a leader other than node {excluded}; per-node state: [{}]",
+                    self.diagnostics()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Wait until every node reports the same applied index, then return it.
     ///
     /// Raft appends one entry per term when a node takes office, so a settled

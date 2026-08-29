@@ -317,6 +317,30 @@ impl Ctx {
             Ok(())
         }
     }
+
+    /// Run an executable at a concrete `path` (not resolved through PATH),
+    /// inheriting stdio. Fails with the child's own exit code, like
+    /// [`Cmd::run`], but for a binary `which` cannot find — the `pcs-service`
+    /// build product the example `validate`/`demo` tasks run.
+    pub fn run_exe(&self, path: &Path, args: &[&str]) -> Result<()> {
+        let status = Command::new(path)
+            .current_dir(&self.root)
+            .args(args)
+            .status()
+            .map_err(|e| self.error(1, &[&format!("could not run {}: {e}", path.display())]))?;
+        if status.success() {
+            return Ok(());
+        }
+        let code = status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .filter(|code| *code != 0)
+            .unwrap_or(1);
+        Err(self.error(
+            code,
+            &[&format!("`{}` failed (exit {code})", path.display())],
+        ))
+    }
 }
 
 /// A child process. Failure is the caller's to interpret: [`Cmd::status`]

@@ -470,6 +470,7 @@ connection url="nats://localhost:4222" password="hunter2"
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         }
     }
     fn service_config_many(workflows: Vec<WorkflowSpec>) -> ServiceConfig {
@@ -486,6 +487,7 @@ connection url="nats://localhost:4222" password="hunter2"
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         }
     }
 

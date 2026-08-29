@@ -528,6 +528,7 @@ mod tests {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         }
     }
 
@@ -805,6 +806,7 @@ mod tests {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         };
 
         let cancel = CancellationToken::new();

@@ -538,6 +538,7 @@ fn stream_config() -> ServiceConfig {
         http: HttpConfig::default(),
         store: None,
         observability: ObservabilityConfig::default(),
+        variables: std::collections::HashMap::new(),
     }
 }
 

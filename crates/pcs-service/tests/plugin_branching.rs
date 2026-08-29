@@ -104,6 +104,7 @@ fn config() -> ServiceConfig {
         http: HttpConfig::default(),
         store: None,
         observability: ObservabilityConfig::default(),
+        variables: std::collections::HashMap::new(),
     }
 }
 

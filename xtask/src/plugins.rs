@@ -135,6 +135,18 @@ pub fn run(args: &[String]) -> Result<()> {
     if build_go {
         ctx.log(format!("go:   {}", go_artifact.display()));
     }
+
+    // The smoketest plugin is what `standalone_plugin.kdl` loads, so a Rust
+    // build also emits a variables-bearing copy of that config (the registry
+    // entry resolves the platform's plugin library path) that needs no env
+    // export to validate or run.
+    if build_rust {
+        let entry = crate::examples::by_name("standalone_plugin").expect("registered");
+        let emitted = ctx.path("target/xtask/standalone_plugin.kdl");
+        crate::examples::inject(&ctx, entry, &emitted)?;
+        ctx.log(format!("emitted {} (self-contained)", emitted.display()));
+    }
+
     Ok(())
 }
 

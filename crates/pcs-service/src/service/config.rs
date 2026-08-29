@@ -37,7 +37,11 @@
 //! `${VAR:-default}` falls back to `default` if `VAR` is unset. Substitution
 //! runs over the raw text before the parser, so a template stays valid KDL
 //! either side of it.
-
+//!
+//! A top-level `variables { name "value" }` block declares names that win
+//! over a same-named process env var, with the environment still the
+//! fallback for undeclared names, so a file can reference its own
+//! declarations with the same `${name}` / `${name:-default}` syntax.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,7 +56,7 @@ use pcs_core::retry::{RetryMode, SystemConfig};
 
 /// The configuration language, re-exported so an embedder that reads
 /// [`SourceSpec::config`] or writes a factory names one path.
-pub use pcs_config::{ConfigMap, ConfigValue, from_kdl_str, substitute_env_vars};
+pub use pcs_config::{ConfigMap, ConfigValue, from_kdl_str, substitute_env_vars, substitute_vars};
 
 /// Default opaque per-instance config: an empty table.
 ///
@@ -1445,13 +1449,41 @@ pub struct ServiceConfig {
     /// Logging / observability options.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Names usable as `${name}` placeholders anywhere in this file. A
+    /// declared name wins over a same-named process env var, so the file is
+    /// self-contained.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub variables: HashMap<String, String>,
+}
+
+/// Pull the `variables` node out of an unsubstituted parse. Returns an empty
+/// map when the file declares none. Names are restricted to `[A-Za-z0-9_]`
+/// so a typo in a `${...}` reference cannot alias a name the scanner would
+/// not recognise.
+fn extract_declared_variables(value: &ConfigValue) -> PcsResult<HashMap<String, String>> {
+    let Some(vars) = value.get("variables") else {
+        return Ok(HashMap::new());
+    };
+    let declared =
+        serde_json::from_value::<HashMap<String, String>>(vars.clone()).map_err(|e| {
+            PcsError::configuration(format!("variables block must be name/string pairs: {e}"))
+        })?;
+    for name in declared.keys() {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(PcsError::configuration(format!(
+                "invalid variable name {name:?}: use [A-Za-z0-9_]"
+            )));
+        }
+    }
+    Ok(declared)
 }
 
 impl ServiceConfig {
     /// Load a [`ServiceConfig`] from a KDL file at `path`.
     ///
-    /// The file is read, env-var placeholders are substituted, the KDL is
-    /// parsed, and semantic validation is applied before returning.
+    /// The file is read, its declared `variables` and env-var placeholders
+    /// are substituted (declared names win over same-named env vars), the
+    /// KDL is parsed, and semantic validation is applied before returning.
     ///
     /// # Errors
     ///
@@ -1464,7 +1496,9 @@ impl ServiceConfig {
                 path.as_ref().display()
             ))
         })?;
-        let substituted = pcs_config::substitute_env_vars(&raw)?;
+        let value_pre = pcs_config::from_kdl_str(&raw)?;
+        let declared = extract_declared_variables(&value_pre)?;
+        let substituted = pcs_config::substitute_vars(&raw, &declared)?;
         let value = pcs_config::from_kdl_str(&substituted)?;
         let config = ServiceConfig::deserialize(value)
             .map_err(|e| PcsError::configuration(format!("parsing config: {e}")))?;
@@ -1806,6 +1840,7 @@ peer id=2 addr="127.0.0.2:9000"
                 trace_sample_ratio: 1.0,
                 inspector: crate::inspector::InspectorConfig::default(),
             },
+            variables: HashMap::new(),
         }
     }
 
@@ -2504,6 +2539,7 @@ workflow "w" {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         };
         cfg.validate()
             .expect("a lone processor entry point should be valid");
@@ -3458,5 +3494,99 @@ workflow "w" {
             .validate()
             .expect_err("cluster mode cannot honour a window block");
         assert!(err.to_string().contains("window"), "got: {err}");
+    }
+
+    // ── variables block ──────────────────────────────────────────────────────
+
+    const VARIABLES_WORKFLOW: &str = r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs-test"
+
+variables {
+    mod_dir "/tmp/pcs-modules"
+}
+
+workflow "w" {
+    wasm "p" module="${mod_dir}/p.wasm"
+}
+"#;
+
+    #[test]
+    fn declared_variables_substitute_into_wasm_module_paths() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        file.write_all(VARIABLES_WORKFLOW.as_bytes())
+            .expect("write");
+
+        let cfg = ServiceConfig::load(file.path()).expect("load");
+        assert_eq!(
+            cfg.variables.get("mod_dir").map(String::as_str),
+            Some("/tmp/pcs-modules")
+        );
+        #[cfg(feature = "wasm")]
+        assert_eq!(
+            cfg.workflows[0].wasm[0].module.as_deref(),
+            Some("/tmp/pcs-modules/p.wasm")
+        );
+    }
+
+    #[test]
+    fn a_declared_variable_shadows_a_same_named_env_var_on_load() {
+        unsafe { std::env::set_var("PCS_TEST_LOAD_SHADOW", "/from-env") };
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs-test"
+
+variables {{
+    {name} "/from-file"
+}}
+
+workflow "w" {{
+    wasm "p" module="${{{name}}}/p.wasm"
+}}
+"#,
+            name = "PCS_TEST_LOAD_SHADOW"
+        );
+        let mut file = NamedTempFile::new().expect("tempfile");
+        file.write_all(raw.as_bytes()).expect("write");
+
+        let cfg = ServiceConfig::load(file.path()).expect("load");
+        assert_eq!(
+            cfg.variables
+                .get("PCS_TEST_LOAD_SHADOW")
+                .map(String::as_str),
+            Some("/from-file")
+        );
+        #[cfg(feature = "wasm")]
+        assert_eq!(
+            cfg.workflows[0].wasm[0].module.as_deref(),
+            Some("/from-file/p.wasm")
+        );
+        unsafe { std::env::remove_var("PCS_TEST_LOAD_SHADOW") };
+    }
+
+    #[test]
+    fn an_undeclared_variable_is_a_load_error() {
+        let raw = r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs-test"
+
+workflow "w" {
+    wasm "p" module="${PCS_TEST_UNDECLARED_NOPE}/p.wasm"
+}
+"#;
+        let mut file = NamedTempFile::new().expect("tempfile");
+        file.write_all(raw.as_bytes()).expect("write");
+
+        let err = ServiceConfig::load(file.path()).expect_err("undeclared variable");
+        assert_eq!(err.category(), "configuration");
+        assert!(
+            err.message()
+                .contains("'${PCS_TEST_UNDECLARED_NOPE}' is not set and has no default"),
+            "got: {err}"
+        );
     }
 }

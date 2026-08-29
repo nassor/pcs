@@ -306,6 +306,7 @@ async fn main() -> Result<(), PcsError> {
         store: None,
         http: HttpConfig::default(),
         observability: ObservabilityConfig::default(),
+        variables: std::collections::HashMap::new(),
     };
 
     let built = BuiltService {

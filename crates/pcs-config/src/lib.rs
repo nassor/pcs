@@ -45,14 +45,21 @@
 //! written once is a single value. Such fields carry [`one_or_many`], which
 //! accepts both shapes.
 //!
-//! # Env var substitution
+//! # Variable substitution
 //!
-//! [`substitute_env_vars`] runs over the raw text before the parser, so it is
+//! Both entry points run over the raw text before the parser, so they are
 //! format independent. `${VAR}` is replaced with the value of `VAR` and
 //! `${VAR:-default}` falls back to `default` when `VAR` is unset.
+//!
+//! [`substitute_env_vars`] resolves names against the process environment
+//! only. [`substitute_vars`] takes an overlay of declared names that wins
+//! over a same-named env var, with the environment as the fallback, so a
+//! config file can declare its own variables once and reference them with
+//! the same `${name}` / `${name:-default}` syntax.
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use pcs_core::error::{PcsError, PcsResult};
+use std::collections::HashMap;
 
 /// A parsed configuration value.
 ///
@@ -116,18 +123,16 @@ where
     }
 }
 
-/// Substitute `${VAR}` and `${VAR:-default}` placeholders in `raw`.
+/// Substitute `${VAR}` and `${VAR:-default}` placeholders in `raw` by asking
+/// `resolve` for each variable name.
 ///
-/// - `${VAR}`: replaced with the value of env var `VAR`. Returns
-///   [`PcsError::Configuration`] if `VAR` is not set.
-/// - `${VAR:-default}`: replaced with the value of `VAR`, or `default` when
-///   `VAR` is not set.
-///
-/// # Errors
-///
-/// Returns [`PcsError::Configuration`] for an unclosed `${`, or for a
-/// placeholder whose var is unset and which declares no default.
-pub fn substitute_env_vars(raw: &str) -> PcsResult<String> {
+/// `Ok(Some(value))` pushes `value` into the output verbatim — never
+/// re-scanned. `Ok(None)` means the name is unset: `${VAR:-default}`
+/// substitutes `default` and a bare `${VAR}` is an error.
+fn substitute_with(
+    raw: &str,
+    resolve: &mut dyn FnMut(&str) -> PcsResult<Option<String>>,
+) -> PcsResult<String> {
     let mut result = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
 
@@ -157,9 +162,9 @@ pub fn substitute_env_vars(raw: &str) -> PcsResult<String> {
                 (placeholder.as_str(), None)
             };
 
-            match std::env::var(var_name) {
-                Ok(val) => result.push_str(&val),
-                Err(_) => match fallback {
+            match resolve(var_name)? {
+                Some(val) => result.push_str(&val),
+                None => match fallback {
                     Some(default) => result.push_str(default),
                     None => {
                         return Err(PcsError::configuration(format!(
@@ -174,6 +179,59 @@ pub fn substitute_env_vars(raw: &str) -> PcsResult<String> {
     }
 
     Ok(result)
+}
+
+/// Substitute `${VAR}` and `${VAR:-default}` placeholders in `raw`.
+///
+/// - `${VAR}`: replaced with the value of env var `VAR`. Returns
+///   [`PcsError::Configuration`] if `VAR` is not set.
+/// - `${VAR:-default}`: replaced with the value of `VAR`, or `default` when
+///   `VAR` is not set.
+///
+/// # Errors
+///
+/// Returns [`PcsError::Configuration`] for an unclosed `${`, or for a
+/// placeholder whose var is unset and which declares no default.
+pub fn substitute_env_vars(raw: &str) -> PcsResult<String> {
+    substitute_with(raw, &mut |name| Ok(std::env::var(name).ok()))
+}
+
+/// Substitute `${name}` and `${name:-default}` placeholders in `raw`, with
+/// `declared` names taking precedence over process environment variables.
+///
+/// Per placeholder the lookup order is `declared` first (case-sensitive exact
+/// match), then [`std::env::var`]. A declared value may itself contain
+/// placeholders, resolved recursively under the same rule, so declarations
+/// can reference each other in any order; a value that reaches itself again
+/// through the chain is a [`PcsError::Configuration`] cycle error.
+/// Environment-provided values are inserted literally and never re-expanded.
+///
+/// # Errors
+///
+/// Returns [`PcsError::Configuration`] for an unclosed `${`, a placeholder
+/// that is neither declared nor set in the environment and declares no
+/// default, or a cyclic declared-value reference.
+pub fn substitute_vars(raw: &str, declared: &HashMap<String, String>) -> PcsResult<String> {
+    fn resolve(
+        name: &str,
+        declared: &HashMap<String, String>,
+        stack: &mut Vec<String>,
+    ) -> PcsResult<Option<String>> {
+        if let Some(value) = declared.get(name) {
+            if stack.iter().any(|on_stack| on_stack == name) {
+                return Err(PcsError::configuration(format!(
+                    "cyclic variable reference: ${{{name}}}"
+                )));
+            }
+            stack.push(name.to_string());
+            let expanded = substitute_with(value, &mut |inner| resolve(inner, declared, stack))?;
+            stack.pop();
+            return Ok(Some(expanded));
+        }
+        Ok(std::env::var(name).ok())
+    }
+
+    substitute_with(raw, &mut |name| resolve(name, declared, &mut Vec::new()))
 }
 
 /// Add every node of `document` to `table`, collapsing same-named siblings.
@@ -621,8 +679,82 @@ schema_fields "amount" type="Float64"
     }
 
     #[test]
-    fn an_unclosed_placeholder_is_an_error() {
-        let err = substitute_env_vars("node data_dir=\"${PCS\"\n").expect_err("unclosed");
-        assert!(err.message().contains("unclosed"), "{}", err.message());
+    fn declared_variables_substitute_in_place_of_placeholders() {
+        let declared = HashMap::from([("mod_dir".to_string(), "wasm".to_string())]);
+        let out = substitute_vars(r#"node p="/tmp/${mod_dir}/x""#, &declared).expect("substituted");
+        assert_eq!(out, r#"node p="/tmp/wasm/x""#);
+    }
+
+    #[test]
+    fn a_declared_variable_shadows_a_same_named_env_var() {
+        unsafe { std::env::set_var("PCS_TEST_SHADOW", "from-env") };
+        let declared = HashMap::from([("PCS_TEST_SHADOW".to_string(), "from-file".to_string())]);
+        let out = substitute_vars("node p=\"${PCS_TEST_SHADOW}\"", &declared).expect("substituted");
+        assert_eq!(out, r#"node p="from-file""#);
+        unsafe { std::env::remove_var("PCS_TEST_SHADOW") };
+    }
+
+    #[test]
+    fn an_undeclared_variable_falls_back_to_the_env() {
+        unsafe { std::env::set_var("PCS_TEST_UNDECLARED_FALLBACK", "/env/path") };
+        let out = substitute_vars(
+            "node p=\"${PCS_TEST_UNDECLARED_FALLBACK}\"",
+            &HashMap::new(),
+        )
+        .expect("substituted");
+        assert_eq!(out, r#"node p="/env/path""#);
+        unsafe { std::env::remove_var("PCS_TEST_UNDECLARED_FALLBACK") };
+    }
+
+    #[test]
+    fn a_default_is_used_when_a_variable_is_nowhere_and_loses_to_a_declared_value() {
+        let out = substitute_vars("node p=\"${PCS_TEST_NOWHERE:-/fallback}\"", &HashMap::new())
+            .expect("substituted");
+        assert_eq!(out, r#"node p="/fallback""#);
+
+        let declared = HashMap::from([("PCS_TEST_NOWHERE".to_string(), "/declared".to_string())]);
+        let out = substitute_vars("node p=\"${PCS_TEST_NOWHERE:-/fallback}\"", &declared)
+            .expect("substituted");
+        assert_eq!(out, r#"node p="/declared""#);
+    }
+
+    #[test]
+    fn declared_values_expand_recursively_but_env_values_stay_literal() {
+        let declared = HashMap::from([
+            ("a".to_string(), "${b}/x".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let out = substitute_vars("node p=\"${a}\"", &declared).expect("substituted");
+        assert_eq!(out, r#"node p="2/x""#);
+
+        unsafe { std::env::set_var("PCS_TEST_INNER", "expanded") };
+        unsafe { std::env::set_var("PCS_TEST_LITERAL", "${PCS_TEST_INNER}") };
+        let out = substitute_vars("node p=\"${PCS_TEST_LITERAL}\"", &HashMap::new())
+            .expect("substituted");
+        assert_eq!(out, r#"node p="${PCS_TEST_INNER}""#);
+        unsafe { std::env::remove_var("PCS_TEST_INNER") };
+        unsafe { std::env::remove_var("PCS_TEST_LITERAL") };
+    }
+
+    #[test]
+    fn a_cycle_in_declared_values_is_an_error() {
+        let declared = HashMap::from([("a".to_string(), "${a}".to_string())]);
+        let err = substitute_vars("node p=\"${a}\"", &declared).expect_err("self cycle");
+        assert!(
+            err.message().contains("cyclic variable reference"),
+            "{}",
+            err.message()
+        );
+
+        let declared = HashMap::from([
+            ("a".to_string(), "${b}".to_string()),
+            ("b".to_string(), "${a}".to_string()),
+        ]);
+        let err = substitute_vars("node p=\"${a}\"", &declared).expect_err("mutual cycle");
+        assert!(
+            err.message().contains("cyclic variable reference"),
+            "{}",
+            err.message()
+        );
     }
 }

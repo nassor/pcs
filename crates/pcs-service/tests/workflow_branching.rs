@@ -62,6 +62,7 @@ fn config(run_mode: RunMode) -> ServiceConfig {
         http: HttpConfig::default(),
         store: None,
         observability: ObservabilityConfig::default(),
+        variables: std::collections::HashMap::new(),
     }
 }
 

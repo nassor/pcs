@@ -29,6 +29,8 @@ cargo audit                                                  # Security audit (n
 cargo xtask polyglot                                         # Build the six polyglot processors
 cargo xtask quickstart                                       # Build the two Quick Start processors
 cargo xtask ui                                               # Rebuild the /ui dashboard bundle
+cargo xtask validate                                         # Validate every runnable example config
+cargo xtask demo <name>                                      # Build and run an example pipeline
 cargo xtask --help                                           # Every task the runner carries
 ```
 
@@ -375,11 +377,13 @@ docs/search-index.py              # Builds public/search-index.json from the ren
 docs/build-local.py               # zola build + relative-URL rewrite + search index, for
                                   # browsing public/ over file:// or a local server.
 xtask/                            # The task runner behind `cargo xtask <command>`: quickstart,
-                                  # polyglot, plugins, ui, bench, pack-sdk,
+                                  # polyglot, plugins, ui, bench, pack-sdk, validate, demo,
                                   # check-wasm-processor, processor-ipc-roundtrip. One module per
                                   # command, zero dependencies, so it drives Go, .NET, npm, Gradle
                                   # and wasm-tools identically on Windows, Linux and macOS. Exit
                                   # codes are documented per module and CI reads them.
+                                  # validate and demo (examples.rs) inject a `variables` block
+                                  # into example configs, so they run with no OS env export.
 ```
 
 ## Feature flags

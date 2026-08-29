@@ -910,6 +910,7 @@ mod tests {
     use async_trait::async_trait;
     use pcs_connector_channel::{ChannelSink, ChannelSource};
     use pcs_core::PcsResult;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -942,6 +943,7 @@ mod tests {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         }
     }
 

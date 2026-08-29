@@ -97,6 +97,16 @@ pub fn run(args: &[String]) -> Result<()> {
     wasm::validate_dir(&ctx, &build_dir, NO_ARTIFACT)?;
 
     ctx.log(format!("PASS: components in {}", build_dir.display()));
+
+    // Emit a variables-bearing copy of the Quick Start config so it can be run
+    // without exporting an env var: the registry entry injects the `variables`
+    // block the config's placeholders resolve against. The components above
+    // are exactly what the copy references.
+    let entry = crate::examples::by_name("quickstart").expect("registered");
+    let emitted = ctx.path("target/xtask/quickstart.kdl");
+    crate::examples::inject(&ctx, entry, &emitted)?;
+    ctx.log(format!("emitted {} (self-contained)", emitted.display()));
+
     ctx.log("next: docker compose -f examples/quickstart/docker-compose.yml up -d");
     ctx.log("      cargo run -p pcs-service -- serve -c examples/quickstart/quickstart.kdl");
     Ok(())

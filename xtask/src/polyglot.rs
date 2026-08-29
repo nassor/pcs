@@ -154,6 +154,15 @@ pub fn run(args: &[String]) -> Result<()> {
     wasm::validate_dir(&ctx, &build_dir, NO_ARTIFACT)?;
 
     ctx.log(format!("PASS: components in {}", build_dir.display()));
+
+    // The Python stage is what `standalone_polyglot.kdl` loads, so the build
+    // also emits a variables-bearing copy of that config that needs no env
+    // export to validate or run.
+    let entry = crate::examples::by_name("standalone_polyglot").expect("registered");
+    let emitted = ctx.path("target/xtask/standalone_polyglot.kdl");
+    crate::examples::inject(&ctx, entry, &emitted)?;
+    ctx.log(format!("emitted {} (self-contained)", emitted.display()));
+
     ctx.log("next: cargo run -p pcs-service --features wasm,tracing --example polyglot_orders");
     Ok(())
 }

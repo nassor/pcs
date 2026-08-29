@@ -13,6 +13,8 @@
 
 mod bench;
 mod ci;
+mod demo;
+mod examples;
 mod generated;
 mod pack;
 mod plugins;
@@ -20,6 +22,7 @@ mod polyglot;
 mod quickstart;
 mod sh;
 mod ui;
+mod validate;
 mod wasm;
 
 use std::env;
@@ -37,6 +40,8 @@ Commands
   pack-sdk                  Pack the five pcs-sdk packages
   check-wasm-processor      cargo check pcs-core for wasm32-wasip2
   processor-ipc-roundtrip   Host-to-processor Arrow IPC round-trip gate
+  validate [--only=LIST]    Validate every runnable example config
+  demo <name>               Build and run an example pipeline
 
 `cargo xtask <command> --help` prints that command's own usage.";
 
@@ -65,6 +70,8 @@ fn main() -> ExitCode {
         "pack-sdk" => pack::run(rest),
         "check-wasm-processor" => ci::check_wasm_processor(rest),
         "processor-ipc-roundtrip" => ci::processor_ipc_roundtrip(rest),
+        "validate" => validate::run(rest),
+        "demo" => demo::run(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())

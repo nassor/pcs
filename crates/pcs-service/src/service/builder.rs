@@ -824,6 +824,7 @@ mod tests {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         }
     }
 
@@ -1010,6 +1011,7 @@ mod tests {
             http: HttpConfig::default(),
             store: None,
             observability: ObservabilityConfig::default(),
+            variables: HashMap::new(),
         };
 
         let built = ServiceBuilder::new()

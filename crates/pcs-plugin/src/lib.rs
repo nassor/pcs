@@ -184,8 +184,10 @@ pub mod host {
 ///
 /// - The crate must set `crate-type = ["cdylib"]`, or nothing exports the
 ///   symbols.
-/// - A `state = T` plugin must register `T` in `build()`, so `describe`
-///   declares it and the host's template dataset carries it.
+/// - A `state = T` plugin must NOT register `T` in `build()`: the macro installs
+///   `ProcessorState<T>` as a resource before the systems run and serializes it
+///   into the checkpoint afterwards. Resources do not round-trip through Arrow
+///   IPC, so state never leaks into the output.
 ///
 /// # Example
 ///

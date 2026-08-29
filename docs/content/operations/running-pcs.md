@@ -16,13 +16,13 @@ readiness and graceful shutdown. This page starts where those leave off.
 
 ## 1. Build and install
 
-`cargo install pcs-service` from a clone of the repository builds the **default
+`cargo install --path crates/pcs-service` from a clone of the repository builds the **default
 bundle**: `mimalloc`, `service`, `wasm`, `windows`, `parquet-checkpoint`, every
 connector except Kafka, and all five transformers. That binary serves, runs
 WASM pipelines, and binds every node kind except `plugin` and cluster mode.
 
 ```bash,name=Install the default bundle
-cargo install pcs-service
+cargo install --path crates/pcs-service
 ```
 
 Runs the same on Linux, macOS and Windows (PowerShell). Two features stay
@@ -36,7 +36,7 @@ opt-in because of what they pull in:
   `store "tikv"` block: TiKV is the only cluster application-data store.
 
 ```bash,name=Install with cluster support and Kafka
-cargo install pcs-service --features service-cluster,tikv-store,connector-kafka
+cargo install --path crates/pcs-service --features service-cluster,tikv-store,connector-kafka
 ```
 
 For a deliberately narrow binary, pick the features from

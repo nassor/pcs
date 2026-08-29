@@ -183,6 +183,39 @@ content is untrusted input. The visitor truncates any value at 512 bytes on a
 UTF-8 boundary, caps a record at 32 fields, and appends
 `("truncated", "true")` when either bound bites.
 
+## Span levels
+
+Nine span names, split by level. The five host spans are the per-item runner
+tree: one whole tree opens per item.
+
+| Span | Level | Opened by |
+|---|---|---|
+| `workflow.batch` | `debug` | the runners, per item or claim |
+| `source.drain` | `debug` | the standalone runner, per source |
+| `runtime.run` | `debug` | the runners, per processor |
+| `sink.write` | `debug` | the runners, per sink |
+| `processor.batch` | `debug` | the WASM and plugin hosts, per `run-batch` |
+| `pipeline.run` | `info` | `pcs-core`, per native pipeline run |
+| `pipeline.stage` | `info` | `pcs-core`, per stage |
+| `system.execute` | `info` | `pcs-core`, per system |
+| `task_attempt` | `info`, retries only | `pcs-core`'s two retry drivers |
+
+The default `log_level="info"` builds the filter `pcs=info`, so none of the five
+`debug` spans is materialised. The Traces tab then shows traces rooted at
+`pipeline.run` rather than `workflow.batch`, and carries no per-item runner spans
+at all. A workflow of only WASM components or native plugins contributes nothing
+at `info`, because a guest's own spans never reach the host: its Traces tab is
+empty. `log_level="debug"` is the escape hatch, and restores the full per-item
+waterfall from `workflow.batch` down to `processor.batch`.
+
+`task_attempt` is the one `info` span usually absent as well. A first attempt
+that succeeds opens no span, so a clean run shows zero of them.
+
+That split is a cost decision. On the reference machine, per-item stream latency
+measured through the service's own subscriber is about 4.6 µs at the default
+`info` and about 7.4 µs at `debug`; built without the `tracing` feature it is
+about 1.9 µs. Reach for `debug` to read one workflow's waterfall, not to run on.
+
 ## Configuration
 
 ```kdl,name=The observability block

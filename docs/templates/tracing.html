@@ -256,11 +256,16 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
 <p>
     Nine span names, plus flat events across fourteen targets.
     <code>pipeline.run</code>, <code>pipeline.stage</code> and
-    <code>system.execute</code> come from <code>pcs-core</code>'s execution path, and
-    <code>task_attempt</code> comes from the retry driver inside them. The host adds
-    five: <code>workflow.batch</code> around one iteration, <code>source.drain</code>,
+    <code>system.execute</code> come from <code>pcs-core</code>'s execution path at
+    <code>info</code>, and <code>task_attempt</code> comes from the retry driver inside
+    them, also at <code>info</code> but only on a retry. The host adds
+    five, all at <code>debug</code>: <code>workflow.batch</code> around one iteration,
+    <code>source.drain</code>,
     <code>runtime.run</code>, <code>sink.write</code>, and <code>processor.batch</code>
-    around one out-of-process processor call. Every host span carries
+    around one out-of-process processor call. One whole tree of those five opens per item,
+    so the default <code>log_level="info"</code> materialises none of them and
+    <code>log_level="debug"</code> is what brings the per-item waterfall back. Every host
+    span carries
     <code>workflow</code>, the declared workflow id, and each node's span carries that
     node's declared id. Field names below are the exact keys the
     macros record, so they are what you match on in a JSON log pipeline.
@@ -276,8 +281,8 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         </tr>
         <tr>
             <td><code>pcs_core::retry</code></td>
-            <td>info span, warn, error</td>
-            <td>The <code>task_attempt</code> span at <code>info</code>, carrying <code>attempt</code> (1-based) and <code>max_attempts</code>; a <code>warn</code> per failed-but-retryable attempt with <code>error</code>, <code>attempt</code>, <code>max_attempts</code>, <code>delay_ms</code>; and an <code>error</code> on exhaustion with <code>error</code> and <code>attempts</code>. Both the async and the blocking driver emit it, from one shared attempt counter.</td>
+            <td>info span on retries, warn, error</td>
+            <td>The <code>task_attempt</code> span at <code>info</code>, carrying <code>attempt</code> (1-based) and <code>max_attempts</code>. It opens only on a retry: a first attempt that succeeds opens no span, so a clean run produces none. Then a <code>warn</code> per failed-but-retryable attempt with <code>error</code>, <code>attempt</code>, <code>max_attempts</code>, <code>delay_ms</code>, and an <code>error</code> on exhaustion with <code>error</code> and <code>attempts</code>. Both the async and the blocking driver emit it, from one shared attempt counter.</td>
         </tr>
         <tr>
             <td><code>pcs_core::windows::system</code></td>
@@ -286,17 +291,17 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         </tr>
         <tr>
             <td><code>pcs_service::service::standalone</code></td>
-            <td>info spans, info, warn, error</td>
+            <td>debug spans, info, warn, error</td>
             <td>One <code>workflow.batch</code> span per iteration with <code>workflow</code>, <code>iteration</code> and <code>rows</code>, one <code>source.drain</code> per source with <code>workflow</code>, <code>source</code>, <code>component</code> and <code>rows</code>, one <code>runtime.run</code> per processor with <code>workflow</code>, <code>processor</code>, <code>rows_in</code> and <code>rows_out</code>, and one <code>sink.write</code> per sink with <code>workflow</code>, <code>sink</code>, <code>component</code> and <code>rows</code>, in topological order. Every iteration event names the batch span as its parent, so the whole iteration is one trace. The busiest module, 15 event sites.</td>
         </tr>
         <tr>
             <td><code>pcs_service::service::stream</code></td>
-            <td>info spans, info, warn, error</td>
-            <td>The same span set per arriving item, minus <code>source.drain</code>: the wait for input precedes the item and would otherwise dominate its latency. Events carry <code>source_name</code>, <code>sink_name</code>, <code>component</code>, <code>error</code>.</td>
+            <td>debug spans, info, warn, error</td>
+            <td>The same span set per arriving item, minus <code>source.drain</code>: the wait for input precedes the item and would otherwise dominate its latency. Because those spans are <code>debug</code> and the default level omits them, every error and warning here names its own <code>workflow</code>, <code>iteration</code> and node rather than relying on a parent span's fields, and renders as a root record in the Logs tab. Events carry <code>source_name</code>, <code>sink_name</code>, <code>component</code>, <code>error</code>.</td>
         </tr>
         <tr>
             <td><code>pcs_service::distributed::runner</code></td>
-            <td>info spans, info, warn, error</td>
+            <td>debug spans, info, warn, error</td>
             <td>One <code>workflow.batch</code> span per claimed batch with <code>workflow</code>, <code>claim</code> and <code>rows</code>, holding one <code>runtime.run</code>. Expired-lease sweeps and every release-instead-of-ack path: <code>reclaimed_count</code>, <code>claim_id</code>, <code>error</code>.</td>
         </tr>
         <tr>
@@ -316,12 +321,12 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         </tr>
         <tr>
             <td><code>pcs_service::wasm::runner</code></td>
-            <td>info span, warn</td>
+            <td>debug span, warn</td>
             <td>One <code>processor.batch</code> span per <code>run-batch</code> call, covering the IPC encode, the guest call and the IPC decode: <code>workflow</code>, <code>processor</code>, <code>rows_in</code>, <code>rows_out</code>, <code>systems_run</code>, <code>retries</code>, <code>guest_wall_us</code>, the last four read back off the WIT <code>run-metrics</code> record. The <code>warn</code> covers building the template dataset: <code>describe()</code> failed, or one component's schema would not parse (<code>component</code>, <code>error</code>).</td>
         </tr>
         <tr>
             <td><code>pcs_service::plugin::runtime</code></td>
-            <td>info span, debug</td>
+            <td>debug span, debug</td>
             <td>The same <code>processor.batch</code> span for a native plugin, with <code>plugin_wall_us</code> in place of <code>guest_wall_us</code>. The <code>debug</code> reports a loaded plugin's <code>plugin</code>, <code>version</code>, <code>stateful</code> and <code>components</code>.</td>
         </tr>
         <tr>
@@ -410,8 +415,9 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
             pipeline.run wraps the whole call and carries the pipeline name, the stage
             count and the row count. Inside it, one pipeline.stage span per stage carries
             the stage index and how many systems it holds. Inside that, one system.execute
-            span per system carries the system name. Innermost, the retry driver opens one
-            task_attempt span per attempt, carrying the attempt number and the maximum.
+            span per system carries the system name. Innermost, a task_attempt span
+            carrying the attempt number and the maximum, opened only on a retry: a first
+            attempt that succeeds opens none.
         </desc>
 
         <g class="anim anim-1">
@@ -434,7 +440,7 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
 
         <g class="anim anim-4">
             <rect class="row" x="60" y="104" width="534" height="22" rx="3"/>
-            <text class="t-sm" x="70" y="119">task_attempt</text>
+            <text class="t-sm" x="70" y="119">task_attempt &middot; retries only</text>
             <text class="t-sm t-end" x="584" y="119">attempt, max_attempts</text>
         </g>
     </svg>
@@ -442,7 +448,8 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
     <figcaption class="dgm-cap">
         Three stages of two systems each, all succeeding first try, opens one
         <code>pipeline.run</code>, three <code>pipeline.stage</code>, six
-        <code>system.execute</code> and six <code>task_attempt</code> spans.
+        <code>system.execute</code> and <b>zero</b> <code>task_attempt</code> spans. The
+        innermost box appears only once a system has to be retried.
     </figcaption>
 </div>
 

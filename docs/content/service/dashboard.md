@@ -52,11 +52,18 @@ in-process channel joining a `ChannelSink` to a `ChannelSource` across
 workflows, with its live rate.
 
 **Traces** lists the retained traces with name, start, duration, span count and
-an error badge. One trace is one iteration. Selecting one renders an SVG
-waterfall, one bar per span, x as the offset from trace start.
+an error badge. What a trace is depends on `log_level`: at the default `info` it
+is one native pipeline run rooted at `pipeline.run`, and at `debug` it is one
+runner item rooted at `workflow.batch`. Selecting one renders an SVG waterfall,
+one bar per span, x as the offset from trace start.
 
 **Logs** tails the newest records with a level filter, and a row links to its
-trace.
+trace. At the default level this is where a failure is triaged, because the
+runners name their own context instead of leaning on a parent span: every error
+record carries `workflow`, the `iteration` it happened on, and the failing node's
+own field, `source`, `processor` or `sink`. Those records render as roots rather
+than nested rows, since the span that would have parented them is a `debug` span
+that never opened.
 
 <img src="../../dashboard/logs.png" alt="The Logs tab tails the newest records with a level filter.">
 
@@ -157,6 +164,10 @@ process runs. No websocket, so the axum side stays stateless.
 
 ## What a wasm trace shows
 
+This tree needs `log_level="debug"`. Every span in it is a `debug` span, so at
+the default `info` a WASM workflow's Traces tab is empty: the guest's own spans
+never reach the host, and the host's own are filtered out.
+
 One `workflow.batch` root span per iteration, holding one `source.drain` per
 source, one `runtime.run` per processor and one `sink.write` per sink, in
 topological order. A `runtime.run` over a WASM processor holds one
@@ -165,9 +176,10 @@ retries and the guest's own wall time.
 
 A guest's `pipeline.stage` and `system.execute` spans never reach the host, so a
 WASM processor is one bar rather than a subtree. A native runtime nests those
-three levels under `runtime.run`.
+three levels under `runtime.run`, and they are `info` spans, which is why a
+native workflow still traces at the default level.
 
-<img src="../../dashboard/traces.png" alt="The Traces tab lists the retained traces, and the selected one renders as a waterfall of its spans.">
+<img src="../../dashboard/traces.png" alt="Captured at log_level=debug: the Traces tab lists workflow.batch-rooted traces, and the selected one renders as a waterfall of workflow.batch, runtime.run, processor.batch and sink.write.">
 
 ## Switching it off
 

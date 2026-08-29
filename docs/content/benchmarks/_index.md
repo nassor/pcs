@@ -277,6 +277,16 @@ planning are hoisted to load time via `InstancePre`, so what remains is store
 creation, instantiation and the IPC round trip — and the IPC section below shows
 that half is substantial at one row.
 
+Those figures are the engine, not the deployment. `stream_latency` installs no
+`tracing` subscriber, so every span on the path costs a no-op dispatch. The
+`pcs-service` binary installs one, and at this scale that subscriber is the larger
+share of per-item cost. Measured through the service's own subscriber, per-item
+stream latency is about 4.6 µs at the default `log_level="info"`, about 7.4 µs at
+`log_level="debug"`, and about 1.9 µs compiled without the `tracing` feature. The
+step from `info` to `debug` is the five per-item runner spans becoming real. That
+is a different measurement path from the round trip charted above, so read it as
+the service's own overhead rather than a number to subtract from the 2 µs p99.
+
 At n=1000 the WASM tail is thinly sampled, so treat the 420 µs p99 as
 indicative, not settled.
 

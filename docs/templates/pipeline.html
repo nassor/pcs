@@ -650,13 +650,15 @@ impl System for CallPricingApi {
 </p>
 
 <p>
-    Every attempt is observable. Under the <code>tracing</code> feature both drivers wrap
-    the call in an <code>info</code>-level <code>task_attempt</code> span carrying
-    <code>attempt</code> and <code>max_attempts</code>, warn on each failure that will be
-    retried with <code>attempt</code>, <code>max_attempts</code>, and
-    <code>delay_ms</code>, and log an error when the budget runs out. That span is the
-    only one <code>pcs-core</code> emits, which makes it the thing to look for when a
-    stage is inexplicably slow. See <a href="{{ get_url(path='@/tracing.md') }}">Tracing</a>.
+    A retry is observable. Under the <code>tracing</code> feature both drivers open an
+    <code>info</code>-level <code>task_attempt</code> span carrying <code>attempt</code>
+    and <code>max_attempts</code>, but only from the second attempt on: a call that
+    succeeds first try opens none, so a clean run shows no <code>task_attempt</code> at
+    all. Both warn on each failure that will be retried with <code>attempt</code>,
+    <code>max_attempts</code> and <code>delay_ms</code>, and log an error when the budget
+    runs out. That the span exists at all is therefore the signal: it means something
+    under it failed and was tried again. See
+    <a href="{{ get_url(path='@/tracing.md') }}">Tracing</a>.
 </p>
 
 <h2 id="failure">When a system fails</h2>

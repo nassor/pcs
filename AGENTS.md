@@ -45,6 +45,29 @@ cargo fmt --manifest-path crates/pcs-service-ui/Cargo.toml -- --check
 cargo clippy --manifest-path crates/pcs-service-ui/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 ```
 
+### protoc prerequisite
+
+`protoc` must be on `PATH` before **any** `pcs-service` test, example or benchmark target
+compiles, whatever feature list is passed. `raft` is a non-optional entry in
+`crates/pcs-service/Cargo.toml`'s `[dev-dependencies]` with `features = ["prost-codec"]`, so it is
+not gated behind `distributed-raft` the way the normal dependency is: it pulls `raft-proto`, whose
+`protobuf-build`/`prost-build` build script invokes `protoc` to regenerate `eraftpb`. A plain
+`cargo build` of the library skips it; `cargo test`, `cargo check --examples` and
+`cargo xtask bench` do not.
+
+```bash
+sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu, what ci.yml runs
+brew install protobuf                       # macOS
+```
+
+On Windows, take the `protoc-*-win64.zip` release from
+`github.com/protocolbuffers/protobuf/releases` and put its `bin/` on `PATH`.
+
+`ci.yml` installs it in the `test`, `distributed_chaos`, `wasm_processor` and `polyglot` jobs, the
+four that compile a `pcs-service` test or example target. A missing `protoc` surfaces as a
+`raft-proto` build-script failure, not as a feature error, so it reads as unrelated to the change
+that triggered it.
+
 ### WASM fixture prerequisite
 
 Each Rust processor generates its WIT bindings in-macro via `wit_bindgen::generate!`, so nothing
@@ -784,9 +807,19 @@ collector, a scraper or external storage. Nothing leaves the process.
   Empty for a wasm-hosted processor, whose spans open inside the guest. A wasm processor's own
   per-batch latency is the `PROCESSOR_ATTR`-attributed `pcs_processor_batch_duration_seconds`
   instead.
-- Host-side spans are what fills the traces tab. Each runner iteration opens a `workflow.batch` root
-  holding `source.drain` per source, `runtime.run` per processor, and `sink.write` per sink, in
-  topological order. `runtime.run` is the contextual parent of whatever the runtime opens:
+- Host-side spans are what fills the traces tab, and their level is what decides whether it has
+  anything in it. The five runner spans are **`debug`**: `workflow.batch` (the root each runner
+  iteration or claim opens), `source.drain` per source, `runtime.run` per processor, `sink.write`
+  per sink, and `processor.batch` from the WASM and plugin hosts. The four `pcs-core` names are
+  **`info`**: `pipeline.run`, `pipeline.stage`, `system.execute`, plus `task_attempt`, which opens
+  **only on a retry** so a clean run produces none. One whole `debug` tree opens per item, so the
+  default `log_level="info"` (filter `pcs=info`) materialises none of it and the traces tab shows
+  `pipeline.run`-rooted traces only; `log_level="debug"` restores the per-item waterfall, at roughly
+  4.6 µs/item against 7.4 µs/item on the reference machine. Because the runner spans may not exist,
+  every runner error and warning names its own `workflow`, `iteration` and node field rather than
+  relying on a parent span. `layer.rs`'s module doc carries the authoritative name/level/fields
+  table.
+- `runtime.run` is the contextual parent of whatever the runtime opens:
   `pipeline.run` for a native `Pipeline`, `processor.batch` for a WASM processor or a native plugin.
   The runners parent their events on the batch span rather than entering it, because the loop awaits
   and an entered guard would adopt every span tokio polls on that thread meanwhile.

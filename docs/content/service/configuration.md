@@ -176,10 +176,17 @@ that node's watermark: [Windowing](@/service/windowing.md).
 
 ### Retrying connector operations
 
-Every `source` and `sink` retries a failed operation with exponential backoff
-before the error reaches the runner: 4 attempts, a 100 ms base delay, 2.0x
-growth, a 30 s cap and 0.1 jitter, the same policy as a pipeline system retry.
-EOF from a source is not an error and is not retried.
+Every `sink` retries a failed write with exponential backoff before the error
+reaches the runner: 4 attempts, a 100 ms base delay, 2.0x growth, a 30 s cap and
+0.1 jitter, the same policy as a pipeline system retry. A `source` takes the same
+wrapper everywhere except `run_mode kind="stream"`, where the stream runner's own
+re-poll already is the retry loop and owns the source's error policy. EOF from a
+source is not an error and is not retried.
+
+The asymmetry follows from what a lost call costs. A `write_batch` the runner
+cannot re-drive is lost rows, so a sink is always wrapped. A stream source that
+fails is polled again 10 ms later, so wrapping it would stack one backoff on
+another.
 
 An optional `retry` child on a `source` or `sink` overrides the policy for that
 node. `max_attempts=1` disables retrying.
@@ -258,6 +265,15 @@ confirm the address answers:
 curl -s http://localhost:8080/ready
 {"status":"ready"}
 ```
+
+`log_level` sets more than verbosity: it decides which spans exist. The default
+`"info"` omits the per-item runner traces, because `workflow.batch`,
+`source.drain`, `runtime.run`, `sink.write` and `processor.batch` are all `debug`
+spans. The dashboard's Traces tab then shows traces rooted at `pipeline.run`, and
+`log_level="debug"` is the escape hatch that restores the whole per-item
+waterfall. It costs roughly 4.6 µs per item at `info` against 7.4 µs at `debug`,
+so `debug` is for reading one workflow, not for running on. Levels per span name
+are in [Observability](@/service/observability.md#span-levels).
 
 ## The store block
 

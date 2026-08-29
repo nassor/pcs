@@ -12,11 +12,14 @@ use uuid::Uuid;
 
 use crate::PcsResult;
 
-/// Hard cap on Arrow IPC bytes that may be included in a single
-/// `ConsensusCommand` (e.g. `RegisterMasterBatch`).
+/// Hard cap on the Arrow IPC bytes of a single persisted payload: the master
+/// batch a partition source registers, and — as the
+/// [`CheckpointStore::max_checkpoint_bytes`](crate::distributed::checkpoint::CheckpointStore::max_checkpoint_bytes)
+/// default — one stage checkpoint.
 ///
-/// Payloads **above** this limit (strictly greater than) must be rejected before
-/// they reach Raft. Consumers that produce larger batches must split them first.
+/// Payloads above this limit are rejected before they are written; consumers
+/// that produce larger batches must split them first. A store may raise the
+/// checkpoint half: the TiKV store allows 4 MiB.
 pub const MAX_LOG_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// A granted claim on a row-range slice of a replicated master `RecordBatch`.
@@ -68,8 +71,8 @@ pub struct BatchClaim {
 /// Source of Arrow-columnar work batches for distributed processing.
 ///
 /// Implementations coordinate across instances to ensure at-most-one claim
-/// per row range at any given time. In multi-node mode each mutating call is
-/// serialized through Raft before returning.
+/// per row range at any given time. The TiKV store does it with an atomic
+/// compare-and-swap on the row-range key.
 ///
 /// ## Lease contract
 ///
@@ -77,7 +80,7 @@ pub struct BatchClaim {
 /// returns an error. Continuing after a lease failure breaks the at-most-once
 /// processing guarantee and can corrupt downstream state.
 ///
-/// ## Example (single-node)
+/// ## Example
 ///
 /// ```no_run
 /// # #[cfg(feature = "distributed")]
@@ -138,8 +141,7 @@ pub trait PartitionSource: Send + Sync {
     ///
     /// Returns the number of claims freed. The default implementation is a
     /// no-op (returns `Ok(0)`) for sources that do not support expiry sweeps.
-    /// [`RedbSharedStore`](crate::distributed::consensus::store::RedbSharedStore)
-    /// overrides this with `ConsensusCommand::ReclaimExpired`.
+    /// The TiKV store overrides it with a scan over the batch's row ranges.
     async fn reclaim_expired(&self, _now_millis: u64) -> PcsResult<u32> {
         Ok(0)
     }

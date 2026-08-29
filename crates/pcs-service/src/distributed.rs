@@ -7,26 +7,27 @@
 //!
 //! # Feature gates
 //!
-//! - `distributed`: this module and the core traits.
-//! - `distributed-raft`: adds the raft-rs consensus driver.
-//! - `tikv-store`: adds the TiKV-backed shared store and state client.
+//! - `distributed`: this module, the core traits, and the runner.
+//! - `tikv-store`: adds the TiKV-backed shared store and state client, the
+//!   only application-data backend.
+//! - `distributed-raft`: adds the raft-rs consensus driver in `consensus/`,
+//!   which carries cluster membership and leadership only.
 //!
 //! # Architecture
 //!
 //! ```text
-//! PartitionSource  ─────────────────────────────►  claim row-ranges
-//! CheckpointStore  ─────────────────────────────►  persist IPC snapshots
+//! PartitionSource   ────────────────────────────►  claim row-ranges
+//! CheckpointStore   ────────────────────────────►  persist IPC snapshots
 //! DistributedRunner ─ claim → run_on_with_state → checkpoint → ack
-//! RedbSharedStore  ─ single-node or multi-node (via Raft channel)
-//! consensus/            ─ state machine, log store, snapshot, driver, transport
+//! TikvSharedStore   ─ both traits over a raw TiKV client (claims via CAS)
+//! consensus/        ─ raft log store, driver, TCP transport
 //! ```
 //!
-//! # Log entry size constraint
+//! # Payload size constraint
 //!
-//! Arrow IPC payloads embedded in Raft log entries are bounded at 1 MiB
-//! ([`MAX_LOG_ENTRY_BYTES`]); larger payloads are rejected at the propose boundary.
-//! The snapshot path (raft-rs `build_snapshot_bytes` / `install_snapshot_bytes`) handles
-//! arbitrarily large state.
+//! Arrow IPC payloads are bounded at 1 MiB ([`MAX_LOG_ENTRY_BYTES`]) for a
+//! registered master batch and, by default, for a checkpoint; the TiKV store
+//! raises the checkpoint half to `TIKV_MAX_CHECKPOINT_BYTES` (4 MiB).
 
 pub mod accumulator_store;
 pub mod checkpoint;
@@ -44,7 +45,6 @@ use async_trait::async_trait;
 pub use checkpoint::{
     ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, PROCESSOR_STATE_STAGE_SENTINEL,
 };
-pub use consensus::RedbSharedStore;
 pub use partition::{BatchClaim, MAX_LOG_ENTRY_BYTES, PartitionSource};
 pub use runner::{DistributedRunner, KeyPartition, RunnerConfig};
 pub use strategy::CheckpointStrategy;

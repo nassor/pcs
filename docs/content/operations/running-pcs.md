@@ -14,9 +14,10 @@ binary. [Configuration](@/service/configuration.md) is the config surface and th
 load-time gates. [Observability](@/service/observability.md) is the HTTP probes,
 readiness and graceful shutdown. This page starts where those leave off.
 
-A cluster node needs `--features service-cluster`, which is not in the default
-bundle. `mode "cluster"` in a binary without it produces a startup error and
-exits 1.
+A cluster node needs `--features service-cluster,tikv-store`, and neither is in
+the default bundle. `mode "cluster"` in a binary without `service-cluster`
+produces a startup error and exits 1. So does a cluster config with no
+`store "tikv"` block: TiKV is the only cluster application-data store.
 
 ---
 
@@ -29,8 +30,8 @@ Use cluster when:
 - The workload exceeds one machine's throughput.
 
 Do not default to cluster mode. Raft needs at least three nodes for quorum,
-membership is managed manually, and standalone with a good backup
-strategy is usually enough.
+membership is managed manually, a TiKV has to be running beside it, and
+standalone with a good backup strategy is usually enough.
 
 ### Cluster Mode and the Workflow Graph
 
@@ -53,15 +54,23 @@ output, rather than draining it into a locally declared sink.
 mode "cluster"
 bootstrap #false                 // #true on the initial node ONLY at first start-up
 
-// Timing. Invariant: lease_ttl_ms >= 3 * election_timeout_ms
-lease_ttl_ms 30000               // 30 s
+// Raft timing. These drive elections, not claims.
 election_timeout_ms 1500         // 1.5 s
 heartbeat_interval_ms 300        // 300 ms
-snapshot_log_interval 10000      // trigger snapshot every 10 000 committed entries
+snapshot_log_interval 10000      // compact the raft log every 10 000 entries
 
 // id is unique per node; override with --node-id or PCS_NODE_ID.
-// data_dir holds the redb files and must be persistent storage.
+// data_dir holds the raft log and must be persistent storage.
 node id=1 name="node-1" data_dir="/var/lib/pcs/data"
+
+// Application data: partitions, claims, checkpoints, configs, cursors and
+// processor priors. Required in cluster mode, and the same for every node.
+store "tikv" {
+    pd_endpoints "10.0.0.1:2379" "10.0.0.2:2379" "10.0.0.3:2379"
+    key_prefix "pcs"             // every key this deployment writes sits under it
+    timeout_ms 10000
+    lease_ttl_ms 90000           // claim lease, at least 10000
+}
 
 // Raft transport addresses, not HTTP.
 peer id=1 addr="10.0.0.1:9000"
@@ -82,7 +91,9 @@ observability log_format="json" log_level="info"
 ### Bootstrap a Three-Node Cluster
 
 This walkthrough assumes three machines at `10.0.0.1` to `10.0.0.3`, Raft on
-port 9000 and HTTP on port 8080.
+port 9000, HTTP on port 8080, and a TiKV already serving PD on port 2379. Bring
+TiKV up first: a node whose `store "tikv"` endpoints are unreachable fails to
+start.
 
 **Step 1: Prepare data directories** (all three nodes):
 
@@ -170,67 +181,77 @@ a manual workaround.
 
 ### Failure Semantics (Cluster)
 
-At-least-once delivery enforced by Raft-backed leases:
+At-least-once delivery, enforced by TiKV-backed leases:
 
-- A node claims a row-range batch from `PartitionSource`. The claim carries a
-  TTL equal to `lease_ttl_ms`.
+- A node claims one 512-row range through `PartitionSource`. The claim carries a
+  TTL equal to the `lease_ttl_ms` in the `store "tikv"` block.
 - If the node does not ack within the TTL (crash, network partition, or slow
-  processing), the lease expires and another node re-claims the batch.
+  processing), the lease expires and another node re-claims the range.
 - A node that loses its lease mid-run stops processing immediately and
-  releases the claim. The batch returns to pending and is re-claimed.
+  releases the claim. The range returns to pending and is re-claimed.
 - Ack is issued only after the processor run and checkpoint write both complete.
 
 **SIGKILL mid-claim**: the claim expires after `lease_ttl_ms` and is retried by
-another node. Processing pauses by up to one TTL for any batch in flight at kill
+another node. Processing pauses by up to one TTL for any range in flight at kill
 time. No data is permanently lost.
 
 ---
 
-## Data Directory Layout
+## Where State Lives
 
-- `raft-log.redb` holds the Raft log entries, an openraft redb B-tree.
-- `state-machine.redb` holds the applied state: the batch registry, claims and
-  checkpoints.
-- `snapshots/<term>-<index>/state.ipc` holds each installed Raft snapshot, in
-  Arrow IPC format.
+Two places, and only one of them is on the node.
 
-Node identity comes from the config and the CLI, not from this directory.
+### `node.data_dir`
 
-**`raft-log.redb`**: grows until a snapshot installs and the preceding entries
-are compacted. Snapshots trigger automatically once committed log entries
-exceed `snapshot_log_interval` (default: 10 000); there is no manual
-force-snapshot command. If the file grows unexpectedly, check that
-`pcs_raft_commit_index` is advancing and that snapshot installation completes.
+Three files, all local, none of them application state.
 
-**`state-machine.redb`**: holds batch registrations, active claims, the
-secondary claims-by-batch index, and checkpoint IPC bytes. It is serialized
-into Raft snapshots. Back it up before manual maintenance. Its size is stable
-in steady state.
+- `raft-log.redb` holds this node's Raft log: its vote, its entries and its view
+  of the membership.
+- `bootstrap.lock` records that a cluster was deliberately created here. A
+  `raft-log.redb` without it is an unclean shutdown before bootstrap finished,
+  and the node refuses to start.
+- `node-id` records which node the directory belongs to. A start whose `node.id`
+  disagrees with it is refused.
 
-**`snapshots/`**: written during `build_snapshot`, read during
-`install_snapshot`. New nodes joining the cluster receive a full snapshot over
-TCP (chunked at 4 MiB per frame). Old snapshots are cleaned up after a newer
-one installs. Do not delete these manually while the node is running.
+Nothing else is written there. A node that loses its data directory loses its
+place in the membership, never a claim or a checkpoint.
 
-### `MAX_LOG_ENTRY_BYTES` Cap
+**`raft-log.redb`**: grows until compaction. The driver compacts once applied
+entries pass `snapshot_log_interval` (default: 10 000); there is no manual
+force-compaction command. Nothing is proposed into this log, so its entries are
+Raft's own per-term bookkeeping and it grows slowly. If it grows unexpectedly,
+check that `pcs_raft_commit_index` is advancing.
 
-Two independent limits apply:
+### TiKV
+
+Everything the pipeline touches, under the `key_prefix` the `store "tikv"` block
+declares: registered master batches, one record per 512-row range carrying that
+range's claim state, checkpoint IPC bytes, the schema-id ledger, source cursors,
+processor priors, and persisted configs. Every node reads and writes the same
+copy. Claim transitions are compare-and-swap, so TiKV arbitrates them without a
+coordinator and no PCS node dispatches work to another.
+
+Back up TiKV, not the data directories. Two deployments can share one TiKV by
+picking different `key_prefix` values.
+
+### Payload Caps
 
 - **`MAX_LOG_ENTRY_BYTES`**: 1 MiB, defined in
-  `crates/pcs-service/src/distributed/partition.rs`. Caps the Arrow IPC
-  payload carried *inside a single Raft log entry*: checkpoint snapshots and
-  `RegisterMasterBatch` bodies. Payloads above it are rejected with a `Store`
-  error before they reach Raft.
+  `crates/pcs-service/src/distributed/partition.rs`. Caps the Arrow IPC payload
+  of a registered master batch and the runner's own stage checkpoint.
+- **`TIKV_MAX_CHECKPOINT_BYTES`**: 4 MiB, defined in
+  `crates/pcs-service/src/distributed/tikv_store.rs`. The ceiling the TiKV store
+  reports through `CheckpointStore::max_checkpoint_bytes`, which the window
+  accumulator and the processor state blob are measured against. It leaves
+  headroom under TiKV's own raw-value limit.
 - **`MAX_FRAME_BYTES`**: 16 MiB, defined in
-  `crates/pcs-service/src/distributed/consensus/transport.rs`. Caps a single
-  length-prefixed TCP frame on the peer transport. It bounds the wire, not the
-  log entry; snapshot transfers are chunked at 4 MiB to stay under it.
+  `crates/pcs-service/src/distributed/consensus/transport/mod.rs`. Caps a single
+  length-prefixed TCP frame on the peer transport. That transport carries Raft
+  messages only, so no application payload ever reaches it.
 
-If the workload produces large checkpoints, raise `MAX_LOG_ENTRY_BYTES` in
-`crates/pcs-service/src/distributed/partition.rs` and rebuild with
-`--features service-cluster`. Prefer shorter batches, smaller per-entity
-state, or splitting the component upstream first: every log entry is
-replicated to every node.
+If registration rejects a batch, split the input across several `batch_id`s
+rather than raising the constant. Row ranges are 512 rows apiece however large
+the batch is, so smaller batches cost no parallelism.
 
 ---
 
@@ -245,7 +266,7 @@ Checkpoint strategy is set on `DistributedRunner`, in code rather than config.
 | `None` | No checkpointing | Idempotent pipelines that can safely re-run from the start |
 
 The default is `EveryStage`. For long pipelines with expensive stages, consider
-`EveryNStages` to reduce redb write pressure.
+`EveryNStages` to reduce write pressure on TiKV.
 
 ---
 
@@ -259,7 +280,7 @@ exiting. The remaining nodes elect a new leader after `election_timeout_ms * 2` 
 the exiting node was the leader.
 
 `SIGKILL` bypasses the handler. The claim expires after `lease_ttl_ms` and is
-retried by another node, so processing pauses by up to one lease TTL for any batch
+retried by another node, so processing pauses by up to one lease TTL for any range
 in flight at kill time. No data is permanently lost.
 
 ---
@@ -328,23 +349,29 @@ the remaining nodes elect a new leader automatically after `election_timeout_ms
 
 ### Cluster partition
 
-**Majority side** (quorum present): continues operating. If the leader is on
-this side it keeps committing; if not, the majority elects a new leader.
+A PCS Raft partition and a TiKV partition are different failures, because the
+two carry different things.
 
-**Minority side** (no quorum): all nodes become followers and stop accepting
-writes. In-flight claims are not acked; they expire and are retried by the
-majority side after `lease_ttl_ms`.
+**PCS Raft partition**: the majority side keeps a leader, or elects one. The
+minority side falls back to followers or candidates. Neither side stops
+claiming: claims go to TiKV, not through the PCS Raft, so a running node keeps
+working as long as TiKV is reachable. What the minority loses is a settled
+leader, which is visible as `pcs_raft_leader_id` reporting `-1`. A node that
+*restarts* into a minority partition does fail to start: startup waits 30 s for
+Raft to leave Candidate and exits 1 if it does not.
 
-When the partition heals, minority-side nodes re-join and receive a snapshot or
-log replay from the leader. No manual action is required.
+**TiKV unreachable**: claims, checkpoints and acks all fail. In-flight leases
+expire and the ranges return to pending once TiKV is back. Restore TiKV's own
+quorum first; the PCS nodes need no manual action.
+
+When a PCS Raft partition heals, minority-side nodes rejoin from the leader. No
+manual action is required.
 
 ### Disk pressure (`raft-log.redb` growing)
 
-1. Check `pcs_raft_commit_index`. If it has stopped advancing, the state
-   machine may be stuck.
-2. Snapshots are triggered automatically when committed entries exceed
-   `snapshot_log_interval`. Reduce this value in the config and restart to
-   force more frequent snapshots.
-3. After a snapshot installs, log compaction removes old entries and frees
-   space.
-
+1. Check `pcs_raft_commit_index`. If it has stopped advancing, the node is not
+   committing and compaction cannot run.
+2. Compaction is automatic once applied entries pass `snapshot_log_interval`.
+   Reduce that value and restart to compact more often.
+3. Nothing application-sized is in this log. A file growing past a few megabytes
+   means entries are accumulating uncommitted, not that a payload is large.

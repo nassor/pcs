@@ -13,8 +13,9 @@
 //!   [`config::ServiceConfig`] schema, which can describe a cluster config even
 //!   though running one fails at startup.
 //! - `service-cluster`: adds the cluster runner ([`cluster::run_cluster`]) and
-//!   enables `distributed-raft`, compiling in the full openraft, redb, and TCP
-//!   transport stack.
+//!   enables `distributed-raft`, compiling in the raft-rs drive loop, its
+//!   redb log store, and the TCP transport. Cluster mode also needs
+//!   `tikv-store`: TiKV is the only application-data store.
 //!
 //! ## Quick start
 //!

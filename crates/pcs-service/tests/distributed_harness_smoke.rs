@@ -9,9 +9,12 @@
 #[cfg(feature = "distributed-raft")]
 mod common;
 
+/// A three-node cluster elects a leader, commits the leader's own term entry,
+/// and every node converges on the same applied index. Nothing is proposed:
+/// the PCS raft carries membership and leadership only.
 #[cfg(feature = "distributed-raft")]
 #[tokio::test(flavor = "multi_thread")]
-async fn cluster_forms_and_applies_noop() {
+async fn cluster_forms_and_converges() {
     use common::RaftClusterHarness;
     use std::time::Duration;
 
@@ -24,20 +27,25 @@ async fn cluster_forms_and_applies_noop() {
         .await
         .expect("leader should be elected within 10 s");
 
-    harness
-        .propose_noop(leader)
+    // Taking office appends one entry, so the leader's applied index must pass 0.
+    let leader_applied = harness
+        .await_applied_at_least(leader, 1, Duration::from_secs(10))
         .await
-        .expect("noop proposal should succeed");
+        .expect("the leader must apply its own term entry");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let converged = harness
+        .await_convergence(Duration::from_secs(15))
+        .await
+        .expect("all three nodes must converge on one applied index");
+    assert!(
+        converged >= leader_applied,
+        "convergence index {converged} must not go backwards from {leader_applied}"
+    );
 
-    for node_id in 1..=3_u64 {
-        let applied = harness.last_applied(node_id);
-        assert!(
-            applied.is_some() && applied.unwrap() >= 1,
-            "node {node_id} should have applied at least 1 entry, got {applied:?}"
-        );
-    }
+    assert!(
+        harness.max_term() >= 1,
+        "an elected leader implies a term of at least 1"
+    );
 
     harness.shutdown().await;
 }

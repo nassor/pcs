@@ -5,6 +5,11 @@ features: field-granular DAG scheduling, parallel and sequential systems,
 world resources, checkpointing, Raft consensus, and structured tracing across
 three nodes.
 
+The three PCS nodes form a Raft cluster for membership and leadership. The work
+pool — master batches, row-range claims and checkpoints — lives in a TiKV the
+Compose file deploys alongside them, so every node points at the same
+`--pd-endpoints` and the same `--key-prefix`.
+
 ---
 
 ## Architecture
@@ -16,26 +21,26 @@ graph TB
     subgraph node1["Node 1 (Bootstrap + Generator)"]
         GEN["Order Generator\n(every 10 s)"]
         W1["DistributedRunner"]
-        GEN -->|register_master_batch| SM1[("Raft State\nMachine")]
+        GEN -->|register_master_batch| TIKV
     end
 
     subgraph node2["Node 2 (Follower)"]
         W2["DistributedRunner"]
-        SM2[("Raft State\nMachine")]
     end
 
     subgraph node3["Node 3 (Follower)"]
         W3["DistributedRunner"]
-        SM3[("Raft State\nMachine")]
     end
 
-    SM1 <-->|Raft TCP 9001| SM2
-    SM1 <-->|Raft TCP 9001| SM3
-    SM2 <-->|Raft TCP 9002| SM3
+    TIKV[("TiKV\n(work pool)")]
 
-    SM1 --> W1
-    SM2 --> W2
-    SM3 --> W3
+    R1[("Raft\nnode 1")] <-->|Raft TCP 9001| R2[("Raft\nnode 2")]
+    R1 <-->|Raft TCP 9001| R3[("Raft\nnode 3")]
+    R2 <-->|Raft TCP 9002| R3
+
+    TIKV --> W1
+    TIKV --> W2
+    TIKV --> W3
 
     W1 -->|invoices| OUT1["/data/output/node1"]
     W2 -->|invoices| OUT2["/data/output/node2"]
@@ -44,8 +49,10 @@ graph TB
 
 - **Node 1** bootstraps the Raft cluster and runs an embedded generator task.
 - All 3 nodes run a `DistributedRunner` that claims, processes, checkpoints, and
-  acks batches via Raft-replicated state.
-- The generator only writes when node 1 is the leader; followers skip silently.
+  acks batches. Claims are atomic compare-and-swap transitions on TiKV keys, so
+  exactly one node processes each row range.
+- The PCS raft carries membership and leadership; nothing is proposed into its
+  log.
 
 ---
 
@@ -90,7 +97,7 @@ world access (`System` with `&mut Pipeline`).
 ```mermaid
 sequenceDiagram
     participant G as Generator (node1)
-    participant R as Raft Cluster
+    participant R as TiKV work pool
     participant N as Any Node Runner
     participant W as Pipeline Factory
     participant P as Pipeline (4 stages)
@@ -99,12 +106,12 @@ sequenceDiagram
     loop every 10 s
         G->>G: generate 300–500 Order rows
         G->>R: register_master_batch(batch_id, ipc_bytes)
-        R-->>G: MasterBatchRegistered
+        R-->>G: batch + row ranges written
     end
 
     N->>R: claim_next_batch(instance_id)
     R-->>N: BatchClaim { batch_id, row_range }
-    Note over N: FulfillmentStore intercepts claim<br/>reads IPC from state machine DB
+    Note over N: FulfillmentStore intercepts claim<br/>reads the batch IPC back from the store
     N->>W: world_factory()
     W-->>N: Pipeline (Order rows + resources)
     N->>P: pipeline.run(world)
@@ -162,11 +169,13 @@ erDiagram
 
 - Rust 1.95+
 - 3 terminals
+- A reachable TiKV. `tiup playground --mode tikv-slim` gives you PD on
+  `127.0.0.1:2379`.
 
 ### Build
 
 ```bash
-cargo build --example distributed_fulfillment --features service-cluster
+cargo build --example distributed_fulfillment --features service-cluster,tikv-store
 ```
 
 ### Terminal 1 — Bootstrap node + generator
@@ -178,6 +187,7 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --data-dir /tmp/fulfillment/node1 \
   --output-dir /tmp/fulfillment/output/node1 \
   --peers 127.0.0.1:9002,127.0.0.1:9003 \
+  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment \
   --generator-interval 10
 ```
 
@@ -189,7 +199,8 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --listen 127.0.0.1:9002 \
   --data-dir /tmp/fulfillment/node2 \
   --output-dir /tmp/fulfillment/output/node2 \
-  --peers 127.0.0.1:9001,127.0.0.1:9003
+  --peers 127.0.0.1:9001,127.0.0.1:9003 \
+  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
 ```
 
 ### Terminal 3
@@ -200,7 +211,8 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --listen 127.0.0.1:9003 \
   --data-dir /tmp/fulfillment/node3 \
   --output-dir /tmp/fulfillment/output/node3 \
-  --peers 127.0.0.1:9001,127.0.0.1:9002
+  --peers 127.0.0.1:9001,127.0.0.1:9002 \
+  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
 ```
 
 ---
@@ -244,7 +256,8 @@ docker compose -f examples/distributed_fulfillment/docker-compose.yml down
 | Pipeline resources (non-columnar) | `resources.rs` → `FxRateTable`, `TaxRateTable`, `InventoryCatalog`, `NodeId` |
 | Retry config | `GenerateInvoiceSystem::config()` → `RetryMode::Fixed { retries: 3 }` |
 | `world.append::<Invoice>()` | `GenerateInvoiceSystem::run()` — Invoice rows created at runtime |
-| Raft consensus | `ArrowRaftDriver` via `distributed-raft` feature |
+| Raft consensus (membership, leadership) | `ArrowRaftDriver` via `distributed-raft` feature |
+| Shared work pool | `TikvSharedStore` via `tikv-store` feature |
 | Checkpoint every N stages | `CheckpointStrategy::EveryNStages(2)` in `RunnerConfig` |
 | At-least-once semantics | `DistributedRunner` claim → ack cycle |
 | Structured tracing | Every system emits `tracing::info!` with `node_id`, `batch_id`, `stage` |

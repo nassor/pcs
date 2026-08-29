@@ -1,72 +1,42 @@
-//! Inbound half of the transport: the TCP accept loop and RPC dispatch.
+//! Inbound half of the transport: the TCP accept loop and message dispatch.
 //!
-//! Owns [`RaftTcpServer`] and the per-connection read/dispatch/write loop.
-//! Inbound raft messages are forwarded to the driver's transport inbox
-//! (which steps them into the local `RawNode`); forwarded proposals are
-//! routed to the proposal channel and their responses written back on the
-//! same connection.
+//! Owns [`RaftTcpServer`] and the per-connection read/dispatch loop. Inbound
+//! raft messages are forwarded to the driver's transport inbox, which steps
+//! them into the local `RawNode`. Nothing is answered on the connection: raft
+//! traffic is fire-and-forget.
 
-#[cfg(feature = "distributed-raft")]
 use std::io;
-#[cfg(feature = "distributed-raft")]
 use std::net::SocketAddr;
-#[cfg(feature = "distributed-raft")]
 use std::sync::Arc;
-#[cfg(feature = "distributed-raft")]
 use std::time::Duration;
 
-#[cfg(feature = "distributed-raft")]
 use prost::Message as _;
-#[cfg(feature = "distributed-raft")]
 use raft::eraftpb::Message;
-#[cfg(feature = "distributed-raft")]
 use tokio::net::TcpStream;
-#[cfg(feature = "distributed-raft")]
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-#[cfg(feature = "distributed-raft")]
 use super::MAX_ACCEPTED_CONNECTIONS;
-#[cfg(feature = "distributed-raft")]
-use super::wire::{RpcEnvelope, RpcResponse, read_frame, write_frame};
-#[cfg(feature = "distributed-raft")]
-use crate::PcsResult;
-#[cfg(feature = "distributed-raft")]
-use crate::distributed::consensus::types::ConsensusCommand;
+use super::wire::{decode_raft_message, read_frame};
 
-/// TCP server that dispatches incoming Raft RPCs to the local driver.
+/// TCP server that dispatches incoming Raft messages to the local driver.
 ///
 /// Start one instance per node during cluster initialisation. The server binds
 /// `listen_addr` and spawns a Tokio task per accepted connection. The accept
 /// loop stops on [`RaftTcpServer::shutdown`] or when the server handle drops.
-#[cfg(feature = "distributed-raft")]
 pub struct RaftTcpServer {
     transport_tx: mpsc::Sender<Message>,
-    proposal_tx: mpsc::Sender<(
-        ConsensusCommand,
-        oneshot::Sender<PcsResult<ConsensusResponse>>,
-    )>,
     listen_addr: SocketAddr,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-#[cfg(feature = "distributed-raft")]
 impl RaftTcpServer {
     /// Create a new server bound to `listen_addr` that forwards inbound
-    /// messages to the driver's channels.
-    #[allow(clippy::type_complexity)]
-    pub fn new(
-        transport_tx: mpsc::Sender<Message>,
-        proposal_tx: mpsc::Sender<(
-            ConsensusCommand,
-            oneshot::Sender<PcsResult<ConsensusResponse>>,
-        )>,
-        listen_addr: SocketAddr,
-    ) -> Self {
+    /// messages to the driver's transport inbox.
+    pub fn new(transport_tx: mpsc::Sender<Message>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             transport_tx,
-            proposal_tx,
             listen_addr,
             shutdown_tx,
             shutdown_rx,
@@ -122,10 +92,9 @@ impl RaftTcpServer {
                     };
 
                     let transport_tx = self.transport_tx.clone();
-                    let proposal_tx = self.proposal_tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        handle_connection(transport_tx, proposal_tx, stream).await;
+                        handle_connection(transport_tx, stream).await;
                         #[cfg(feature = "tracing")]
                         tracing::debug!(peer = %_peer_addr, "RaftTcpServer: connection closed");
                     });
@@ -144,19 +113,9 @@ impl RaftTcpServer {
     }
 }
 
-#[cfg(feature = "distributed-raft")]
-use crate::distributed::consensus::types::ConsensusResponse;
-
-/// Handle one accepted connection: read RPCs, dispatch, write responses.
-#[cfg(feature = "distributed-raft")]
-async fn handle_connection(
-    transport_tx: mpsc::Sender<Message>,
-    proposal_tx: mpsc::Sender<(
-        ConsensusCommand,
-        oneshot::Sender<PcsResult<ConsensusResponse>>,
-    )>,
-    mut stream: TcpStream,
-) {
+/// Handle one accepted connection: read frames and step each raft message into
+/// the driver.
+async fn handle_connection(transport_tx: mpsc::Sender<Message>, mut stream: TcpStream) {
     loop {
         // Close the connection if the peer stops sending, so an alive-but-silent TCP
         // link does not park a task indefinitely.
@@ -177,67 +136,23 @@ async fn handle_connection(
                 }
             };
 
-        let envelope: RpcEnvelope = match RpcEnvelope::decode(&raw) {
-            Ok(e) => e,
+        let body = match decode_raft_message(&raw) {
+            Ok(b) => b,
             Err(_e) => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(error = %_e, "RaftTcpServer: envelope decode error");
+                tracing::warn!(error = %_e, "RaftTcpServer: frame tag decode error");
                 break;
             }
         };
-
-        let response = handle_envelope(&transport_tx, &proposal_tx, envelope).await;
-
-        // Raft messages are fire-and-forget: no reply frame is written, so no
-        // stale frames accumulate on pooled connections.
-        let Some(response) = response else {
-            continue;
+        let msg = match Message::decode(body) {
+            Ok(m) => m,
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %_e, "RaftTcpServer: raft message decode error");
+                break;
+            }
         };
-        let resp_bytes = response.encode();
-        if write_frame(&mut stream, &resp_bytes).await.is_err() {
-            break;
-        }
-    }
-}
-
-/// Dispatch one decoded envelope: raft messages to the driver's inbox
-/// (response-less), forwarded proposals to the proposal channel with the
-/// response written back.
-#[cfg(feature = "distributed-raft")]
-async fn handle_envelope(
-    transport_tx: &mpsc::Sender<Message>,
-    proposal_tx: &mpsc::Sender<(
-        ConsensusCommand,
-        oneshot::Sender<PcsResult<ConsensusResponse>>,
-    )>,
-    envelope: RpcEnvelope,
-) -> Option<RpcResponse> {
-    match envelope {
-        RpcEnvelope::RaftMessage(bytes) => {
-            let msg = match Message::decode(bytes.as_slice()) {
-                Ok(m) => m,
-                Err(_e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(error = %_e, "RaftTcpServer: raft message decode error");
-                    return None;
-                }
-            };
-            // Overflow drops the message; raft re-sends (heartbeats, probes).
-            let _ = transport_tx.try_send(msg);
-            None
-        }
-        RpcEnvelope::ProposalForward { command } => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if proposal_tx.send((command, reply_tx)).await.is_err() {
-                return Some(RpcResponse::Error("proposal channel closed".to_string()));
-            }
-            match reply_rx.await {
-                Ok(Ok(response)) => Some(RpcResponse::Applied { index: 0, response }),
-                Ok(Err(e)) => Some(RpcResponse::Error(e.to_string())),
-                Err(_) => Some(RpcResponse::Error(
-                    "proposal reply channel closed".to_string(),
-                )),
-            }
-        }
+        // Overflow drops the message; raft re-sends (heartbeats, probes).
+        let _ = transport_tx.try_send(msg);
     }
 }

@@ -1,18 +1,23 @@
-//! Arrow-IPC distributed scheduler: single-node batch processing with checkpoint.
+//! Arrow-IPC distributed scheduler: TiKV-backed batch processing with checkpoints.
 //!
-//! Master batches are registered with [`RedbSharedStore`]. A
+//! Master batches are registered with [`TikvSharedStore`]. A
 //! [`DistributedRunner`] then claims a row-range, runs a [`Pipeline`] over a
 //! fresh [`Dataset`], checkpoints the resulting IPC bytes, and acks the claim.
 //! Recovery after a crash resumes from the checkpoint.
 //!
-//! This is single-node mode, no Raft. A production deployment uses a
-//! multi-node [`RedbSharedStore`] plus [`ArrowRaftDriver`].
+//! Claims are atomic compare-and-swap transitions on TiKV keys, so several
+//! instances pointed at the same `key_prefix` share one work pool.
+//!
+//! Needs the `tikv-store` feature and a reachable TiKV: PD at
+//! `PCS_PD_ENDPOINTS` (default `127.0.0.1:2379`). The example exits with a
+//! clear message when the store cannot be reached.
 //!
 //! ```bash
-//! cargo run --example distributed_scheduler --features distributed
+//! cargo run --example distributed_scheduler --features tikv-store
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Float64Array, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -21,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use pcs_service::PcsError;
 use pcs_service::component::Component;
 use pcs_service::dataset::Dataset;
-use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
+use pcs_service::distributed::{TikvSharedStore, TikvStoreConfig};
 use pcs_service::pipeline::Pipeline;
 use pcs_service::system::{SystemMeta, system_fn};
 
@@ -74,15 +79,40 @@ fn make_order_ipc() -> Vec<u8> {
     buf
 }
 
+/// Connection options, overridable through the environment so the example runs
+/// against a local `tiup playground` or a Compose deployment unchanged.
+fn store_config() -> TikvStoreConfig {
+    let pd_endpoints = std::env::var("PCS_PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    TikvStoreConfig {
+        pd_endpoints,
+        // A unique prefix per run keeps repeated runs of the example from
+        // claiming each other's batches.
+        key_prefix: format!("pcs-example-{}", uuid::Uuid::now_v7().simple()),
+        timeout: Duration::from_secs(10),
+        lease_ttl_millis: 30_000,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), PcsError> {
-    println!("=== Arrow Distributed Scheduler (single-node) ===\n");
+    println!("=== Arrow Distributed Scheduler (TiKV-backed) ===\n");
 
-    let db_path = std::env::temp_dir().join(format!(
-        "pcs_arrow_distributed_example_{}.redb",
-        uuid::Uuid::now_v7()
-    ));
-    let store = RedbSharedStore::single_node(&db_path)?;
+    let store_cfg = store_config();
+    println!("PD endpoints: {:?}", store_cfg.pd_endpoints);
+    println!("Key prefix:   {}\n", store_cfg.key_prefix);
+
+    let store = TikvSharedStore::connect(&store_cfg).await.map_err(|e| {
+        PcsError::configuration(format!(
+            "cannot reach TiKV at {:?}: {e}\n\
+             Start one (for example `tiup playground`) or set PCS_PD_ENDPOINTS.",
+            store_cfg.pd_endpoints
+        ))
+    })?;
 
     // In production the master batch comes from an ingestion layer such as a
     // Parquet or S3 reader, not a hand-rolled helper.
@@ -130,8 +160,6 @@ async fn main() -> Result<(), PcsError> {
     println!("Batches processed: {}", processed);
     println!("Checkpoint written: yes (EveryStage)");
     println!("At-least-once guarantee: claim was acked after successful run");
-
-    let _ = std::fs::remove_file(&db_path);
 
     Ok(())
 }

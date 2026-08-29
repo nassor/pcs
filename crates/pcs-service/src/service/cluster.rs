@@ -14,30 +14,27 @@
 //! locally in the runner's scheduler after each batch, so output is spread
 //! across nodes and operators must aggregate it externally.
 //!
+//! ## Store backend
 //!
-//! ## Store backends
-//!
-//! With a `store "tikv" { … }` block the shared store lives in TiKV and the
-//! PCS raft node (tikv/raft-rs) runs only for membership and leadership:
-//! application mutations go to TiKV's own raft, so the redb state machine is
-//! untouched. Without one, the redb `RedbSharedStore` routes mutations through
-//! the local raft handle as before.
+//! The shared store is always TiKV: `ServiceConfig::validate` requires a
+//! `store "tikv" { … }` block in cluster mode. Application mutations —
+//! partitions, claims, checkpoints — go to TiKV's own raft, and the PCS raft
+//! node (tikv/raft-rs) runs only for membership and leadership.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::PcsError;
 use crate::PcsResult;
+use crate::distributed::SharedStore;
 use crate::distributed::checkpoint::CheckpointStore;
 use crate::distributed::consensus::driver::{
     ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
 };
-use crate::distributed::consensus::store::RedbSharedStore;
 use crate::distributed::runner::{DistributedRunner, RunnerConfig};
 use crate::distributed::strategy::CheckpointStrategy;
 #[cfg(feature = "tikv-store")]
@@ -49,7 +46,6 @@ use crate::service::config::{ClusterConfig, ServiceConfig, ServiceMode};
 
 const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 const RAFT_LOG_DB_FILE: &str = "raft-log.redb";
-const APP_DB_FILE: &str = "cluster-app.redb";
 const NODE_ID_FILE: &str = "node-id";
 
 // ── Timing constants ─────────────────────────────────────────────────────────
@@ -148,9 +144,8 @@ pub async fn run_cluster(
     };
 
     let log_db_path = data_dir.join(RAFT_LOG_DB_FILE);
-    let app_db_path = data_dir.join(APP_DB_FILE);
 
-    let (handle, _driver_task) = ArrowRaftDriver::start(driver_config, &log_db_path, &app_db_path)
+    let (handle, _driver_task) = ArrowRaftDriver::start(driver_config, &log_db_path)
         .await
         .map_err(|e| PcsError::configuration(format!("ArrowRaftDriver::start failed: {e}")))?;
 
@@ -183,23 +178,17 @@ pub async fn run_cluster(
     stats.last_raft_term = Some(metrics.term);
     stats.last_leader_id = metrics.leader_id;
 
-    // Backend selection: with a `store` block the shared store lives in TiKV
-    // (PCS raft still runs for membership and leadership; application
-    // mutations go to TiKV's own raft), otherwise the redb store routes
-    // through the local raft handle.
-    let store: Box<dyn crate::distributed::SharedStore> = match config.store.as_ref() {
-        #[cfg(feature = "tikv-store")]
-        Some(_) => {
-            let tcfg = TikvStoreConfig::try_from(config.store.as_ref().expect("matched Some"))?;
-            Box::new(TikvSharedStore::connect(&tcfg).await?)
-        }
-        #[cfg(not(feature = "tikv-store"))]
-        Some(_) => unreachable!("validate rejects `store` without tikv-store"),
-        None => Box::new(RedbSharedStore::multi_node(
-            Arc::clone(handle.app_db()),
-            handle.clone(),
-        )),
-    };
+    // TiKV is the only cluster application-data store. `validate` guarantees a
+    // `store "tikv"` block is present and that this binary carries the
+    // `tikv-store` feature, so both error paths here are defence in depth for a
+    // caller that built a `ServiceConfig` in code and skipped validation.
+    let store_config = config.store.as_ref().ok_or_else(|| {
+        PcsError::configuration(
+            "mode \"cluster\" requires a `store \"tikv\"` block: TiKV is the only cluster \
+             application-data store",
+        )
+    })?;
+    let store = connect_store(store_config).await?;
 
     let producer_cancel = cancel.child_token();
     // ServiceConfig::validate rejects sources in cluster mode, so built.nodes
@@ -288,6 +277,29 @@ pub async fn run_cluster(
     stats.total_duration_ms = start.elapsed().as_millis() as u64;
 
     Ok(stats)
+}
+
+/// Connect the cluster shared store described by `store_config`.
+///
+/// Dual impl, like `crate::metrics::Instruments`: without `tikv-store` there is
+/// no backend to connect, so the call is a configuration error rather than a
+/// `#[cfg]` at the call site.
+#[cfg(feature = "tikv-store")]
+async fn connect_store(
+    store_config: &crate::service::config::StoreConfig,
+) -> PcsResult<Box<dyn SharedStore>> {
+    let tcfg = TikvStoreConfig::try_from(store_config)?;
+    Ok(Box::new(TikvSharedStore::connect(&tcfg).await?))
+}
+
+#[cfg(not(feature = "tikv-store"))]
+async fn connect_store(
+    _store_config: &crate::service::config::StoreConfig,
+) -> PcsResult<Box<dyn SharedStore>> {
+    Err(PcsError::configuration(
+        "mode \"cluster\" requires the `tikv-store` feature: TiKV is the only cluster \
+         application-data store — rebuild with `--features service-cluster,tikv-store`",
+    ))
 }
 
 /// Record `pcs_raft_commit_index`, `pcs_raft_term` and `pcs_raft_leader_id`
@@ -439,7 +451,6 @@ async fn wait_for_raft_settled(
 mod tests {
     use super::*;
     use crate::distributed::consensus::driver::{ArrowRaftDriver, ArrowRaftDriverConfig};
-    use crate::distributed::consensus::store::RedbSharedStore;
     use crate::service::config::{
         ClusterConfig, HttpConfig, NodeConfig, ObservabilityConfig, PeerSpec, ServiceConfig,
         ServiceMode, StandaloneConfig, WorkflowSpec,
@@ -466,29 +477,41 @@ mod tests {
             .and_then(|v| v.parse::<f64>().ok())
     }
 
-    fn single_peer_cluster_config(
-        node_id: u64,
-        addr: SocketAddr,
-        data_dir: PathBuf,
-    ) -> ServiceConfig {
+    fn single_node_driver_config(addr: SocketAddr) -> ArrowRaftDriverConfig {
+        ArrowRaftDriverConfig {
+            node_id: 1,
+            listen_addr: addr,
+            peers: HashMap::new(),
+            heartbeat_interval_ms: 30,
+            election_timeout_ms: 200,
+            snapshot_log_interval: 1000,
+        }
+    }
+
+    fn single_peer_cluster(addr: SocketAddr) -> ClusterConfig {
+        ClusterConfig {
+            peers: vec![PeerSpec {
+                id: 1,
+                addr: addr.to_string(),
+            }],
+            bootstrap: true,
+            election_timeout_ms: 300,
+            heartbeat_interval_ms: 50,
+            snapshot_log_interval: 1000,
+        }
+    }
+
+    /// A one-node cluster config with no `store` block, which `validate`
+    /// rejects and `run_cluster` refuses.
+    fn storeless_cluster_config(addr: SocketAddr, data_dir: PathBuf) -> ServiceConfig {
         ServiceConfig {
             node: NodeConfig {
-                id: node_id,
+                id: 1,
                 name: None,
                 data_dir,
             },
             mode: ServiceMode::Cluster {
-                config: ClusterConfig {
-                    peers: vec![PeerSpec {
-                        id: node_id,
-                        addr: addr.to_string(),
-                    }],
-                    bootstrap: true,
-                    lease_ttl_ms: 10_000,
-                    election_timeout_ms: 300,
-                    heartbeat_interval_ms: 50,
-                    snapshot_log_interval: 1000,
-                },
+                config: single_peer_cluster(addr),
             },
             workflows: vec![WorkflowSpec {
                 id: "cluster-test".to_string(),
@@ -531,6 +554,7 @@ mod tests {
             inspector: None,
         }
     }
+
     #[test]
     fn test_inconsistent_data_dir_returns_error() {
         let dir = TempDir::new().unwrap();
@@ -628,43 +652,28 @@ mod tests {
         );
     }
 
+    /// The node directory a bootstrapped node leaves behind is exactly
+    /// `bootstrap.lock`, `raft-log.redb` and `node-id`: no application store
+    /// lives on local disk.
     #[tokio::test]
     async fn test_bootstrap_creates_lock_file() {
         let dir = TempDir::new().unwrap();
         let addr = free_addr();
-        let driver_config = ArrowRaftDriverConfig {
-            node_id: 1,
-            listen_addr: addr,
-            peers: HashMap::new(),
-            heartbeat_interval_ms: 30,
-            election_timeout_ms: 200,
-            snapshot_log_interval: 1000,
-        };
 
         let (handle, _task) = ArrowRaftDriver::start(
-            driver_config,
+            single_node_driver_config(addr),
             dir.path().join(RAFT_LOG_DB_FILE),
-            dir.path().join(APP_DB_FILE),
         )
         .await
         .unwrap();
 
         let bootstrap_lock = dir.path().join(BOOTSTRAP_LOCK_FILE);
-        let cluster = ClusterConfig {
-            peers: vec![PeerSpec {
-                id: 1,
-                addr: addr.to_string(),
-            }],
-            bootstrap: true,
-            lease_ttl_ms: 10_000,
-            election_timeout_ms: 300,
-            heartbeat_interval_ms: 50,
-            snapshot_log_interval: 1000,
-        };
+        let cluster = single_peer_cluster(addr);
 
         bootstrap_cluster(&handle, &cluster, 1, &addr.to_string(), &bootstrap_lock)
             .await
             .unwrap();
+        write_node_id_file(dir.path(), 1).unwrap();
 
         assert!(
             bootstrap_lock.exists(),
@@ -672,6 +681,21 @@ mod tests {
         );
 
         handle.shutdown().await;
+
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                BOOTSTRAP_LOCK_FILE.to_string(),
+                NODE_ID_FILE.to_string(),
+                RAFT_LOG_DB_FILE.to_string(),
+            ],
+            "the node directory holds only raft state and identity"
+        );
     }
 
     /// The one-second recorder must write all three Raft gauges from the driver
@@ -686,34 +710,15 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let addr = free_addr();
-        let driver_config = ArrowRaftDriverConfig {
-            node_id: 1,
-            listen_addr: addr,
-            peers: HashMap::new(),
-            heartbeat_interval_ms: 30,
-            election_timeout_ms: 200,
-            snapshot_log_interval: 1000,
-        };
 
         let (handle, _task) = ArrowRaftDriver::start(
-            driver_config,
+            single_node_driver_config(addr),
             dir.path().join(RAFT_LOG_DB_FILE),
-            dir.path().join(APP_DB_FILE),
         )
         .await
         .unwrap();
 
-        let cluster = ClusterConfig {
-            peers: vec![PeerSpec {
-                id: 1,
-                addr: addr.to_string(),
-            }],
-            bootstrap: true,
-            lease_ttl_ms: 10_000,
-            election_timeout_ms: 300,
-            heartbeat_interval_ms: 50,
-            snapshot_log_interval: 1000,
-        };
+        let cluster = single_peer_cluster(addr);
         bootstrap_cluster(
             &handle,
             &cluster,
@@ -731,9 +736,9 @@ mod tests {
         let gauges = spawn_raft_gauges(handle.clone(), cancel.child_token());
 
         // A freshly bootstrapped node passes `wait_for_raft_settled` as a
-        // Learner, before it promotes itself, so the first tick legitimately
-        // sees no leader and records -1. Polling proves the recorder keeps
-        // publishing rather than firing once.
+        // follower, before it wins its first election, so the first tick
+        // legitimately sees no leader and records -1. Polling proves the
+        // recorder keeps publishing rather than firing once.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut text = String::new();
         let mut leader = None;
@@ -812,105 +817,24 @@ mod tests {
         );
     }
 
-    // Integration smoke test: boots a real single-node Raft cluster, runs
-    // run_cluster, cancels after 500 ms, and checks that it returns Ok.
+    /// A cluster config with no `store` block must be refused rather than fall
+    /// back to a local store. `validate` catches it at load time; this covers
+    /// the runner's own guard for a config built in code.
     #[tokio::test]
-    async fn test_single_node_cancel_returns_ok() {
+    async fn test_cluster_without_store_is_refused() {
         let dir = TempDir::new().unwrap();
-        let addr = free_addr();
-        let config = single_peer_cluster_config(1, addr, dir.path().to_path_buf());
+        let config = storeless_cluster_config(free_addr(), dir.path().to_path_buf());
 
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
+        config
+            .validate()
+            .expect_err("validate must reject cluster mode without a store");
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            cancel_clone.cancel();
-        });
-
-        let result = run_cluster(empty_built_service(), &config, cancel).await;
+        let result = run_cluster(empty_built_service(), &config, CancellationToken::new()).await;
+        let err = result.expect_err("run_cluster must refuse a storeless cluster config");
+        let msg = err.to_string();
         assert!(
-            result.is_ok(),
-            "run_cluster should return Ok on cancel: {result:?}"
+            msg.contains("tikv"),
+            "error should name the required TiKV store: {msg}"
         );
-
-        let stats = result.unwrap();
-        assert!(
-            dir.path().join(BOOTSTRAP_LOCK_FILE).exists(),
-            "bootstrap.lock must exist after successful run"
-        );
-        // No duration assertion: Raft startup and settle dominate the 500 ms
-        // cancel and depend on election timers.
-        assert!(
-            stats.total_duration_ms > 0,
-            "duration should be > 0ms, got {}ms",
-            stats.total_duration_ms
-        );
-    }
-
-    // Dropping the consensus receiver simulates a partitioned cluster: the
-    // oneshot channel closes at once, so every propose must return an error.
-    #[tokio::test]
-    async fn test_multi_node_propose_channel_closed_returns_error() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.redb");
-
-        let (store, rx) = RedbSharedStore::with_consensus(&db_path).await.unwrap();
-        drop(rx);
-
-        let result = store
-            .register_master_batch(0, "comp".to_string(), 1, vec![0u8; 64], 1)
-            .await;
-
-        assert!(
-            result.is_err(),
-            "closed channel should produce an error, not success"
-        );
-    }
-
-    #[test]
-    fn test_oversize_payload_rejected_before_propose() {
-        use crate::distributed::partition::MAX_LOG_ENTRY_BYTES;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.redb");
-        let store = RedbSharedStore::single_node(&db_path).unwrap();
-
-        // Payload at exactly the limit (= MAX_LOG_ENTRY_BYTES) should be rejected.
-        let big = vec![0u8; MAX_LOG_ENTRY_BYTES];
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(store.register_master_batch(0, "x".to_string(), 1, big, 1));
-
-        assert!(
-            result.is_err(),
-            "oversize payload must be rejected with an error"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("MAX_LOG_ENTRY_BYTES") || msg.contains("Split"),
-            "error should mention size limit: {msg}"
-        );
-    }
-
-    // A duplicate RegisterMasterBatch must surface the state machine's own
-    // response rather than a canned ClaimAcked.
-    #[tokio::test]
-    async fn test_sm_error_propagates_to_caller() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.redb");
-        let store = RedbSharedStore::single_node(&db_path).unwrap();
-
-        store
-            .register_master_batch(0, "comp".to_string(), 1, vec![0u8; 64], 10)
-            .await
-            .expect("first registration should succeed");
-
-        // A repeat registration may be idempotent or may fail; what matters is
-        // that the response comes from the state machine.
-        let result2 = store
-            .register_master_batch(0, "comp".to_string(), 1, vec![0u8; 64], 10)
-            .await;
-        // Either outcome is acceptable.
-        let _ = result2;
     }
 }

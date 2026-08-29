@@ -17,15 +17,19 @@
 [profile.default]
 # Excluded whole binaries are entirely testcontainers-driven: every test in
 # the file starts a container (see docs/content/connectors/kafka.md and
-# nats.md, and crates/pcs-connector-postgresql/tests/common/mod.rs). Excluded
-# test() clauses pick out the one Docker-backed test inside an otherwise-fast
-# file (kafka_service.rs, nats_service.rs, postgres_service.rs and
-# s3_service.rs each pair a real-container test with a pure-config test), or
-# the Docker-gated `cluster` module inside raft_consensus_chaos.rs (its `unit`
-# module is Docker-free and stays fast). The one chaos test with no cheap
-# counterpart, distributed_integration_chaos.rs's
-# full_stack_chaos_monkey_60s, opts out via `#[ignore]` instead, so it is
-# skipped here without a filter entry and reachable through `--run-ignored`.
+# nats.md, and crates/pcs-connector-postgresql/tests/common/mod.rs) or, for
+# the three Raft suites, a Toxiproxy container plus an N-node cluster.
+# Excluded test() clauses pick out the one Docker-backed test inside an
+# otherwise-fast file: kafka_service.rs, nats_service.rs, postgres_service.rs
+# and s3_service.rs each pair a real-container test with a pure-config test.
+# The one chaos test with no cheap counterpart,
+# distributed_integration_chaos.rs's full_stack_chaos_monkey_60s, opts out via
+# `#[ignore]` instead, so it is skipped here without a filter entry and
+# reachable through `--run-ignored`.
+#
+# The runner suites (distributed_scheduler, runner_chaos, checkpoint_chaos,
+# wasm_chaos, distributed_processor_state) need no entry: they drive the
+# in-memory fixture in tests/common/memory_store.rs, not a container.
 default-filter = '''
 not (
     binary_id(=pcs-connector-kafka::kafka_roundtrip)
@@ -36,11 +40,11 @@ not (
     or binary_id(=pcs-connector-s3::round_trip)
     or binary_id(=pcs-service::transport_chaos)
     or binary_id(=pcs-service::distributed_harness_smoke)
+    or binary_id(=pcs-service::raft_consensus_chaos)
     or (binary_id(=pcs-service::kafka_service) and test(=a_kafka_source_and_sink_move_rows_through_the_standalone_runner))
     or (binary_id(=pcs-service::nats_service) and test(=a_nats_source_and_sink_move_rows_through_the_standalone_runner))
     or (binary_id(=pcs-service::postgres_service) and test(=a_postgres_source_and_sink_move_rows_through_the_standalone_runner))
     or (binary_id(=pcs-service::s3_service) and test(=an_s3_source_and_sink_move_rows_through_the_standalone_runner))
-    or (binary_id(=pcs-service::raft_consensus_chaos) and test(/^cluster::/))
     or binary_id(=pcs-service::tikv_store)
 )
 '''
@@ -48,7 +52,25 @@ not (
 [profile.ci]
 default-filter = "all()"
 # The heaviest Docker chaos tests run past nextest's default 60s slow
-# threshold (transport_chaos's bandwidth test takes up to ~120s, and
-# full_stack_chaos_monkey_60s ~70-100s), so raise it to keep CI output from
-# being spuriously flagged SLOW. Nothing here terminates a test early.
+# threshold (transport_chaos's bandwidth test allows up to 60s for the
+# follower to reconverge on top of container startup, and
+# full_stack_chaos_monkey_60s takes ~70-100s), so raise it to keep CI output
+# from being spuriously flagged SLOW. Nothing here terminates a test early.
 slow-timeout = "180s"
+
+# Each Raft chaos test starts its own Toxiproxy container plus an N-node
+# cluster with one proxy per directed edge, then asserts on election and
+# log-convergence deadlines. Unlike the connector suites, which each need
+# only their own container, these contend for the Docker daemon, host ports
+# and enough CPU to run 3-5 raft nodes apiece, so they take the machine one
+# at a time.
+[test-groups.raft-chaos]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(=pcs-service::transport_chaos) or binary_id(=pcs-service::raft_consensus_chaos) or binary_id(=pcs-service::distributed_harness_smoke) or binary_id(=pcs-service::distributed_integration_chaos)'
+test-group = "raft-chaos"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(=pcs-service::transport_chaos) or binary_id(=pcs-service::raft_consensus_chaos) or binary_id(=pcs-service::distributed_harness_smoke) or binary_id(=pcs-service::distributed_integration_chaos)'
+test-group = "raft-chaos"

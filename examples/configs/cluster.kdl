@@ -1,24 +1,28 @@
 // PCS cluster service configuration, built-in factories only.
 // A three-node Raft cluster with at-least-once processing. Each node runs with
-// its own PCS_NODE_ID and PCS_DATA_DIR.
+// its own PCS_NODE_ID and PCS_DATA_DIR, and all three share one TiKV cluster:
+// the PCS raft carries membership and leadership, while the work pool (master
+// batches, row-range claims, checkpoints) lives in TiKV.
+//
+// Needs both `service-cluster` and `tikv-store`, plus a reachable PD.
 //
 // Validate, without starting a cluster:
 //   PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-//   cargo run --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- validate \
+//   cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate \
 //     --config examples/configs/cluster.kdl
 //
 // Run three nodes, one per terminal or process-manager entry:
 //   Terminal 1:
 //     PCS_NODE_ID=1 PCS_BOOTSTRAP=true PCS_DATA_DIR=/tmp/pcs-node-1 \
-//     cargo run --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
+//     cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
 //       --config examples/configs/cluster.kdl
 //   Terminal 2:
 //     PCS_NODE_ID=2 PCS_DATA_DIR=/tmp/pcs-node-2 \
-//     cargo run --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
+//     cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
 //       --config examples/configs/cluster.kdl
 //   Terminal 3:
 //     PCS_NODE_ID=3 PCS_DATA_DIR=/tmp/pcs-node-3 \
-//     cargo run --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
+//     cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- serve \
 //       --config examples/configs/cluster.kdl
 //
 // Components and systems have no configuration representation: the processor
@@ -32,12 +36,9 @@ mode "cluster"
 // substitution; the loader accepts a string that parses as a bool.
 bootstrap "${PCS_BOOTSTRAP:-false}"
 
-// Invariant: lease_ttl_ms >= 3 * election_timeout_ms.
-// 30000 >= 3 * 1500 = 4500, so this holds.
-lease_ttl_ms 30000          // 30 s
 election_timeout_ms 1500    // 1.5 s
 heartbeat_interval_ms 300   // 300 ms, must be < election_timeout_ms
-snapshot_log_interval 10000 // snapshot every 10 000 committed log entries
+snapshot_log_interval 10000 // compact the raft log every 10 000 applied entries
 
 // id is a u64; the quoted form accepts the substituted digits.
 // PCS_NODE_ID is 1, 2, or 3, set per instance via env var.
@@ -48,6 +49,16 @@ node id="${PCS_NODE_ID}" name="pcs-node-${PCS_NODE_ID}" data_dir="${PCS_DATA_DIR
 peer id=1 addr="10.0.0.1:9000"
 peer id=2 addr="10.0.0.2:9000"
 peer id=3 addr="10.0.0.3:9000"
+
+// Cluster mode requires this block: TiKV is the only application-data store.
+// Every node must name the same `pd_endpoints` and the same `key_prefix`, or
+// they claim from separate work pools. `lease_ttl_ms` is the claim lease, the
+// only lease knob in cluster mode; minimum 10000.
+store "tikv" {
+    pd_endpoints "10.0.0.1:2379" "10.0.0.2:2379" "10.0.0.3:2379"
+    key_prefix "pcs-cluster"
+    lease_ttl_ms 30000
+}
 
 // A cluster-mode workflow declares exactly one processor node and no source,
 // sink or link: the distributed runner ingests through `PartitionSource` and

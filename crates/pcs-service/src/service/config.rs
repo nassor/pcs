@@ -25,10 +25,11 @@
 //! [`WorkflowSpec`].
 //!
 //! Cluster mode instead sets `mode "cluster"`, `bootstrap` on the first node,
-//! and one `peer` node (`id`, `addr`) per cluster member. A cluster-mode
-//! workflow declares exactly one `wasm` or `plugin` node and no source, sink
-//! or link: the distributed runner ingests through `PartitionSource` and
-//! drives one runtime per node.
+//! and one `peer` node (`id`, `addr`) per cluster member, plus a
+//! `store "tikv"` block: TiKV is the only cluster application-data store. A
+//! cluster-mode workflow declares exactly one `wasm` or `plugin` node and no
+//! source, sink or link: the distributed runner ingests through
+//! `PartitionSource` and drives one runtime per node.
 //!
 //! ## Env var substitution
 //!
@@ -174,9 +175,6 @@ pub struct PeerSpec {
     pub addr: String,
 }
 
-fn default_lease_ttl() -> u64 {
-    30_000
-}
 fn default_election_timeout() -> u64 {
     1_500
 }
@@ -201,16 +199,13 @@ pub struct ClusterConfig {
     /// in templates.
     #[serde(default, deserialize_with = "de_bool_flexible")]
     pub bootstrap: bool,
-    /// Batch-lease TTL in milliseconds. Must be >= 3 × `election_timeout_ms`.
-    #[serde(default = "default_lease_ttl")]
-    pub lease_ttl_ms: u64,
     /// Raft election timeout in milliseconds.
     #[serde(default = "default_election_timeout")]
     pub election_timeout_ms: u64,
     /// Raft heartbeat interval in milliseconds.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_ms: u64,
-    /// Take a log snapshot every N committed log entries.
+    /// Compact the Raft log every N applied log entries.
     #[serde(default = "default_snapshot_log_interval")]
     pub snapshot_log_interval: u64,
 }
@@ -1511,14 +1506,6 @@ impl ServiceConfig {
                     "node id {node_id} is not listed in cluster.peers"
                 )));
             }
-
-            let min_lease = config.election_timeout_ms.saturating_mul(3);
-            if config.lease_ttl_ms < min_lease {
-                return Err(PcsError::configuration(format!(
-                    "lease_ttl_ms ({}) must be >= 3 × election_timeout_ms ({}) = {}",
-                    config.lease_ttl_ms, config.election_timeout_ms, min_lease,
-                )));
-            }
         }
 
         for wf in &self.workflows {
@@ -1626,6 +1613,17 @@ impl ServiceConfig {
                     self.http.bind
                 ))
             })?;
+        }
+
+        // TiKV is the only cluster application-data store, so a cluster node
+        // without one has nowhere to claim partitions from. Checked after the
+        // workflow rules so a config with both problems reports the shape
+        // error first.
+        if matches!(self.mode, ServiceMode::Cluster { .. }) && self.store.is_none() {
+            return Err(PcsError::configuration(
+                "mode \"cluster\" requires a `store \"tikv\"` block: TiKV is the only cluster \
+                 application-data store",
+            ));
         }
 
         #[cfg(not(feature = "tikv-store"))]
@@ -2043,7 +2041,6 @@ store "tikv" {{
             ServiceMode::Cluster { config } => {
                 assert_eq!(config.peers.len(), 2);
                 assert!(config.bootstrap);
-                assert_eq!(config.lease_ttl_ms, default_lease_ttl());
                 assert_eq!(config.election_timeout_ms, default_election_timeout());
                 assert_eq!(config.heartbeat_interval_ms, default_heartbeat_interval());
                 assert_eq!(
@@ -2124,26 +2121,56 @@ peer id=2 addr="127.0.0.2:9000"
         );
     }
 
+    /// Cluster mode has no local application store, so a config without a
+    /// `store "tikv"` block is rejected.
+    #[cfg(feature = "wasm")]
     #[test]
-    fn test_cluster_insufficient_lease_ttl_rejected() {
-        let raw = format!(
-            r#"
+    fn test_cluster_without_store_rejected() {
+        let raw = r#"
 mode "cluster"
-lease_ttl_ms 1000
-election_timeout_ms 1000
+bootstrap #true
 
 node id=1 data_dir="/tmp/pcs"
 
 peer id=1 addr="127.0.0.1:9000"
-{TRIVIAL_WORKFLOW}
-"#
-        );
-        let cfg = parse(&raw).expect("parse should succeed");
-        let err = cfg.validate().unwrap_err();
+
+workflow "w" {
+    wasm "p" module="p.wasm"
+}
+"#;
+        let cfg = parse(raw).expect("parse should succeed");
+        let err = cfg
+            .validate()
+            .expect_err("cluster mode needs a store block");
         assert!(
-            err.to_string().contains("lease_ttl_ms"),
-            "error should mention lease_ttl_ms: {err}"
+            err.to_string().contains("store \"tikv\""),
+            "error should name the required store block: {err}"
         );
+    }
+
+    /// The same config with a `store "tikv"` block validates.
+    #[cfg(all(feature = "wasm", feature = "tikv-store"))]
+    #[test]
+    fn test_cluster_with_tikv_store_validates() {
+        let raw = r#"
+mode "cluster"
+bootstrap #true
+
+node id=1 data_dir="/tmp/pcs"
+
+peer id=1 addr="127.0.0.1:9000"
+
+store "tikv" {
+    pd_endpoints "127.0.0.1:2379"
+}
+
+workflow "w" {
+    wasm "p" module="p.wasm"
+}
+"#;
+        let cfg = parse(raw).expect("parse should succeed");
+        cfg.validate()
+            .expect("a cluster config with a tikv store validates");
     }
 
     #[test]

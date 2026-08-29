@@ -48,7 +48,7 @@ pcs-service --version
 
 ## What stays opt-in
 
-Three features are not in the bundle, each for a reason.
+Four features are not in the bundle, each for a reason.
 
 `connector-kafka` needs `cmake` and a C toolchain, because `librdkafka-sys`
 builds vendored C. Defaulting it would break the install on a machine that has
@@ -58,10 +58,20 @@ neither. Add it when you need Kafka:
 cargo install --path crates/pcs-service --features connector-kafka
 ```
 
-`distributed-raft` and `service-cluster` carry the Raft stack, the redb log
-store and the TCP peer transport. A cluster node is a deployment decision, so
-`mode "cluster"` in a config asks for a binary built with
-`--features service-cluster`. See [Operating pcs-service](@/operations/running-pcs.md).
+`tikv-store` pulls `tikv-client`, and tonic and prost behind it. It carries
+`TikvSharedStore`, the shared store the distributed runner claims from, and
+`TikvStateClient`, which persists configs, source cursors and processor priors.
+
+`distributed-raft` and `service-cluster` carry the PCS Raft stack: the redb raft
+log, the node driver and the TCP peer transport. A cluster node is a deployment
+decision, so `mode "cluster"` asks for a binary built with the cluster feature
+and TiKV together:
+
+```bash,name=Build a cluster node
+cargo install --path crates/pcs-service --features service-cluster,tikv-store
+```
+
+See [Operating pcs-service](@/operations/running-pcs.md).
 
 ## The config file it looks for
 

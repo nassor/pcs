@@ -10,13 +10,16 @@
 
 #![cfg(feature = "distributed")]
 
+#[path = "common/memory_store.rs"]
+mod memory_store;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use memory_store::MemoryStore;
 use pcs_core::runtime::PipelineRuntime;
 use pcs_core::{Dataset, PcsError, PcsResult};
-use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
 use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
@@ -67,7 +70,7 @@ impl PipelineRuntime for MockTrapRuntime {
 
 /// Shared inner state for `CountingSource`.
 struct CountingSourceInner {
-    inner: RedbSharedStore,
+    inner: MemoryStore,
     release_count: Arc<AtomicUsize>,
     ack_count: Arc<AtomicUsize>,
     claims_issued: Arc<AtomicUsize>,
@@ -85,10 +88,7 @@ struct CountingSourceInner {
 struct CountingSource(Arc<CountingSourceInner>);
 
 impl CountingSource {
-    fn new(
-        inner: RedbSharedStore,
-        max_claims: usize,
-    ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn new(inner: MemoryStore, max_claims: usize) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let release = Arc::new(AtomicUsize::new(0));
         let ack = Arc::new(AtomicUsize::new(0));
         let src = Self(Arc::new(CountingSourceInner {
@@ -158,11 +158,7 @@ impl CheckpointStore for CountingSource {
     }
 }
 
-fn temp_db_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("pcs_wasm_chaos_{}.redb", Uuid::now_v7()))
-}
-
-async fn seed_batch(store: &RedbSharedStore, batch_id: u64) {
+async fn seed_batch(store: &MemoryStore, batch_id: u64) {
     store
         .register_master_batch(batch_id, "test".to_string(), 1, vec![0u8; 16], 1)
         .await
@@ -182,8 +178,7 @@ fn runner_config(max_batches: Option<usize>) -> RunnerConfig {
 /// `release_claim` exactly once, and never call `ack_claim`.
 #[tokio::test]
 async fn test_trap_releases_not_acks() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     let (source, release_count, ack_count) = CountingSource::new(inner, 1);
@@ -208,8 +203,6 @@ async fn test_trap_releases_not_acks() {
         0,
         "claim must NOT be acked when runtime returns Err"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A trapped batch is released, re-claimable, and succeeds on the retry.
@@ -219,8 +212,7 @@ async fn test_trap_releases_not_acks() {
 /// `Err`; the second claims the re-queued batch. After both: release 1, ack 1.
 #[tokio::test]
 async fn test_trap_then_retry_succeeds() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     // Allow 2 total claims across both runner runs (1 trap + 1 retry).
@@ -245,16 +237,13 @@ async fn test_trap_then_retry_succeeds() {
         "run 2 must not add more releases"
     );
     assert_eq!(ack_count.load(Ordering::SeqCst), 1, "run 2: batch acked");
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The trap surfaces as `PcsError::SystemExecution`, not a panic and not a
 /// re-wrapped error.
 #[tokio::test]
 async fn test_trap_error_is_system_execution_variant() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     let (source, _release, _ack) = CountingSource::new(inner, 1);
@@ -267,6 +256,4 @@ async fn test_trap_error_is_system_execution_variant() {
         matches!(err, PcsError::SystemExecution(_)),
         "error must be PcsError::SystemExecution, got: {err:?}"
     );
-
-    let _ = std::fs::remove_file(&path);
 }

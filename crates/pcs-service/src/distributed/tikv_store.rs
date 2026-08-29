@@ -288,9 +288,8 @@ impl TikvSharedStore {
     ///
     /// The batch is split into fixed-size pending row ranges
     /// ([`TIKV_ROWS_PER_RANGE`]) so several instances can claim parts of it
-    /// in parallel. Rejects payloads at the redb propose boundary
-    /// ([`MAX_LOG_ENTRY_BYTES`]) and refuses to overwrite an existing batch
-    /// id.
+    /// in parallel. Rejects payloads at or above [`MAX_LOG_ENTRY_BYTES`] and
+    /// refuses to overwrite an existing batch id.
     ///
     /// # Errors
     ///
@@ -365,6 +364,32 @@ impl TikvSharedStore {
             start = end;
         }
         Ok(())
+    }
+
+    /// Read the registered master batch at `batch_id`; `Ok(None)` when absent.
+    ///
+    /// The runner builds each partition dataset from its own world factory, so
+    /// nothing on the claim path needs the payload. A caller that wants to
+    /// hydrate rows from the batch itself — as
+    /// `examples/distributed_fulfillment` does — reads it back here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcsError::Store`] on a transport failure or a record that
+    /// does not decode.
+    pub async fn read_master_batch(&self, batch_id: u64) -> PcsResult<Option<MasterBatchRecord>> {
+        let key = Key::from(batch_key(&self.prefix, batch_id));
+        let Some(value) = self
+            .client
+            .get(key)
+            .await
+            .map_err(|e| PcsError::store(format!("tikv get master batch {batch_id}: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let record = postcard::from_bytes(&value)
+            .map_err(|e| PcsError::store(format!("tikv decode master batch: {e}")))?;
+        Ok(Some(record))
     }
 
     /// Read the claim index record for `claim_id`; `Ok(None)` when absent.
@@ -857,7 +882,7 @@ mod tests {
         assert_eq!(
             DefaultStore.max_checkpoint_bytes(),
             MAX_LOG_ENTRY_BYTES,
-            "the trait default is the redb cap"
+            "the trait default is the shared 1 MiB payload cap"
         );
         // TIKV_MAX_CHECKPOINT_BYTES (4 MiB) > MAX_LOG_ENTRY_BYTES (1 MiB) is
         // the whole point of the override; the constant's own test asserts

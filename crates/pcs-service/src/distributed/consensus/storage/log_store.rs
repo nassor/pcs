@@ -6,6 +6,7 @@
 //! every method through [`tokio::task::spawn_blocking`]; the parent module doc
 //! explains why.
 
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,8 +17,15 @@ use raft::{Error, Result as RaftResult, Storage, StorageError};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use super::{dec, enc};
 use crate::error::{PcsError, PcsResult};
+
+fn enc<T: serde::Serialize>(v: &T) -> io::Result<Vec<u8>> {
+    postcard::to_allocvec(v).map_err(|e| io::Error::other(format!("postcard encode: {e}")))
+}
+
+fn dec<T: for<'de> serde::Deserialize<'de>>(b: &[u8]) -> io::Result<T> {
+    postcard::from_bytes(b).map_err(|e| io::Error::other(format!("postcard decode: {e}")))
+}
 
 const HARD_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_hard_state");
 const CONF_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_conf_state");
@@ -28,8 +36,10 @@ const KEY_HARD_STATE: &str = "hard_state";
 const KEY_CONF_STATE: &str = "conf_state";
 const KEY_SNAPSHOT: &str = "snapshot";
 
-/// One stored snapshot: the PCS snapshot bytes plus the raft bookkeeping
-/// (index, term, conf state) the log needs to serve [`Storage::snapshot`].
+/// One stored snapshot: the raft bookkeeping (index, term, conf state) the log
+/// needs to serve [`Storage::snapshot`], plus the opaque payload raft carries
+/// alongside it. The payload is empty in cluster mode — the PCS raft holds no
+/// application state, so a snapshot is metadata only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotRecord {
     index: u64,
@@ -386,9 +396,39 @@ impl Storage for RaftRedbLogStore {
 }
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{blank_entry, make_store};
     use super::*;
     use tempfile::TempDir;
+
+    fn make_store(dir: &TempDir) -> RaftRedbLogStore {
+        RaftRedbLogStore::open(dir.path().join("raft-log.redb")).unwrap()
+    }
+
+    fn blank_entry(index: u64) -> Entry {
+        Entry {
+            term: 1,
+            index,
+            data: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Postcard round-trip of the stored snapshot record, the one metadata row
+    /// whose encoding is not prost.
+    #[test]
+    fn test_snapshot_record_postcard_round_trip() {
+        let record = SnapshotRecord {
+            index: 10,
+            term: 2,
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+            data: Vec::new(),
+        };
+        let decoded: SnapshotRecord = dec(&enc(&record).unwrap()).unwrap();
+        assert_eq!(decoded.index, 10);
+        assert_eq!(decoded.term, 2);
+        assert_eq!(decoded.voters, vec![1, 2, 3]);
+        assert!(decoded.data.is_empty());
+    }
 
     #[test]
     fn test_empty_state() {

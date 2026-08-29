@@ -307,7 +307,8 @@ tier.
 The service runs under the streaming standalone runner, which is
 **at-most-once**. It acknowledges nothing and keeps no checkpoints, so a service
 killed mid-batch loses that batch. The state blob each processor returns is
-handed back as the next item's `prior` and lives in loop memory only.
+handed back as the next item's `prior`. Neither config here declares a `store`
+block, so that blob lives in loop memory and is gone on restart.
 
 At-least-once is `DistributedRunner`'s territory, covered under
 [Distributed Runner](@/distributed.md).

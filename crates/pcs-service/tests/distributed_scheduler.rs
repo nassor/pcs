@@ -1,5 +1,5 @@
-// DistributedRunner over a redb-backed shared store. Requires the `distributed`
-// feature.
+// DistributedRunner over the in-memory shared-store fixture. Requires the
+// `distributed` feature.
 
 #![cfg(feature = "distributed")]
 
@@ -14,9 +14,13 @@ use pcs_core::component::Component;
 use pcs_core::dataset::Dataset;
 use pcs_core::pipeline::Pipeline;
 use pcs_core::system::{SystemMeta, system_fn};
-use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
+
+#[path = "common/memory_store.rs"]
+mod memory_store;
+
+use memory_store::MemoryStore;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Order {
@@ -69,8 +73,7 @@ fn make_order_ipc(orders: &[(u64, f64, &str)]) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_distributed_runner_processes_single_batch() {
-    let db_path = std::env::temp_dir().join(format!("pcs_dist_test_{}.redb", uuid::Uuid::now_v7()));
-    let store = RedbSharedStore::single_node(&db_path).unwrap();
+    let store = MemoryStore::new();
 
     let ipc_bytes = make_order_ipc(&[(1, 100.0, "USD"), (2, 250.0, "EUR"), (3, 75.5, "GBP")]);
     store
@@ -105,15 +108,11 @@ async fn test_distributed_runner_processes_single_batch() {
         ran.load(std::sync::atomic::Ordering::SeqCst),
         "system should have been called"
     );
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 #[tokio::test]
 async fn test_distributed_runner_processes_multiple_batches() {
-    let db_path =
-        std::env::temp_dir().join(format!("pcs_dist_multi_{}.redb", uuid::Uuid::now_v7()));
-    let store = RedbSharedStore::single_node(&db_path).unwrap();
+    let store = MemoryStore::new();
 
     for batch_id in 0..3u64 {
         let ipc_bytes = make_order_ipc(&[
@@ -142,15 +141,11 @@ async fn test_distributed_runner_processes_multiple_batches() {
     let processed = runner.run(Dataset::new).await.unwrap();
 
     assert_eq!(processed, 3, "all 3 batches should have been processed");
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 #[tokio::test]
 async fn test_distributed_runner_no_batches_returns_zero() {
-    let db_path =
-        std::env::temp_dir().join(format!("pcs_dist_empty_{}.redb", uuid::Uuid::now_v7()));
-    let store = RedbSharedStore::single_node(&db_path).unwrap();
+    let store = MemoryStore::new();
 
     let mut pipeline = Pipeline::new("distributed-empty");
     pipeline.add_system(system_fn(SystemMeta::new("noop"), |_data: &mut Dataset| {
@@ -168,6 +163,4 @@ async fn test_distributed_runner_no_batches_returns_zero() {
     let processed = runner.run(Dataset::new).await.unwrap();
 
     assert_eq!(processed, 0, "no batches registered, should process 0");
-
-    let _ = std::fs::remove_file(&db_path);
 }

@@ -1,143 +1,44 @@
-//! On-wire message types and the length-prefixed frame codec.
+//! On-wire frame body codec and the length-prefixed frame helpers.
 //!
-//! Holds the [`RpcEnvelope`] / [`RpcResponse`] pair exchanged by every RPC and
-//! the [`read_frame`] / [`write_frame`] helpers both directions share.
+//! One message kind travels over this transport: a raft protocol message,
+//! carried as raw prost-encoded `eraftpb::Message` bytes (the raft
+//! `prost-codec` wire format) behind a one-byte tag inside a length-prefixed
+//! frame.
 //!
-//! Each payload is `1 tag byte + body` inside the existing length-prefixed
-//! frame: raft messages travel as raw prost-encoded `eraftpb::Message` bytes
-//! (the raft `prost-codec` wire format), everything else as postcard.
+//! The tag exists so the format stays extensible. It is **append-only**:
+//! [`TAG_RAFT_MESSAGE`] must keep its value, and a future message kind takes
+//! the next free tag, so rolling upgrades stay compatible.
 
 use std::io;
 
 use tokio::net::TcpStream;
 
-#[cfg(feature = "distributed-raft")]
-use crate::distributed::consensus::types::{ConsensusCommand, ConsensusResponse};
-
 use super::MAX_FRAME_BYTES;
 
 /// Tag byte for a raft message frame body.
-#[cfg(feature = "distributed-raft")]
 const TAG_RAFT_MESSAGE: u8 = 0;
-/// Tag byte for a proposal-forward frame body.
-#[cfg(feature = "distributed-raft")]
-const TAG_PROPOSAL_FORWARD: u8 = 1;
-/// Tag byte for an applied response body.
-#[cfg(feature = "distributed-raft")]
-const TAG_RESPONSE_APPLIED: u8 = 0;
-/// Tag byte for an error response body.
-#[cfg(feature = "distributed-raft")]
-const TAG_RESPONSE_ERROR: u8 = 1;
 
-/// Typed envelope for all RPCs sent over the TCP transport.
+/// Encode prost-encoded raft message bytes as a tagged frame body.
+pub(super) fn encode_raft_message(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    out.push(TAG_RAFT_MESSAGE);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Strip the tag byte from a frame body, returning the prost-encoded raft
+/// message bytes.
 ///
-/// Serialized as `1 tag byte + body` inside the length-prefixed frame:
-/// [`RaftMessage`](Self::RaftMessage) bodies are raw prost-encoded
-/// `eraftpb::Message` bytes, [`ProposalForward`](Self::ProposalForward)
-/// bodies are postcard-encoded [`ConsensusCommand`].
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug)]
-pub(crate) enum RpcEnvelope {
-    /// A raft protocol message: prost-encoded `eraftpb::Message` bytes.
-    RaftMessage(Vec<u8>),
-    /// A follower forwards a proposal to the leader.
-    ProposalForward { command: ConsensusCommand },
-}
-
-#[cfg(feature = "distributed-raft")]
-impl RpcEnvelope {
-    /// Encode as `1 tag byte + body`.
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            RpcEnvelope::RaftMessage(bytes) => {
-                let mut out = Vec::with_capacity(1 + bytes.len());
-                out.push(TAG_RAFT_MESSAGE);
-                out.extend_from_slice(bytes);
-                out
-            }
-            RpcEnvelope::ProposalForward { command } => {
-                let body = postcard::to_allocvec(command)
-                    .expect("postcard encode of ConsensusCommand is infallible");
-                let mut out = Vec::with_capacity(1 + body.len());
-                out.push(TAG_PROPOSAL_FORWARD);
-                out.extend_from_slice(&body);
-                out
-            }
-        }
-    }
-
-    /// Decode from `1 tag byte + body`.
-    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-        let Some((tag, body)) = bytes.split_first() else {
-            return Err(io::Error::other("empty envelope frame"));
-        };
-        match *tag {
-            TAG_RAFT_MESSAGE => Ok(RpcEnvelope::RaftMessage(body.to_vec())),
-            TAG_PROPOSAL_FORWARD => {
-                let command = postcard::from_bytes(body)
-                    .map_err(|e| io::Error::other(format!("proposal decode: {e}")))?;
-                Ok(RpcEnvelope::ProposalForward { command })
-            }
-            other => Err(io::Error::other(format!("unknown envelope tag {other}"))),
-        }
-    }
-}
-
-/// Response envelope returned from the server for each incoming RPC.
-#[cfg(feature = "distributed-raft")]
-#[derive(Debug)]
-pub(crate) enum RpcResponse {
-    /// A forwarded proposal was applied at `index`.
-    Applied {
-        index: u64,
-        response: ConsensusResponse,
-    },
-    /// Error string returned by the server.
-    Error(String),
-}
-
-#[cfg(feature = "distributed-raft")]
-impl RpcResponse {
-    /// Encode as `1 tag byte + body`.
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            RpcResponse::Applied { index, response } => {
-                let body = postcard::to_allocvec(&(*index, response))
-                    .expect("postcard encode of the applied pair is infallible");
-                let mut out = Vec::with_capacity(1 + body.len());
-                out.push(TAG_RESPONSE_APPLIED);
-                out.extend_from_slice(&body);
-                out
-            }
-            RpcResponse::Error(message) => {
-                let body = postcard::to_allocvec(message)
-                    .expect("postcard encode of String is infallible");
-                let mut out = Vec::with_capacity(1 + body.len());
-                out.push(TAG_RESPONSE_ERROR);
-                out.extend_from_slice(&body);
-                out
-            }
-        }
-    }
-
-    /// Decode from `1 tag byte + body`.
-    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-        let Some((tag, body)) = bytes.split_first() else {
-            return Err(io::Error::other("empty response frame"));
-        };
-        match *tag {
-            TAG_RESPONSE_APPLIED => {
-                let (index, response) = postcard::from_bytes(body)
-                    .map_err(|e| io::Error::other(format!("applied decode: {e}")))?;
-                Ok(RpcResponse::Applied { index, response })
-            }
-            TAG_RESPONSE_ERROR => {
-                let message = postcard::from_bytes(body)
-                    .map_err(|e| io::Error::other(format!("error decode: {e}")))?;
-                Ok(RpcResponse::Error(message))
-            }
-            other => Err(io::Error::other(format!("unknown response tag {other}"))),
-        }
+/// # Errors
+///
+/// Returns an error for an empty body or an unrecognised tag.
+pub(super) fn decode_raft_message(body: &[u8]) -> io::Result<&[u8]> {
+    let Some((tag, rest)) = body.split_first() else {
+        return Err(io::Error::other("empty transport frame"));
+    };
+    match *tag {
+        TAG_RAFT_MESSAGE => Ok(rest),
+        other => Err(io::Error::other(format!("unknown transport tag {other}"))),
     }
 }
 
@@ -150,7 +51,6 @@ impl RpcResponse {
 ///   - `ErrorKind::InvalidData` when the frame length exceeds [`MAX_FRAME_BYTES`].
 ///   - `ErrorKind::UnexpectedEof` on a truncated frame (EOF inside payload).
 ///   - Other kinds forwarded from the underlying stream.
-#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
 pub(super) async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
 
@@ -173,7 +73,6 @@ pub(super) async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<
 }
 
 /// Write one length-prefixed frame to `stream`.
-#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
 pub(super) async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -186,68 +85,28 @@ pub(super) async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributed::consensus::types::ConsensusCommand;
 
     #[test]
-    fn test_envelope_round_trip_raft_message() {
-        let envelope = RpcEnvelope::RaftMessage(vec![0xAA, 0xBB, 0xCC]);
-        let bytes = envelope.encode();
-        assert_eq!(bytes[0], TAG_RAFT_MESSAGE);
-        let back = RpcEnvelope::decode(&bytes).unwrap();
-        match back {
-            RpcEnvelope::RaftMessage(b) => assert_eq!(b, vec![0xAA, 0xBB, 0xCC]),
-            _ => panic!("wrong variant"),
-        }
+    fn test_raft_message_body_round_trip() {
+        let body = encode_raft_message(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(body[0], TAG_RAFT_MESSAGE);
+        assert_eq!(decode_raft_message(&body).unwrap(), &[0xAA, 0xBB, 0xCC]);
     }
 
     #[test]
-    fn test_envelope_round_trip_proposal() {
-        let cmd = ConsensusCommand::AckClaim {
-            claim_id: uuid::Uuid::now_v7(),
-            instance_id: uuid::Uuid::now_v7(),
-        };
-        let envelope = RpcEnvelope::ProposalForward {
-            command: cmd.clone(),
-        };
-        let bytes = envelope.encode();
-        let back = RpcEnvelope::decode(&bytes).unwrap();
-        match back {
-            RpcEnvelope::ProposalForward { command } => assert_eq!(command, cmd),
-            _ => panic!("wrong variant"),
-        }
+    fn test_empty_raft_message_body_round_trips() {
+        let body = encode_raft_message(&[]);
+        assert_eq!(body, vec![TAG_RAFT_MESSAGE]);
+        assert!(decode_raft_message(&body).unwrap().is_empty());
     }
 
     #[test]
-    fn test_response_round_trip_applied() {
-        let resp = RpcResponse::Applied {
-            index: 7,
-            response: ConsensusResponse::ClaimAcked,
-        };
-        let bytes = resp.encode();
-        assert_eq!(bytes[0], TAG_RESPONSE_APPLIED);
-        match RpcResponse::decode(&bytes).unwrap() {
-            RpcResponse::Applied { index, response } => {
-                assert_eq!(index, 7);
-                assert!(matches!(response, ConsensusResponse::ClaimAcked));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_response_round_trip_error() {
-        let resp = RpcResponse::Error("boom".to_string());
-        let bytes = resp.encode();
-        match RpcResponse::decode(&bytes).unwrap() {
-            RpcResponse::Error(m) => assert_eq!(m, "boom"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_decode_rejects_unknown_tags() {
-        assert!(RpcEnvelope::decode(&[0xFF, 0x00]).is_err());
-        assert!(RpcResponse::decode(&[0xFF, 0x00]).is_err());
-        assert!(RpcEnvelope::decode(&[]).is_err());
+    fn test_decode_rejects_empty_and_unknown_tags() {
+        assert!(decode_raft_message(&[]).is_err());
+        let err = decode_raft_message(&[0xFF, 0x00]).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown transport tag 255"),
+            "an unknown tag must name itself: {err}"
+        );
     }
 }

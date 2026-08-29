@@ -546,20 +546,216 @@ where
 mod tests {
     use super::*;
     use crate::dataset::Dataset;
-    use crate::distributed::checkpoint::{Checkpoint, CheckpointStore};
-    use crate::distributed::consensus::state_machine::apply as sm_apply;
-    use crate::distributed::consensus::store::RedbSharedStore;
-    use crate::distributed::consensus::types::ConsensusCommand;
+    use crate::distributed::checkpoint::{
+        ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, PROCESSOR_STATE_STAGE_SENTINEL,
+    };
     use crate::distributed::partition::{BatchClaim, PartitionSource};
     use crate::system::{SystemMeta, system_fn};
     use async_trait::async_trait;
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
-    fn temp_path() -> PathBuf {
-        let dir = std::env::temp_dir();
-        dir.join(format!("pcs_runner_test_{}.db", Uuid::now_v7()))
+    /// Lease TTL [`MemoryStore`] grants, long enough that no test lease expires
+    /// on its own.
+    const TEST_LEASE_TTL_MILLIS: u64 = 30_000;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RangeStatus {
+        Pending,
+        Claimed,
+        Completed,
+    }
+
+    /// One registered master batch and the state of its single row range.
+    struct BatchState {
+        batch_id: u64,
+        component: String,
+        schema_id: u32,
+        total_rows: u32,
+        status: RangeStatus,
+        claim_id: Uuid,
+        instance_id: Uuid,
+        lease_expires_at: u64,
+    }
+
+    #[derive(Default)]
+    struct Inner {
+        /// Registration order is claim order.
+        batches: Vec<BatchState>,
+        checkpoints: HashMap<(Uuid, u32), Checkpoint>,
+    }
+
+    /// In-memory shared store: real claim bookkeeping, no I/O.
+    ///
+    /// The runner builds every dataset from its own `world_factory`, so the
+    /// fixture keeps no master-batch payload — only the claim lifecycle and the
+    /// checkpoints the runner writes.
+    ///
+    /// Cloning shares one set of batches, so two runners (or a runner plus the
+    /// assertions) can hold the same store.
+    #[derive(Clone, Default)]
+    struct MemoryStore {
+        inner: Arc<Mutex<Inner>>,
+    }
+
+    impl MemoryStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Register a batch whose whole row range becomes claimable.
+        fn register(&self, batch_id: u64, total_rows: u32) {
+            self.lock().batches.push(BatchState {
+                batch_id,
+                component: "test".to_string(),
+                schema_id: 1,
+                total_rows,
+                status: RangeStatus::Pending,
+                claim_id: Uuid::nil(),
+                instance_id: Uuid::nil(),
+                lease_expires_at: 0,
+            });
+        }
+
+        /// Every checkpoint stored at `stage_idx`, in unspecified order.
+        fn checkpoints_at(&self, stage_idx: u32) -> Vec<Checkpoint> {
+            self.lock()
+                .checkpoints
+                .iter()
+                .filter(|((_, s), _)| *s == stage_idx)
+                .map(|(_, c)| c.clone())
+                .collect()
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn resolve(
+            inner: &mut Inner,
+            claim_id: Uuid,
+            instance_id: Uuid,
+        ) -> PcsResult<&mut BatchState> {
+            let batch = inner
+                .batches
+                .iter_mut()
+                .find(|b| b.claim_id == claim_id)
+                .ok_or_else(|| PcsError::generic(format!("unknown claim {claim_id}")))?;
+            if batch.instance_id != instance_id {
+                return Err(PcsError::generic(format!(
+                    "claim {claim_id} is held by another instance"
+                )));
+            }
+            if batch.status != RangeStatus::Claimed {
+                return Err(PcsError::generic(format!(
+                    "claim {claim_id} is not in Claimed state"
+                )));
+            }
+            Ok(batch)
+        }
+    }
+
+    #[async_trait]
+    impl PartitionSource for MemoryStore {
+        async fn claim_next_batch(&self, instance_id: Uuid) -> PcsResult<Option<BatchClaim>> {
+            let now = now_millis();
+            let mut inner = self.lock();
+            let Some(batch) = inner.batches.iter_mut().find(|b| match b.status {
+                RangeStatus::Pending => true,
+                RangeStatus::Claimed => b.lease_expires_at < now,
+                RangeStatus::Completed => false,
+            }) else {
+                return Ok(None);
+            };
+            let claim_id = Uuid::now_v7();
+            batch.status = RangeStatus::Claimed;
+            batch.claim_id = claim_id;
+            batch.instance_id = instance_id;
+            batch.lease_expires_at = now + TEST_LEASE_TTL_MILLIS;
+            Ok(Some(BatchClaim {
+                batch_id: batch.batch_id,
+                component: batch.component.clone(),
+                row_range: 0..batch.total_rows,
+                schema_id: batch.schema_id,
+                claim_id,
+                instance_id,
+                lease_expires_at: batch.lease_expires_at,
+                lease_ttl_millis: TEST_LEASE_TTL_MILLIS,
+                claimed_at: Instant::now(),
+            }))
+        }
+
+        async fn renew_claim(&self, claim_id: Uuid, instance_id: Uuid) -> PcsResult<u64> {
+            let expires_at = now_millis() + TEST_LEASE_TTL_MILLIS;
+            let mut inner = self.lock();
+            MemoryStore::resolve(&mut inner, claim_id, instance_id)?.lease_expires_at = expires_at;
+            Ok(expires_at)
+        }
+
+        async fn ack_claim(&self, claim_id: Uuid, instance_id: Uuid) -> PcsResult<()> {
+            let mut inner = self.lock();
+            let batch = MemoryStore::resolve(&mut inner, claim_id, instance_id)?;
+            batch.status = RangeStatus::Completed;
+            batch.lease_expires_at = 0;
+            Ok(())
+        }
+
+        async fn release_claim(&self, claim_id: Uuid, instance_id: Uuid) -> PcsResult<()> {
+            let mut inner = self.lock();
+            let batch = MemoryStore::resolve(&mut inner, claim_id, instance_id)?;
+            batch.status = RangeStatus::Pending;
+            batch.claim_id = Uuid::nil();
+            batch.instance_id = Uuid::nil();
+            batch.lease_expires_at = 0;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CheckpointStore for MemoryStore {
+        async fn save_checkpoint(
+            &self,
+            claim_id: Uuid,
+            stage_idx: u32,
+            ipc_bytes: Vec<u8>,
+            schema_id: u32,
+        ) -> PcsResult<()> {
+            let mut inner = self.lock();
+            let batch_id = inner
+                .batches
+                .iter()
+                .find(|b| b.claim_id == claim_id)
+                .map(|b| b.batch_id)
+                .ok_or_else(|| PcsError::generic(format!("unknown claim {claim_id}")))?;
+            inner.checkpoints.insert(
+                (claim_id, stage_idx),
+                Checkpoint {
+                    batch_id,
+                    stage_idx,
+                    payload: ipc_bytes,
+                    schema_id,
+                    created_at: now_millis(),
+                },
+            );
+            Ok(())
+        }
+
+        async fn load_checkpoint(
+            &self,
+            claim_id: Uuid,
+            stage_idx: u32,
+        ) -> PcsResult<Option<Checkpoint>> {
+            Ok(self.lock().checkpoints.get(&(claim_id, stage_idx)).cloned())
+        }
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     fn empty_data() -> Dataset {
@@ -568,8 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_happy_path_no_batches() {
-        let path = temp_path();
-        let store = RedbSharedStore::single_node(&path).unwrap();
+        let store = MemoryStore::new();
         let pipeline = Pipeline::new("test");
         let config = RunnerConfig {
             max_batches: Some(5),
@@ -579,42 +774,21 @@ mod tests {
         let runner = DistributedRunner::new(store, Box::new(pipeline), config);
         let processed = runner.run(empty_data).await.unwrap();
         assert_eq!(processed, 0);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn test_runner_processes_one_batch() {
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
 
-        let path = temp_path();
-        let store = RedbSharedStore::single_node(&path).unwrap();
+        let store = MemoryStore::new();
+        store.register(0, 10);
 
-        // Seed a batch.
-        let seed_db = match &store {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-        sm_apply(
-            &seed_db,
-            ConsensusCommand::RegisterMasterBatch {
-                batch_id: 0,
-                component: "test".to_string(),
-                schema_id: 1,
-                ipc_bytes: vec![0u8; 64],
-                total_rows: 10,
-                now_at_propose: 0,
-            },
-        )
-        .unwrap();
-
-        let counter = StdArc::new(AtomicU32::new(0));
-        let counter_clone = StdArc::clone(&counter);
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = Arc::clone(&counter);
 
         let mut pipeline = Pipeline::new("test");
         pipeline.add_system(system_fn(SystemMeta::new("increment"), move |_data| {
-            counter_clone.fetch_add(1, Ordering::Relaxed);
+            counter_clone.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(())
         }));
 
@@ -626,14 +800,12 @@ mod tests {
         let runner = DistributedRunner::new(store, Box::new(pipeline), config);
         let processed = runner.run(empty_data).await.unwrap();
         assert_eq!(processed, 1);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(counter.load(AtomicOrdering::Relaxed), 1);
     }
 
     /// A partition source that fails lease renewal to simulate expiry.
     struct ExpirableSource {
-        inner: RedbSharedStore,
+        inner: MemoryStore,
         fail_renewal: bool,
     }
 
@@ -685,27 +857,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_lease_expiry_causes_clean_exit() {
-        let path = temp_path();
-        let inner = RedbSharedStore::single_node(&path).unwrap();
-
-        // Seed a batch.
-        let seed_db = match &inner {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-        sm_apply(
-            &seed_db,
-            ConsensusCommand::RegisterMasterBatch {
-                batch_id: 0,
-                component: "test".to_string(),
-                schema_id: 1,
-                ipc_bytes: vec![0u8; 64],
-                total_rows: 10,
-                now_at_propose: 0,
-            },
-        )
-        .unwrap();
+        let inner = MemoryStore::new();
+        inner.register(0, 10);
 
         let source = ExpirableSource {
             inner,
@@ -727,7 +880,6 @@ mod tests {
             result.is_err(),
             "expected lease expiry error, got {result:?}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// Partition source that counts `release_claim` and `ack_claim` calls and delegates
@@ -736,7 +888,7 @@ mod tests {
     /// Only the first claim is issued: `release_claim` returns the batch to `Pending`, so
     /// the runner loop would otherwise re-find it on every iteration and cycle forever.
     struct CountingSource {
-        inner: RedbSharedStore,
+        inner: MemoryStore,
         release_count: Arc<AtomicUsize>,
         ack_count: Arc<AtomicUsize>,
         claims_issued: Arc<AtomicUsize>,
@@ -794,27 +946,8 @@ mod tests {
     /// A failed `save_checkpoint` must release the claim for at-least-once retry, not ack.
     #[tokio::test]
     async fn test_checkpoint_failure_releases_not_acks() {
-        let path = temp_path();
-        let inner = RedbSharedStore::single_node(&path).unwrap();
-
-        // Seed a batch.
-        let seed_db = match &inner {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-        sm_apply(
-            &seed_db,
-            ConsensusCommand::RegisterMasterBatch {
-                batch_id: 0,
-                component: "test".to_string(),
-                schema_id: 1,
-                ipc_bytes: vec![0u8; 64],
-                total_rows: 10,
-                now_at_propose: 0,
-            },
-        )
-        .unwrap();
+        let inner = MemoryStore::new();
+        inner.register(0, 10);
 
         let release_count = Arc::new(AtomicUsize::new(0));
         let ack_count = Arc::new(AtomicUsize::new(0));
@@ -855,7 +988,6 @@ mod tests {
             0,
             "must NOT ack a claim whose checkpoint failed"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// Two-run scenario: the first run creates accumulator rows, the second loads them.
@@ -864,43 +996,23 @@ mod tests {
     async fn test_accumulator_persists_across_two_runs() {
         use crate::component::Component as _;
         use crate::windows::accumulator::WindowAccumulator;
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
 
-        let path = temp_path();
-        let store = RedbSharedStore::single_node(&path).unwrap();
-
-        let seed_db = match &store {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-
+        let store = MemoryStore::new();
         // Seed two batches so two runs happen.
         for batch_id in 0u64..2 {
-            sm_apply(
-                &seed_db,
-                ConsensusCommand::RegisterMasterBatch {
-                    batch_id,
-                    component: "test".to_string(),
-                    schema_id: 1,
-                    ipc_bytes: vec![0u8; 64],
-                    total_rows: 10,
-                    now_at_propose: 0,
-                },
-            )
-            .unwrap();
+            store.register(batch_id, 10);
         }
 
         // A system that appends one accumulator row per run.
-        let run_count = StdArc::new(AtomicU32::new(0));
-        let run_count_clone = StdArc::clone(&run_count);
+        let run_count = Arc::new(AtomicU32::new(0));
+        let run_count_clone = Arc::clone(&run_count);
 
         let mut pipeline = Pipeline::new("test");
         pipeline.add_system(system_fn(
             SystemMeta::new("append_accumulator"),
             move |data: &mut Dataset| {
-                let run = run_count_clone.fetch_add(1, Ordering::Relaxed);
+                let run = run_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
                 if data.batch_for(WindowAccumulator::name()).is_some() {
                     let row = WindowAccumulator {
                         version: Some(1),
@@ -935,10 +1047,9 @@ mod tests {
         let runner = DistributedRunner::new(store, Box::new(pipeline), config);
         let processed = runner.run(world_factory).await.unwrap();
         assert_eq!(processed, 2);
-        assert_eq!(run_count.load(Ordering::Relaxed), 2);
-
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(run_count.load(AtomicOrdering::Relaxed), 2);
     }
+
     /// Chain-carry proof: the second claim must load the accumulator rows the
     /// first claim wrote (load under the *prior* claim id, not the fresh one),
     /// and both claims must leave their own checkpoint in the store.
@@ -947,53 +1058,30 @@ mod tests {
     async fn test_accumulator_values_carry_across_claims() {
         use crate::component::Component as _;
         use crate::windows::accumulator::WindowAccumulator;
-        use redb::ReadableDatabase;
-        use redb::ReadableTable as _;
-        use std::sync::Arc as StdArc;
-        use std::sync::Mutex as StdMutex;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
 
-        let path = temp_path();
-        let store = RedbSharedStore::single_node(&path).unwrap();
-
-        let seed_db = match &store {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-
+        let store = MemoryStore::new();
         // Two batches → two claims, one per claim pass. Each claim pass is a
         // separate world, so only the chained accumulator can carry rows
         // from the first claim to the second.
         for batch_id in 0u64..2 {
-            sm_apply(
-                &seed_db,
-                ConsensusCommand::RegisterMasterBatch {
-                    batch_id,
-                    component: "test".to_string(),
-                    schema_id: 1,
-                    ipc_bytes: vec![0u8; 64],
-                    total_rows: 10,
-                    now_at_propose: 0,
-                },
-            )
-            .unwrap();
+            store.register(batch_id, 10);
         }
 
         // The system records how many accumulator rows the dataset held at
         // entry (the restored prior state) and appends one more, with a
         // distinct window_id per run.
-        let run_count = StdArc::new(AtomicU32::new(0));
-        let entry_rows = StdArc::new(StdMutex::new(Vec::<u64>::new()));
-        let run_count_clone = StdArc::clone(&run_count);
-        let entry_rows_clone = StdArc::clone(&entry_rows);
+        let run_count = Arc::new(AtomicU32::new(0));
+        let entry_rows = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let run_count_clone = Arc::clone(&run_count);
+        let entry_rows_clone = Arc::clone(&entry_rows);
 
         let mut pipeline = Pipeline::new("test");
         pipeline.add_system(system_fn(
             SystemMeta::new("append_accumulator"),
             move |data: &mut Dataset| {
                 entry_rows_clone.lock().unwrap().push(data.rows() as u64);
-                let run = run_count_clone.fetch_add(1, Ordering::Relaxed);
+                let run = run_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
                 if data.batch_for(WindowAccumulator::name()).is_some() {
                     let row = WindowAccumulator {
                         version: Some(1),
@@ -1025,10 +1113,10 @@ mod tests {
             checkpoint_strategy: CheckpointStrategy::None,
             ..Default::default()
         };
-        let runner = DistributedRunner::new(store, Box::new(pipeline), config);
+        let runner = DistributedRunner::new(store.clone(), Box::new(pipeline), config);
         let processed = runner.run(world_factory).await.unwrap();
         assert_eq!(processed, 2);
-        assert_eq!(run_count.load(Ordering::Relaxed), 2);
+        assert_eq!(run_count.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(
             entry_rows.lock().unwrap().as_slice(),
             &[0, 1],
@@ -1037,29 +1125,23 @@ mod tests {
 
         // Store-level: both claims left an accumulator checkpoint, the second
         // carrying the first's row plus its own (1 row and 2 rows).
-        let txn = seed_db.begin_read().unwrap();
-        let checkpoints: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("arrow_checkpoints");
-        let table = txn.open_table(checkpoints).unwrap();
-        let mut checkpoint_row_counts: Vec<u64> = Vec::new();
-        for entry in table.iter().unwrap() {
-            let (_, value) = entry.unwrap();
-            let record: crate::distributed::consensus::state_machine::CheckpointRecord =
-                serde_json::from_slice(value.value()).expect("decode checkpoint record");
-            let dataset = Dataset::read_ipc(&mut record.ipc_bytes.as_slice())
-                .expect("checkpoint payload is single-component IPC");
-            if let Some(batch) = dataset.batch_for(WindowAccumulator::name()) {
-                checkpoint_row_counts.push(batch.num_rows() as u64);
-            }
-        }
+        let mut checkpoint_row_counts: Vec<u64> = store
+            .checkpoints_at(ACCUMULATOR_STAGE_SENTINEL)
+            .into_iter()
+            .filter_map(|c| {
+                let dataset = Dataset::read_ipc(&mut c.payload.as_slice())
+                    .expect("checkpoint payload is single-component IPC");
+                dataset
+                    .batch_for(WindowAccumulator::name())
+                    .map(|b| b.num_rows() as u64)
+            })
+            .collect();
         checkpoint_row_counts.sort_unstable();
         assert_eq!(
             checkpoint_row_counts,
             vec![1, 2],
             "claim 1 persists 1 row; claim 2 persists claim 1's row plus its own"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A failed accumulator save must release the batch instead of acking it, so replay
@@ -1067,41 +1149,20 @@ mod tests {
     #[cfg(feature = "windows")]
     #[tokio::test]
     async fn test_accumulator_save_failure_releases_not_acks() {
-        use crate::distributed::checkpoint::Checkpoint;
         use crate::windows::accumulator::WindowAccumulator;
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::AtomicUsize;
 
-        let path = temp_path();
-        let inner = RedbSharedStore::single_node(&path).unwrap();
+        let inner = MemoryStore::new();
+        inner.register(0, 10);
 
-        let seed_db = match &inner {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
-        sm_apply(
-            &seed_db,
-            ConsensusCommand::RegisterMasterBatch {
-                batch_id: 0,
-                component: "test".to_string(),
-                schema_id: 1,
-                ipc_bytes: vec![0u8; 64],
-                total_rows: 10,
-                now_at_propose: 0,
-            },
-        )
-        .unwrap();
-
-        let release_count = StdArc::new(AtomicUsize::new(0));
-        let ack_count = StdArc::new(AtomicUsize::new(0));
-        let claims_issued = StdArc::new(AtomicUsize::new(0));
+        let release_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let claims_issued = Arc::new(AtomicUsize::new(0));
 
         struct FailingAccumStore {
-            inner: RedbSharedStore,
-            release_count: StdArc<AtomicUsize>,
-            ack_count: StdArc<AtomicUsize>,
-            claims_issued: StdArc<AtomicUsize>,
+            inner: MemoryStore,
+            release_count: Arc<AtomicUsize>,
+            ack_count: Arc<AtomicUsize>,
+            claims_issued: Arc<AtomicUsize>,
         }
 
         #[async_trait]
@@ -1188,33 +1249,47 @@ mod tests {
             0,
             "must NOT ack a claim whose accumulator save failed"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
+
+    /// The runtime's opaque state blob is parked under its own sentinel and
+    /// reloaded on the next claim, independently of the accumulator.
+    #[tokio::test]
+    async fn test_processor_state_parked_under_its_own_sentinel() {
+        let store = MemoryStore::new();
+        store.register(0, 10);
+
+        let mut pipeline = Pipeline::new("test");
+        pipeline.add_system(system_fn(SystemMeta::new("noop"), |_data| Ok(())));
+
+        let config = RunnerConfig {
+            max_batches: Some(1),
+            checkpoint_strategy: CheckpointStrategy::EveryStage,
+            ..Default::default()
+        };
+        let runner = DistributedRunner::new(store.clone(), Box::new(pipeline), config);
+        assert_eq!(runner.run(empty_data).await.unwrap(), 1);
+
+        // A native pipeline returns no state blob, so the sentinel stays empty
+        // while the data stage checkpoint is written.
+        assert!(
+            store
+                .checkpoints_at(PROCESSOR_STATE_STAGE_SENTINEL)
+                .is_empty(),
+            "a native pipeline carries no runtime state blob"
+        );
+        assert_eq!(
+            store.checkpoints_at(0).len(),
+            1,
+            "EveryStage must leave exactly one data-stage checkpoint"
+        );
+    }
+
     #[tokio::test]
     async fn test_shutdown_between_batches_clean() {
-        let path = temp_path();
-        let inner = RedbSharedStore::single_node(&path).unwrap();
-
-        let seed_db = match &inner {
-            RedbSharedStore::SingleNode(s) => Arc::clone(&s.db),
-            #[cfg(feature = "distributed-raft")]
-            _ => panic!("expected SingleNode"),
-        };
+        let store = MemoryStore::new();
         // Seed two batches.
         for batch_id in 0u64..2 {
-            sm_apply(
-                &seed_db,
-                ConsensusCommand::RegisterMasterBatch {
-                    batch_id,
-                    component: "test".to_string(),
-                    schema_id: 1,
-                    ipc_bytes: vec![0u8; 64],
-                    total_rows: 10,
-                    now_at_propose: 0,
-                },
-            )
-            .unwrap();
+            store.register(batch_id, 10);
         }
 
         let shutdown = CancellationToken::new();
@@ -1226,14 +1301,12 @@ mod tests {
             checkpoint_strategy: CheckpointStrategy::None,
             ..Default::default()
         };
-        let runner = DistributedRunner::new(inner, Box::new(pipeline), config);
+        let runner = DistributedRunner::new(store, Box::new(pipeline), config);
 
         let processed = runner
             .run_with_shutdown(empty_data, shutdown)
             .await
             .unwrap();
         assert_eq!(processed, 0, "cancelled runner must process 0 batches");
-
-        let _ = std::fs::remove_file(&path);
     }
 }

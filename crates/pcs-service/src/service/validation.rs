@@ -411,7 +411,7 @@ fn validate_processor_coverage(
 /// `runtime` is `runtime.template_dataset().schemas().fingerprint()`, the same
 /// `u32` a WASM processor reports as `pipeline-descriptor.schema-fingerprint` (the
 /// processor formats it as 8-char hex; the value is identical). `persisted` is
-/// [`RedbSharedStore::persisted_schema_id`](crate::distributed::consensus::store::RedbSharedStore::persisted_schema_id),
+/// [`CheckpointStore::persisted_schema_id`](crate::distributed::checkpoint::CheckpointStore::persisted_schema_id),
 /// which is `None` on a node with no state yet.
 ///
 /// # Errors

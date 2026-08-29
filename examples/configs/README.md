@@ -16,7 +16,7 @@ feature that registers its factory. Build with:
 | `standalone_plugin.kdl` | `connector-file,transformer-csv,plugin` |
 | `postgresql.kdl` | `connector-postgresql,wasm` |
 | `s3.kdl` | `connector-s3,transformer-csv,wasm` |
-| `cluster.kdl` | `service-cluster,connector-file,transformer-csv,wasm` |
+| `cluster.kdl` | `service-cluster,tikv-store,connector-file,transformer-csv,wasm` |
 | `tcp.kdl` | `connector-tcp,wasm` |
 | `http.kdl` | `connector-http,transformer-csv,wasm` |
 | `tikv.kdl` | `tikv-store,connector-file,transformer-csv` |
@@ -121,8 +121,9 @@ silently dropped section.
 
 | Feature              | `mode "standalone"`             | `mode "cluster"`                         |
 |----------------------|---------------------------------|------------------------------------------|
-| Feature flag         | `service`                       | `service-cluster`                        |
-| Consensus            | None                            | Raft (openraft)                          |
+| Feature flag         | `service`                       | `service-cluster` plus `tikv-store`      |
+| Consensus            | None                            | Raft (raft-rs), membership and leadership |
+| `store "tikv"` block | Optional                        | Required, validation error if absent     |
 | `source` nodes allowed | Yes                           | No, validation error if declared         |
 | `sink` nodes allowed  | Yes                             | No, validation error if declared         |
 | `link` nodes allowed  | Yes                             | No, validation error if declared         |
@@ -135,6 +136,11 @@ A cluster-mode workflow declares exactly one processor node (`wasm` or
 `PartitionSource` and checkpoints its output, so there is no local sink to
 declare either.
 
+Cluster mode has no local application store. Master batches, row-range claims
+and checkpoints all live in TiKV, so every node needs the same `pd_endpoints`
+and the same `key_prefix`; the node's own `data_dir` holds only
+`raft-log.redb`, `bootstrap.lock` and `node-id`.
+
 ---
 
 ## Files in this directory
@@ -142,7 +148,7 @@ declare either.
 | File                      | Description                                        |
 |---------------------------|----------------------------------------------------|
 | `standalone.kdl`          | Runnable single-node config using built-in types   |
-| `cluster.kdl`             | Runnable cluster template using built-in types     |
+| `cluster.kdl`             | Runnable cluster template; needs `tikv-store` and a PD |
 | `standalone_wasm.kdl`     | Standalone config that loads a WASM processor pipeline |
 | `extension_example.kdl`   | Non-runnable template showing user-defined types   |
 | `fixtures/orders.csv`     | Tiny CSV fixture used by `standalone.kdl`          |
@@ -194,12 +200,13 @@ OK: all declared types resolved in built-in registry
 
 ## How to validate the cluster example
 
-Cluster mode requires `--features service-cluster`. Validating with the base
-`service` feature parses the config correctly but attempting to `serve` will fail.
+Cluster mode requires `--features service-cluster,tikv-store`. Without
+`tikv-store` the `store "tikv"` block is a configuration error, and without a
+`store` block cluster mode is rejected outright.
 
 ```bash
 PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-cargo run --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- validate \
+cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate \
   --config examples/configs/cluster.kdl --strict
 ```
 

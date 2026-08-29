@@ -12,14 +12,17 @@
 
 #![cfg(feature = "distributed")]
 
+#[path = "common/memory_store.rs"]
+mod memory_store;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use memory_store::MemoryStore;
 use pcs_core::runtime::PipelineRuntime;
 use pcs_core::{Dataset, PcsError, PcsResult};
-use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::checkpoint::{
     ACCUMULATOR_STAGE_SENTINEL, Checkpoint, CheckpointStore, PROCESSOR_STATE_STAGE_SENTINEL,
 };
@@ -97,7 +100,7 @@ impl PipelineRuntime for MockCounterRuntime {
 }
 
 struct RecordingStoreInner {
-    inner: RedbSharedStore,
+    inner: MemoryStore,
     release_count: Arc<AtomicUsize>,
     ack_count: Arc<AtomicUsize>,
     claim_ids: Mutex<Vec<Uuid>>,
@@ -110,10 +113,7 @@ struct RecordingStoreInner {
 struct RecordingStore(Arc<RecordingStoreInner>);
 
 impl RecordingStore {
-    fn new(
-        inner: RedbSharedStore,
-        max_claims: usize,
-    ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn new(inner: MemoryStore, max_claims: usize) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let release = Arc::new(AtomicUsize::new(0));
         let ack = Arc::new(AtomicUsize::new(0));
         let store = Self(Arc::new(RecordingStoreInner {
@@ -187,11 +187,7 @@ impl CheckpointStore for RecordingStore {
     }
 }
 
-fn temp_db_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("pcs_processor_state_{}.redb", Uuid::now_v7()))
-}
-
-async fn seed_batch(store: &RedbSharedStore, batch_id: u64) {
+async fn seed_batch(store: &MemoryStore, batch_id: u64) {
     store
         .register_master_batch(batch_id, "test".to_string(), 1, vec![0u8; 16], 1)
         .await
@@ -215,8 +211,7 @@ fn counter_of(blob: &[u8]) -> u64 {
 /// and the blob stored under the second claim must reflect both batches.
 #[tokio::test]
 async fn state_blob_carries_across_batches() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
     seed_batch(&inner, 1).await;
 
@@ -254,16 +249,13 @@ async fn state_blob_carries_across_batches() {
             i + 1
         );
     }
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A fresh runner does not inherit the previous runner's state, because the
 /// chained pointer lives in the loop, not on disk.
 #[tokio::test]
 async fn a_new_runner_starts_cold() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
     seed_batch(&inner, 1).await;
 
@@ -281,16 +273,13 @@ async fn a_new_runner_starts_cold() {
         seen_b.lock().unwrap()[0].is_none(),
         "a fresh runner has no chained pointer and must start cold"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A runtime error from `run_on_with_state` releases the claim rather than acking
 /// it, and writes no state.
 #[tokio::test]
 async fn runtime_error_releases_claim_and_writes_no_state() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     let (store, release_count, ack_count) = RecordingStore::new(inner, 1);
@@ -315,15 +304,12 @@ async fn runtime_error_releases_claim_and_writes_no_state() {
             .is_none(),
         "a failed batch must not persist state"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The state sentinel does not shadow the accumulator sentinel.
 #[tokio::test]
 async fn state_and_accumulator_sentinels_are_independent() {
-    let path = temp_db_path();
-    let inner = RedbSharedStore::single_node(&path).unwrap();
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     let (store, _release, _ack) = RecordingStore::new(inner, 1);
@@ -362,6 +348,4 @@ async fn state_and_accumulator_sentinels_are_independent() {
         1,
         "the state blob must be untouched by the accumulator write"
     );
-
-    let _ = std::fs::remove_file(&path);
 }

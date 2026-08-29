@@ -5,9 +5,8 @@
 //   RUSTFLAGS="-C target-cpu=native" \
 //     cargo bench --bench distributed --features distributed
 //
-// Two benchmarks: checkpoint serialization (Arrow IPC bytes/sec for a wide
-// schema) and a snapshot build plus install round-trip, which needs
-// --features distributed-raft.
+// One benchmark: checkpoint serialization, the Arrow IPC bytes/sec a
+// `CheckpointStore` write is bounded by for a wide schema.
 
 #![cfg(feature = "distributed")]
 
@@ -87,80 +86,6 @@ fn bench_checkpoint_serialize(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "distributed-raft")]
-fn bench_snapshot_round_trip(c: &mut Criterion) {
-    use criterion::BatchSize;
-    use pcs_service::distributed::consensus::snapshot::{
-        build_snapshot_bytes, install_snapshot_bytes,
-    };
-    use pcs_service::distributed::consensus::state_machine::apply as sm_apply;
-    use pcs_service::distributed::consensus::types::ConsensusCommand;
-    use redb::Database;
-    use uuid::Uuid;
-
-    let mut group = c.benchmark_group("snapshot_round_trip");
-
-    group.bench_function("3_batches_with_claims", |b| {
-        b.iter_batched(
-            || {
-                // Untimed: temp db seeded with 3 master batches, one claim each.
-                let file = tempfile::NamedTempFile::new().expect("tempfile");
-                let path = file.into_temp_path();
-                let db = Database::create(&path).expect("redb create");
-                for i in 0u64..3 {
-                    sm_apply(
-                        &db,
-                        ConsensusCommand::RegisterMasterBatch {
-                            batch_id: i,
-                            component: format!("comp_{i}"),
-                            schema_id: 1,
-                            ipc_bytes: vec![0xAB; 512],
-                            total_rows: 100,
-                            now_at_propose: 0,
-                        },
-                    )
-                    .expect("apply");
-
-                    sm_apply(
-                        &db,
-                        ConsensusCommand::ClaimRowRange {
-                            batch_id: i,
-                            row_range_start: 0,
-                            row_range_end: 100,
-                            claim_id: Uuid::now_v7(),
-                            instance_id: Uuid::now_v7(),
-                            lease_ttl_millis: 90_000,
-                            now_at_propose: 0,
-                        },
-                    )
-                    .expect("apply claim");
-                }
-                (db, path)
-            },
-            |(src_db, _path)| {
-                // Timed: build the snapshot, then install it into a fresh db.
-                let snap = build_snapshot_bytes(&src_db).expect("build_snapshot_bytes");
-                let file2 = tempfile::NamedTempFile::new().expect("tempfile2");
-                let path2 = file2.into_temp_path();
-                let dst_db = Database::create(&path2).expect("redb create 2");
-                install_snapshot_bytes(&dst_db, &snap, None).expect("install_snapshot_bytes");
-                std::hint::black_box(snap.len())
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.finish();
-}
-
-#[cfg(not(feature = "distributed-raft"))]
 criterion_group!(benches, bench_checkpoint_serialize);
-
-#[cfg(feature = "distributed-raft")]
-criterion_group!(
-    benches,
-    bench_checkpoint_serialize,
-    bench_snapshot_round_trip
-);
 
 criterion_main!(benches);

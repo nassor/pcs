@@ -23,7 +23,7 @@ cargo xtask bench tpch_q6                                    # Benchmarks, alway
 cargo check --examples                                       # Verify examples compile
 cargo run -p pcs-service --example scheduler_etl             # Run an example
 cargo run -p pcs-service --example first_pipeline            # The native tutorial's example
-cargo run -p pcs-service --example distributed_scheduler --features distributed
+cargo run -p pcs-service --example distributed_scheduler --features tikv-store  # Needs a running TiKV
 cargo run -p pcs-service --example scheduler_etl_parallel
 cargo audit                                                  # Security audit (needs cargo-audit)
 cargo xtask polyglot                                         # Build the six polyglot processors
@@ -147,17 +147,22 @@ profiles exist, and which one to reach for depends on why you're running tests:
 
 - `cargo nextest run --workspace --all-features` (the `default` profile): the everyday command.
   It compiles the same `--all-features` closure as always, but skips every test that needs a
-  Docker daemon — the testcontainers-backed connector suites
-  (`pcs-connector-kafka`/`-nats`/`-postgresql`/`-s3`'s `tests/`) and the Docker-gated halves of the
-  Raft chaos suites (`transport_chaos`, `distributed_harness_smoke`, `raft_consensus_chaos`'s
-  `cluster` module, and one Docker-backed test apiece in `pcs-service`'s
-  `kafka_service`/`nats_service`/`postgres_service`/`s3_service`). Run this constantly; it should
-  stay fast regardless of how large the Docker-backed suites grow.
+  Docker daemon: the testcontainers-backed connector suites
+  (`pcs-connector-kafka`/`-nats`/`-postgresql`/`-s3`'s `tests/`), `pcs-service`'s `tikv_store`
+  suite, the three Raft chaos binaries (`transport_chaos`, `distributed_harness_smoke`,
+  `raft_consensus_chaos`), and one Docker-backed test apiece in `pcs-service`'s
+  `kafka_service`/`nats_service`/`postgres_service`/`s3_service`. Run this constantly; it should
+  stay fast regardless of how large the Docker-backed suites grow. The other distributed suites
+  (`distributed_scheduler`, `runner_chaos`, `checkpoint_chaos`, `wasm_chaos`,
+  `distributed_processor_state`) run against the in-memory store fixture in
+  `tests/common/memory_store.rs`, need no daemon, and stay in the fast profile.
 - `cargo nextest run --workspace --all-features --profile ci --run-ignored all` (the `ci`
   profile): the full suite, including everything `default` skips and any `#[ignore]`d test (today,
   only `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
-  Raft-cluster-behind-Toxiproxy chaos run). This is the full suite to run as the last verification
-  step of a plan — not something to reach for on every edit. `ci.yml` splits it in two: the `test`
+  Raft-cluster-behind-Toxiproxy chaos run asserting that every node converges on the same applied
+  index and that the term advances under combined latency, bandwidth, reset and partition faults).
+  This is the full suite to run as the last verification step of a plan, not something to reach
+  for on every edit. `ci.yml` splits it in two: the `test`
   job runs `--profile ci` without `--run-ignored`, and a separate `distributed_chaos` job runs
   only `full_stack_chaos_monkey_60s` (`--test distributed_integration_chaos --run-ignored
   ignored-only`), so that one ~70-100s test never sits on `test`'s critical path. Regenerating or
@@ -174,17 +179,32 @@ Docker-backed tests soft-skip rather than fail when no daemon is reachable: each
 `None`; every such `#[tokio::test]` opens with `let Some(x) = common::try_start().await else {
 return; };`. This is what lets the `ci` profile run unconditionally on a runner that may or may not
 have Docker, and it needs no nextest-side accommodation.
+The Raft chaos harness sharpens that rule: only the container step soft-skips.
+`RaftClusterHarness::try_start` returns `None` when the Docker daemon cannot supply the Toxiproxy
+container, and every step after it panics: host-port resolution, per-edge proxy creation, node
+startup, and the `await_listening` check that a node really accepted on its reserved port. The same
+split guards `tests/common/tikv.rs`: no daemon is a skip, containers up but the store unreachable is
+a real error. That is what stops a green run from hiding a broken harness.
 
-Every Docker-backed test starts its own fresh container (or, for the Raft chaos suite, its own
-N-node cluster plus Toxiproxy container) with OS-assigned host ports and nanosecond-unique
-resource names (topics, subjects, streams). That per-test isolation, not any test-runner feature,
-is what makes running them concurrently safe. `cargo test`'s default behavior runs one test binary
-at a time to completion before starting the next, so today's `kafka_roundtrip`/`nats_roundtrip`/
-`sink`/`source_cursor`/`source_logical`/chaos binaries each get their own turn; nextest schedules
-every test from every binary into one global thread pool (`test-threads`, default `num-cpus`), so
-Docker-backed tests from different crates now run alongside each other instead of one binary
-finishing before the next starts. No `test-groups` cap is configured: nothing in the suite shares a
-mutable external resource, so there is nothing to serialize.
+Every Docker-backed test starts its own fresh container (or, for a Raft chaos test, its own
+Toxiproxy container plus an N-node cluster with one proxy per directed edge) with OS-assigned host
+ports and nanosecond-unique resource names (topics, subjects, streams). For the connector suites
+that per-test isolation is the whole story, and it is what makes running them concurrently safe.
+`cargo test`'s default behavior runs one test binary at a time to completion before starting the
+next, so today's `kafka_roundtrip`/`nats_roundtrip`/`sink`/`source_cursor`/`source_logical`
+binaries each get their own turn; nextest schedules every test from every binary into one global
+thread pool (`test-threads`, default `num-cpus`), so Docker-backed tests from different crates run
+alongside each other instead of one binary finishing before the next starts.
+
+The Raft chaos suites are the exception, and the one place a runner feature does the work. The
+`raft-chaos` test group caps `max-threads = 1` over `transport_chaos`, `raft_consensus_chaos`,
+`distributed_harness_smoke` and `distributed_integration_chaos`, so those four take the machine one
+test at a time. Unlike a connector test, which needs only its own container, each of these contends
+for the Docker daemon, for host ports, and for enough CPU to run 3 to 5 raft nodes while asserting
+on election and log-convergence deadlines. The group is declared once and applied through an
+override in **both** profiles: `distributed_integration_chaos` is in it even though `default` never
+reaches that binary, because `ci` does. Adding a fifth chaos binary means adding it to both
+`filter` expressions.
 
 ## Workspace layout
 
@@ -264,11 +284,13 @@ examples/quickstart/              # The runnable Quick Start: NATS to PostgreSQL
 examples/native/                  # Single-file pcs-core/pcs-service tutorials and feature demos:
                                   # first_pipeline, scheduler_etl(_parallel|_dag), window_aggregation,
                                   # distributed_scheduler, distributed_windowed, windowed_fan_in,
-                                  # stream_latency.
+                                  # stream_latency. The two distributed_* demos need `tikv-store`
+                                  # and a reachable TiKV.
                                   # Declared as `[[example]]` targets of the pcs-service crate.
-examples/distributed_fulfillment/ # A 3-node Raft cluster showcase: field-granular DAG scheduling,
-                                  # checkpointing, Docker Compose deployment. One `[[example]]`
-                                  # target of pcs-service.
+examples/distributed_fulfillment/ # A 3-node PCS Raft cluster showcase: field-granular DAG
+                                  # scheduling, checkpointing into TiKV, Docker Compose deployment
+                                  # of the three nodes plus PD and TiKV. One `[[example]]` target of
+                                  # pcs-service.
 examples/configs/                 # Runnable KDL configs for the pcs-service binary itself (not
                                   # `[[example]]` targets), one per connector plus standalone/cluster
                                   # templates. See its own README.md for the feature-to-config table.
@@ -382,12 +404,14 @@ cluster node is a deliberate deployment choice.
 - `wasm`: wasmtime host. `WasmEngine`, `WasmPipelineRuntime`, the `bindgen!` host bindings.
 - `plugin`: native plugin host. `NativePluginRuntime` dlopens a shared library exporting the
   `pcs-plugin-abi` C ABI, validates its manifest, and runs each batch through `run-batch`.
-- `distributed`: `PartitionSource`, `CheckpointStore`, `DistributedRunner`, redb store, TCP
-  transport.
-- `distributed-raft`: raft-rs (tikv/raft-rs) log store, state machine, snapshot, node driver
+- `distributed`: `PartitionSource`, `CheckpointStore`, `DistributedRunner`, `CheckpointStrategy`.
+  Traits and the runner loop only; it carries no store implementation and no redb.
+- `distributed-raft`: the PCS raft node (raft-rs, tikv/raft-rs) for membership and leadership:
+  `RaftRedbLogStore` over a log-only redb file, the node driver, the TCP peer transport. This is
+  the only feature that pulls `dep:redb`, and the only thing redb holds is the raft log
   (implies `distributed`).
-- `tikv-store`: TiKV persistent layer. `TikvSharedStore` implements `PartitionSource` +
-  `CheckpointStore` over a raw TiKV client (claims via CAS, no PCS raft for app data), and
+- `tikv-store`: TiKV persistent layer, and the only shared store there is. `TikvSharedStore`
+  implements `PartitionSource` + `CheckpointStore` over a raw TiKV client (claims via CAS), and
   `TikvStateClient` persists configs, processor priors and source cursors. Opt-in like
   `connector-kafka`: tikv-client pulls tonic/prost. Implies `distributed`.
 - `service`: the `pcs-service` binary. axum HTTP control plane, KDL config through
@@ -396,6 +420,8 @@ cluster node is a deliberate deployment choice.
   `tracing-opentelemetry` for OTLP span export.
   It does **not** imply `distributed-raft`.
 - `service-cluster`: cluster/Raft mode on top of `service` (implies `service`, `distributed-raft`).
+  It does **not** imply `tikv-store`, and `mode "cluster"` refuses to start without one, so a
+  cluster binary is built with `--features service-cluster,tikv-store`.
 
 ### `pcs-core`, columnar engine
 
@@ -556,7 +582,8 @@ on the host. `pcs-service` owns the `Registry` and `register_builtin_factories`,
 #### Distributed processing (`src/distributed/`)
 
 Multi-instance batch execution with at-least-once semantics. `pcs-core`'s `distributed` feature
-contributes shared types only; all runner code lives here.
+contributes shared types only; all runner code lives here. Application state lives in TiKV. The
+PCS raft node carries membership and leadership, and nothing else.
 
 **`distributed` feature:**
 - `PartitionSource`: claims, acks, and releases row-range batches across instances
@@ -566,27 +593,28 @@ contributes shared types only; all runner code lives here.
   runtime's opaque state blob, calls `runtime.run_on_with_state(&mut partition_data, prior)`, then
   checkpoints and acks. The template's own data, sources, and sinks are never used.
 - `CheckpointStrategy`: `EveryStage`, `EveryNStages`, `None`
-- `RedbSharedStore`: `PartitionSource` plus `CheckpointStore` over redb. Single-node applies
-  directly; multi-node proposes through the Raft driver
-- `ConsensusCommand` and `ConsensusResponse`: deterministic state machine command types
+- `MAX_LOG_ENTRY_BYTES` (1 MiB, `partition.rs`): caps the Arrow IPC payload of a registered master
+  batch, and is the `CheckpointStore::max_checkpoint_bytes` trait default
 - `accumulator_store` and `processor_state_store`: free functions that park the window accumulator and
   the runtime state blob under reserved `stage_idx` sentinels (`ACCUMULATOR_STAGE_SENTINEL`,
   `PROCESSOR_STATE_STAGE_SENTINEL`)
 - `ParquetCheckpointStore`: archival checkpoint store (needs `parquet-checkpoint`)
 
+**`distributed-raft` feature** (`src/distributed/consensus/`), membership and leadership only.
+Nothing is proposed into this log, so its entries are raft's own per-term no-ops:
 - `RaftRedbLogStore`: raft-rs `Storage` over a log-only redb file (hard state, conf state,
-  prost-encoded entries, snapshot)
-- `AppStateMachine`: applies `ConsensusCommand` to a separate file, tracking `last_applied`
-- `validate_store_consistency`: refuses startup when the state machine is behind what the log store
-  purged. Called by `ArrowRaftDriver::start`
+  prost-encoded entries, snapshot). The single-row snapshot table carries raft metadata alone,
+  index, term and conf state, with an empty data payload, because there is no application state
+  to capture. `snapshot_log_interval` is the log compaction cadence
 - `ArrowRaftDriver`, `ArrowRaftDriverConfig`, `ArrowRaftDriverHandle`: a `RawNode` drive loop
-  (tick/step/Ready cycle, static membership seeded from the configured peers on first boot) with
-  a proposal channel
-- `ConsensusCommand` and `ConsensusResponse`: postcard-encoded in `Entry.data`
-- `TransportHub`, `TcpNetwork`, `RaftTcpServer`: pooled length-prefixed TCP; raft messages travel
-  as prost-encoded `eraftpb::Message`, forwarded proposals ride a separate tag
+  (tick/step/Ready cycle, static membership seeded from the configured peers on first boot).
+  `start(config, log_db_path)` takes the one redb path; the handle exposes `metrics`, `shutdown`
+  and `spawn_tcp_server`
+- `TransportHub`, `TcpNetwork`, `RaftTcpServer` (`consensus/transport/`): pooled length-prefixed
+  TCP carrying prost-encoded `eraftpb::Message`, fire and forget. One frame caps at
+  `MAX_FRAME_BYTES`, 16 MiB
 
-**`tikv-store` feature:**
+**`tikv-store` feature:** the shared store and every persistent ledger.
 - `TikvSharedStore`: `PartitionSource` + `CheckpointStore` over a raw TiKV client. Claims are
   atomic CAS transitions on per-row-range keys; row ranges are fixed 512-row chunks created at
   registration. Checkpoints cap at 4 MiB (`TIKV_MAX_CHECKPOINT_BYTES`).
@@ -612,6 +640,10 @@ standalone/cluster runners.
 
 Key types:
 - `ServiceConfig` and `ServiceMode`: the config schema (`mode "standalone"` or `mode "cluster"`)
+- `StoreConfig`: the top-level `store "tikv"` block (`pd_endpoints`, `key_prefix`, `timeout_ms`,
+  `lease_ttl_ms`, `batch_resume`). `mode "cluster"` refuses to start without one, because TiKV is
+  the only cluster application-data store; a `store` block in a binary built without `tikv-store`
+  is likewise a configuration error
 - `WorkflowSpec`: one declared workflow (standalone may declare several; cluster mode takes
   exactly one). Declared `transformer`, `source`, `wasm`, `plugin` and `sink` nodes, each with a
   mandatory id and an optional name, plus `link` nodes carrying `from`, `to` and an optional
@@ -650,6 +682,9 @@ Key types:
   `run_stream` walk `BuiltService::nodes` directly: each iteration fans a source's batch out to its
   `downstream` nodes, runs every processor in topological order, and stages/writes every sink.
   `run_stream` requires at least one source node and pulls them round-robin, one batch per item.
+  `run_cluster` validates `node.data_dir`, whose only three files are `bootstrap.lock`,
+  `raft-log.redb` and `node-id`, starts the `ArrowRaftDriver`, connects the `TikvSharedStore`,
+  waits for raft to settle, then drives the `DistributedRunner` loop until cancellation.
 - HTTP control plane: `/health`, `/ready`, `/metrics`, `/status` (axum-backed), plus the inspector's
   `/api/*` and `/ui` when `observability.inspector.enabled` is set. Those routes are **merged**
   rather than gated inside a handler, so a disabled inspector 404s instead of answering 403.
@@ -801,9 +836,10 @@ collector, a scraper or external storage. Nothing leaves the process.
 - Performance is a finishing check, not optional: `cargo clippy --all-targets --all-features -- -D
   warnings` (already required above) covers Clippy's Perf lint group on every task. A change that
   touches a hot path (`Dataset`/`System`/`Pipeline` execution in `pcs-core`, Arrow IPC ser/de at the
-  `pcs-service` wasm host/processor boundary, or `distributed` checkpoint/redb paths) or a build
-  profile/allocator/dependency setting also needs `.agents/skills/rust-performance/SKILL.md`'s
-  triage workflow, validated with `cargo xtask bench <name>` before/after.
+  `pcs-service` wasm host/processor boundary, or the `distributed` checkpoint and TiKV store paths)
+  or a build profile/allocator/dependency setting also needs
+  `.agents/skills/rust-performance/SKILL.md`'s triage workflow, validated with
+  `cargo xtask bench <name>` before/after.
 - `arrow-ipc = "=59.2.0"` is exact-pinned workspace-wide. It is the host to processor wire format and the
   on-disk checkpoint format. See `crates/pcs-processor/PINS.md` before touching it.
 - Documentation and code comments: read `.agents/skills/writing-pcs-docs/SKILL.md` before editing

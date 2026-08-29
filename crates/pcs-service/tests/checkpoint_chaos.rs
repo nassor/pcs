@@ -8,28 +8,23 @@
 
 #![cfg(feature = "distributed")]
 
-mod common;
+#[path = "common/memory_store.rs"]
+mod memory_store;
 
 use std::sync::Arc;
 
+use memory_store::MemoryStore;
 use pcs_service::PcsError;
 use pcs_service::PcsResult;
 use pcs_service::dataset::Dataset;
 use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
-use pcs_service::distributed::consensus::store::RedbSharedStore;
 use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
 use pcs_service::pipeline::Pipeline;
-use tempfile::TempDir;
 use uuid::Uuid;
 
-fn temp_store(dir: &TempDir) -> RedbSharedStore {
-    let path = dir.path().join(format!("{}.db", Uuid::now_v7()));
-    RedbSharedStore::single_node(&path).unwrap()
-}
-
-async fn seed_batch(store: &RedbSharedStore, batch_id: u64) {
+async fn seed_batch(store: &MemoryStore, batch_id: u64) {
     store
         .register_master_batch(batch_id, "test".to_string(), 1, vec![0u8; 64], 10)
         .await
@@ -44,9 +39,6 @@ fn empty_dataset() -> Dataset {
 /// the runner can surface a recoverable failure.
 #[test]
 fn torn_ipc_write_returns_error() {
-    let dir = TempDir::new().unwrap();
-    let store = temp_store(&dir);
-
     let dataset = Dataset::new();
     let mut ipc_bytes = Vec::new();
     dataset.write_ipc(&mut ipc_bytes).expect("write_ipc");
@@ -58,7 +50,6 @@ fn torn_ipc_write_returns_error() {
         result.is_err(),
         "truncated IPC must return Err, not Ok or panic"
     );
-    drop(store);
 }
 
 /// No vector in the committed cross-language conformance corpus
@@ -99,8 +90,7 @@ async fn checkpoint_failure_integration_releases_not_acks() {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let dir = TempDir::new().unwrap();
-    let inner = temp_store(&dir);
+    let inner = MemoryStore::new();
     seed_batch(&inner, 0).await;
 
     let release_count = Arc::new(AtomicUsize::new(0));
@@ -108,7 +98,7 @@ async fn checkpoint_failure_integration_releases_not_acks() {
     let claims_issued = Arc::new(AtomicUsize::new(0));
 
     struct FailSaveStore {
-        inner: RedbSharedStore,
+        inner: MemoryStore,
         release_count: Arc<AtomicUsize>,
         ack_count: Arc<AtomicUsize>,
         claims_issued: Arc<AtomicUsize>,
@@ -187,6 +177,7 @@ async fn checkpoint_failure_integration_releases_not_acks() {
 #[tokio::test]
 async fn parquet_load_rejects_crashed_tmp_file() {
     use pcs_service::distributed::parquet_checkpoint::ParquetCheckpointStore;
+    use tempfile::TempDir;
 
     let dir = TempDir::new().unwrap();
     let store = ParquetCheckpointStore::new(dir.path()).unwrap();

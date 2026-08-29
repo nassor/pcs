@@ -48,12 +48,13 @@ trait object, so a processor never learns which one is running it.
 
 | | `mode "standalone"` | `mode "cluster"` |
 |---|---|---|
-| **Feature** | `service`, in the default bundle | `service-cluster`, opt-in |
-| **Coordination** | None. One process, one dataset. | Raft over TCP between the declared `peer` nodes. |
-| **Ingest** | Each `source` node drains into the nodes its links feed, every iteration. | `PartitionSource`: batches are claimed, not read. A `source`, `sink` or `link` node is rejected. |
+| **Feature** | `service`, in the default bundle | `service-cluster` plus `tikv-store`, both opt-in |
+| **Coordination** | None. One process, one dataset. | Claims in TiKV, settled by compare-and-swap. Raft over TCP between the declared `peer` nodes carries membership and leadership. |
+| **Store** | Optional. A `store "tikv"` block persists source cursors and processor priors. | Required. `store "tikv"` holds partitions, claims and checkpoints. |
+| **Ingest** | Each `source` node drains into the nodes its links feed, every iteration. | `PartitionSource`: 512-row ranges are claimed, not read. A `source`, `sink` or `link` node is rejected. |
 | **Pacing** | `run_mode`: `continuous`, `one_shot`, `interval`, or `stream`. | As fast as claims arrive, until cancelled. |
 | **On restart** | Re-reads its sources from the beginning. | Resumes from the checkpoint recorded under its lease. |
-| **Uses `node.data_dir`** | No. Required to be non-empty, never written. | Yes: `raft-log.redb`, `cluster-app.redb`, `bootstrap.lock`, `node-id`. |
+| **Uses `node.data_dir`** | No. Required to be non-empty, never written. | Yes, for the raft log alone: `raft-log.redb`, `bootstrap.lock`, `node-id`. |
 
 A standalone iteration checks for cancellation, then walks every declared node
 once in topological order, so a node always runs after every node that links
@@ -108,8 +109,8 @@ exit.
 |---|---|
 | **Sources** | At least one, enforced at config-validation time. Several are pulled round-robin, one batch per item. Cluster mode is not supported. |
 | **Invocation** | One `run-batch` call per received batch. No coalescing: the producer chooses the item size. |
-| **Processor state** | The checkpoint blob one item returns is handed back as the next item's `prior`, one blob per processor node, so processor state survives even though the store does not. |
-| **Durability** | At-most-once. The state blob lives in loop memory only: it is never checkpointed and is lost on restart. A failed item is logged, counted, and dropped; `prior` is left at the last good value. |
+| **Processor state** | The checkpoint blob one item returns is handed back as the next item's `prior`, one blob per processor node. With a `store "tikv"` block the prior and each source's cursor are written to TiKV as they change, so a restart resumes; without one they live in loop memory and are lost. |
+| **Durability** | At-most-once. A failed item is logged, counted, and dropped; `prior` is left at the last good value. A missed cursor write costs one replay, never a lost item. |
 | **Stats** | `iterations` counts items; `total_busy_micros` and `max_item_micros` report per-item cost. `/status` is refreshed at most every 100 ms, since a per-item lock write would dominate the budget. |
 
 Three source types need it. `type="tcp"` is always live; `NatsSource` is live

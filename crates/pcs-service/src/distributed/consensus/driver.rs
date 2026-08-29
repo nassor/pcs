@@ -1,23 +1,25 @@
-//! Arrow-IPC Raft node driver on tikv/raft-rs.
+//! Raft node driver on tikv/raft-rs.
 //!
 //! [`ArrowRaftDriver`] manages a [`RawNode`](raft::RawNode) backed by
 //! [`RaftRedbLogStore`]. It:
 //!
 //! 1. Seeds the static membership (conf state) into the log store on first boot.
-//! 2. Receives [`ConsensusCommand`](crate::distributed::consensus::ConsensusCommand)
-//!    proposals, proposing them when leader and forwarding them to the leader
-//!    otherwise.
-//! 3. Drives the Ready cycle (tick, step, persist, apply, advance) exactly like
+//! 2. Drives the Ready cycle (tick, step, persist, advance) exactly like
 //!    raft's canonical `five_mem_node` example.
-//! 4. Returns the [`ConsensusResponse`](crate::distributed::consensus::ConsensusResponse)
-//!    via a oneshot reply channel.
+//! 3. Compacts the log on a `snapshot_log_interval` cadence.
+//! 4. Publishes a sync-readable [`ArrowRaftMetrics`] snapshot.
 //!
 //! Membership is static: the peer list is seeded once and never changes, so
 //! there are no conf-change proposals and no `initialize` step.
+//!
+//! The driver holds no application state. Cluster application data lives in
+//! TiKV, so nothing is ever proposed into this log: its entries are raft's own
+//! per-term no-ops, committed entries are acknowledged and discarded, and a
+//! snapshot carries raft metadata with an empty payload.
 
 #[cfg(feature = "distributed-raft")]
 pub(crate) mod raft_impl {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,19 +27,13 @@ pub(crate) mod raft_impl {
     use std::time::Duration;
 
     use raft::eraftpb::{Message, MessageType, Snapshot};
-    use raft::{Config as RaftConfig, RawNode, SnapshotStatus, StateRole};
+    use raft::{Config as RaftConfig, RawNode, SnapshotStatus, StateRole, Storage as _};
     use tokio::sync::{mpsc, oneshot};
 
     use crate::PcsError;
     use crate::PcsResult;
-    use crate::distributed::consensus::snapshot::raft_impl::{
-        build_snapshot_bytes, install_snapshot_bytes,
-    };
-    use crate::distributed::consensus::storage::raft_impl::{
-        AppStateMachine, RaftRedbLogStore, validate_store_consistency,
-    };
+    use crate::distributed::consensus::storage::raft_impl::RaftRedbLogStore;
     use crate::distributed::consensus::transport::{RaftTcpServer, TransportHub};
-    use crate::distributed::consensus::types::{ConsensusCommand, ConsensusResponse};
 
     /// Tick interval for the raft drive loop, in milliseconds.
     const TICK_INTERVAL_MS: u64 = 100;
@@ -85,7 +81,7 @@ pub(crate) mod raft_impl {
         pub peers: HashMap<u64, String>,
         pub heartbeat_interval_ms: u64,
         pub election_timeout_ms: u64,
-        /// Build and compact a snapshot every this many applied entries.
+        /// Compact the log every this many applied entries.
         pub snapshot_log_interval: u64,
     }
 
@@ -102,35 +98,16 @@ pub(crate) mod raft_impl {
         }
     }
 
-    /// Handle for submitting proposals and requesting shutdown.
+    /// Handle for reading consensus metrics and requesting shutdown.
     #[derive(Clone)]
     pub struct ArrowRaftDriverHandle {
-        proposal_tx: mpsc::Sender<(
-            ConsensusCommand,
-            oneshot::Sender<PcsResult<ConsensusResponse>>,
-        )>,
         shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
         transport_tx: mpsc::Sender<Message>,
         metrics: Arc<RwLock<ArrowRaftMetrics>>,
-        /// The redb database shared with the state machine.
-        ///
-        /// Used by `RedbSharedStore::multi_node` to open read-only queries
-        /// against the same file that the state machine writes to.
-        app_db: Arc<Mutex<redb::Database>>,
     }
 
     impl ArrowRaftDriverHandle {
-        pub async fn propose(&self, cmd: ConsensusCommand) -> PcsResult<ConsensusResponse> {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            self.proposal_tx
-                .send((cmd, reply_tx))
-                .await
-                .map_err(|_| PcsError::generic("ArrowRaftDriver: proposal channel closed"))?;
-            reply_rx
-                .await
-                .map_err(|_| PcsError::generic("ArrowRaftDriver: reply channel closed"))?
-        }
-
+        /// Signal the drive loop to stop. Idempotent: later calls are no-ops.
         pub async fn shutdown(&self) {
             let mut guard = self.shutdown_tx.lock().await;
             if let Some(tx) = guard.take() {
@@ -138,17 +115,12 @@ pub(crate) mod raft_impl {
             }
         }
 
-        /// Return the redb database shared with the Raft state machine.
-        pub fn app_db(&self) -> &Arc<Mutex<redb::Database>> {
-            &self.app_db
-        }
-
         /// Return the latest Raft metrics snapshot.
         pub fn metrics(&self) -> ArrowRaftMetrics {
             self.metrics.read().expect("metrics lock poisoned").clone()
         }
 
-        /// Spawn the TCP server that accepts inbound Raft RPCs from cluster peers.
+        /// Spawn the TCP server that accepts inbound Raft messages from cluster peers.
         ///
         /// Call this once per node after `ArrowRaftDriver::start` in multi-node mode.
         /// Without it, other nodes cannot deliver heartbeats, votes, or log entries
@@ -160,45 +132,30 @@ pub(crate) mod raft_impl {
             &self,
             listen_addr: std::net::SocketAddr,
         ) -> tokio::task::JoinHandle<std::io::Result<()>> {
-            RaftTcpServer::new(
-                self.transport_tx.clone(),
-                self.proposal_tx.clone(),
-                listen_addr,
-            )
-            .spawn()
+            RaftTcpServer::new(self.transport_tx.clone(), listen_addr).spawn()
         }
     }
 
     pub struct ArrowRaftDriver;
 
     impl ArrowRaftDriver {
+        /// Open the log store at `log_db_path`, seed static membership, and spawn
+        /// the drive loop.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`PcsError::Store`] when the log-only redb file cannot be
+        /// opened, and [`PcsError::Configuration`] when the derived raft config
+        /// or the `RawNode` construction is rejected.
         pub async fn start(
             config: ArrowRaftDriverConfig,
             log_db_path: impl Into<PathBuf>,
-            app_db_path: impl Into<PathBuf>,
         ) -> PcsResult<(
             ArrowRaftDriverHandle,
             tokio::task::JoinHandle<PcsResult<()>>,
         )> {
             let log_db_path = log_db_path.into();
-            let app_db_path = app_db_path.into();
-
             let log_store = RaftRedbLogStore::open(&log_db_path)?;
-            let app_db = Arc::new(Mutex::new(
-                redb::Database::create(&app_db_path)
-                    .map_err(|e| PcsError::store(format!("open app_db: {e}")))?,
-            ));
-            let app_sm = AppStateMachine::open(Arc::clone(&app_db))
-                .map_err(|e| PcsError::store(format!("open state machine: {e}")))?;
-
-            // Both halves of the node directory are open; refuse to start if the
-            // state machine is behind what the log store already purged. Without
-            // this a node restored from mismatched backups would silently
-            // diverge instead of failing loudly.
-            validate_store_consistency(
-                log_store.first_index()?,
-                app_sm.last_applied().map(|(_, i)| i),
-            )?;
 
             // Static membership: seed the conf state on first boot. The
             // operational model already requires editing the peers list and
@@ -229,7 +186,9 @@ pub(crate) mod raft_impl {
                 // Deterministic elections: the randomization window is one tick.
                 min_election_tick: election_tick,
                 max_election_tick: election_tick + 1,
-                applied: app_sm.last_applied().map(|(_, i)| i).unwrap_or(0),
+                // Nothing is applied out of band: raft starts applied at the
+                // log's first index minus one and the drive loop advances it.
+                applied: 0,
                 ..Default::default()
             };
             raft_config
@@ -240,72 +199,56 @@ pub(crate) mod raft_impl {
                 .map_err(|e| PcsError::configuration(format!("RawNode::new: {e}")))?;
             let raw_node = Arc::new(Mutex::new(raw_node));
 
-            let (proposal_tx, proposal_rx) = mpsc::channel::<(
-                ConsensusCommand,
-                oneshot::Sender<PcsResult<ConsensusResponse>>,
-            )>(128);
             let (transport_tx, transport_rx) = mpsc::channel::<Message>(1024);
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+            let last_log_index = log_store.last_index()?;
+            // The log's existing base: a restart must not immediately re-compact
+            // to the snapshot index it already holds.
+            let compaction_base = log_store.first_index()?.saturating_sub(1);
             let metrics = Arc::new(RwLock::new(ArrowRaftMetrics {
                 state: RaftNodeState::Follower,
                 term: 0,
                 leader_id: None,
-                applied_index: app_sm.last_applied().map(|(_, i)| i).unwrap_or(0),
-                last_log_index: log_store.last_index()?,
+                applied_index: 0,
+                last_log_index,
             }));
 
             let handle = ArrowRaftDriverHandle {
-                proposal_tx: proposal_tx.clone(),
                 shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
                 transport_tx,
                 metrics: Arc::clone(&metrics),
-                app_db,
             };
 
-            let hub = TransportHub::new(&config.peers);
-            let run = RunState {
+            let run = SharedRun {
                 raw_node,
                 log_store,
-                app_sm,
-                hub,
-                pending: Arc::new(Mutex::new(VecDeque::new())),
+                hub: TransportHub::new(&config.peers),
                 metrics,
-                peers: config.peers,
-                node_id: config.node_id,
                 snapshot_log_interval: config.snapshot_log_interval,
-                last_snapshot_index: Arc::new(AtomicU64::new(0)),
+                last_snapshot_index: Arc::new(AtomicU64::new(compaction_base)),
             };
 
-            let join =
-                tokio::spawn(
-                    async move { run.drive(proposal_rx, transport_rx, shutdown_rx).await },
-                );
+            let join = tokio::spawn(async move { run.drive(transport_rx, shutdown_rx).await });
 
             Ok((handle, join))
         }
     }
 
-    struct RunState {
+    /// Everything the drive loop needs, cloneable into `spawn_blocking`.
+    #[derive(Clone)]
+    struct SharedRun {
         raw_node: Arc<Mutex<ArrowPCSRaft>>,
         log_store: RaftRedbLogStore,
-        app_sm: AppStateMachine,
         hub: TransportHub,
-        pending: Arc<Mutex<VecDeque<oneshot::Sender<PcsResult<ConsensusResponse>>>>>,
         metrics: Arc<RwLock<ArrowRaftMetrics>>,
-        peers: HashMap<u64, String>,
-        node_id: u64,
         snapshot_log_interval: u64,
         last_snapshot_index: Arc<AtomicU64>,
     }
 
-    impl RunState {
+    impl SharedRun {
         async fn drive(
-            mut self,
-            mut proposal_rx: mpsc::Receiver<(
-                ConsensusCommand,
-                oneshot::Sender<PcsResult<ConsensusResponse>>,
-            )>,
+            self,
             mut transport_rx: mpsc::Receiver<Message>,
             mut shutdown_rx: oneshot::Receiver<()>,
         ) -> PcsResult<()> {
@@ -318,115 +261,28 @@ pub(crate) mod raft_impl {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let run = self.clone_shared();
+                        let run = self.clone();
                         tokio::task::spawn_blocking(move || run.tick_once()).await
                             .map_err(|e| PcsError::generic(format!("tick task panicked: {e}")))??;
                     }
                     msg_opt = transport_rx.recv() => {
                         let Some(msg) = msg_opt else { break; };
-                        let run = self.clone_shared();
+                        let run = self.clone();
                         tokio::task::spawn_blocking(move || run.step(msg)).await
                             .map_err(|e| PcsError::generic(format!("step task panicked: {e}")))??;
-                    }
-                    proposal_opt = proposal_rx.recv() => {
-                        match proposal_opt {
-                            Some((cmd, reply_tx)) => {
-                                self.handle_proposal(cmd, reply_tx).await;
-                            }
-                            None => break,
-                        }
                     }
                     _ = &mut shutdown_rx => break,
                 }
             }
 
             // Let raft flush any final ready state before the storage closes.
-            {
-                let run = self.clone_shared();
-                tokio::task::spawn_blocking(move || run.drain_ready())
-                    .await
-                    .map_err(|e| PcsError::generic(format!("drain task panicked: {e}")))??;
-            }
+            let run = self.clone();
+            tokio::task::spawn_blocking(move || run.drain_ready())
+                .await
+                .map_err(|e| PcsError::generic(format!("drain task panicked: {e}")))??;
             Ok(())
         }
 
-        fn clone_shared(&self) -> SharedRun {
-            SharedRun {
-                raw_node: Arc::clone(&self.raw_node),
-                log_store: self.log_store.clone(),
-                app_sm: Arc::new(self.app_sm.clone()),
-                hub: self.hub.clone(),
-                pending: Arc::clone(&self.pending),
-                metrics: Arc::clone(&self.metrics),
-                snapshot_log_interval: self.snapshot_log_interval,
-                last_snapshot_index: Arc::clone(&self.last_snapshot_index),
-            }
-        }
-
-        async fn handle_proposal(
-            &mut self,
-            cmd: ConsensusCommand,
-            reply_tx: oneshot::Sender<PcsResult<ConsensusResponse>>,
-        ) {
-            // Propose synchronously (cheap: it only appends to the in-memory
-            // log); the response arrives later through the committed-entries
-            // path when this node is the leader.
-            let data = match postcard::to_allocvec(&cmd) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = reply_tx.send(Err(PcsError::generic(format!("encode proposal: {e}"))));
-                    return;
-                }
-            };
-            let leader_id = {
-                let mut rn = self.raw_node.lock().expect("raw_node lock poisoned");
-                let leader = rn.status().ss.leader_id;
-                match rn.propose(Vec::new(), data) {
-                    Ok(()) => {
-                        self.pending
-                            .lock()
-                            .expect("pending lock poisoned")
-                            .push_back(reply_tx);
-                        return;
-                    }
-                    Err(_) => leader,
-                }
-            };
-
-            // Not the leader: forward to the current leader if known.
-            let leader_addr = if leader_id != 0 && leader_id != self.node_id {
-                self.peers.get(&leader_id).cloned()
-            } else {
-                None
-            };
-            let result = match leader_addr {
-                Some(addr) => {
-                    use crate::distributed::consensus::transport::forward_proposal;
-                    forward_proposal(&addr, cmd).await
-                }
-                None => {
-                    // No leader elected yet; let the caller back off and retry.
-                    Ok(ConsensusResponse::NoBatchAvailable)
-                }
-            };
-            let _ = reply_tx.send(result);
-        }
-    }
-
-    /// Everything `drain_ready` needs, cloneable into `spawn_blocking`.
-    #[derive(Clone)]
-    struct SharedRun {
-        raw_node: Arc<Mutex<ArrowPCSRaft>>,
-        log_store: RaftRedbLogStore,
-        app_sm: Arc<AppStateMachine>,
-        hub: TransportHub,
-        pending: Arc<Mutex<VecDeque<oneshot::Sender<PcsResult<ConsensusResponse>>>>>,
-        metrics: Arc<RwLock<ArrowRaftMetrics>>,
-        snapshot_log_interval: u64,
-        last_snapshot_index: Arc<AtomicU64>,
-    }
-
-    impl SharedRun {
         fn tick_once(&self) -> PcsResult<()> {
             let mut rn = self.raw_node.lock().expect("raw_node lock poisoned");
             rn.tick();
@@ -451,9 +307,11 @@ pub(crate) mod raft_impl {
         }
 
         /// One full Ready cycle, mirroring `five_mem_node`: ship messages,
-        /// apply snapshots, apply committed entries, persist entries and hard
-        /// state, then advance. The message sends block the blocking thread on
-        /// the async transport (acceptable: raft traffic is low-rate).
+        /// persist a received snapshot, persist entries and hard state, then
+        /// advance. Committed entries carry no application payload, so
+        /// acknowledging them is `advance_apply`. The message sends block the
+        /// blocking thread on the async transport (acceptable: raft traffic is
+        /// low-rate).
         fn drain_ready_after(&self, rn: &mut ArrowPCSRaft) -> PcsResult<()> {
             while rn.has_ready() {
                 let mut rd = rn.ready();
@@ -461,19 +319,17 @@ pub(crate) mod raft_impl {
                 // 1. Ship outbound messages.
                 self.ship_messages(rn, rd.take_messages());
 
-                // 2. Persist and install a snapshot this node received.
+                // 2. Persist a snapshot this node received, compacting the log
+                //    to its index. The payload is empty: there is no
+                //    application state to install.
                 if *rd.snapshot() != Snapshot::default() {
                     let snap = rd.snapshot().clone();
-                    self.install_snapshot(&snap)?;
+                    let index = snap.metadata.as_ref().map_or(0, |m| m.index);
+                    self.log_store.compact_to(index, &snap)?;
+                    self.last_snapshot_index.store(index, Ordering::Relaxed);
                 }
 
-                // 3. Apply committed entries.
-                let committed = rd.take_committed_entries();
-                if !committed.is_empty() {
-                    self.apply_committed(&committed)?;
-                }
-
-                // 4. Persist entries and hard state.
+                // 3. Persist entries and hard state.
                 if !rd.entries().is_empty() {
                     self.log_store.append_entries(rd.entries())?;
                 }
@@ -481,23 +337,18 @@ pub(crate) mod raft_impl {
                     self.log_store.persist_hard_state(hs)?;
                 }
 
-                // 5. Ship persisted messages.
+                // 4. Ship persisted messages.
                 self.ship_messages(rn, rd.take_persisted_messages());
 
-                // 6. Advance, then fold in the light ready.
+                // 5. Advance, then fold in the light ready.
                 let mut light = rn.advance(rd);
                 self.ship_messages(rn, light.take_messages());
-                let light_committed = light.take_committed_entries();
-                if !light_committed.is_empty() {
-                    self.apply_committed(&light_committed)?;
-                }
-                let applied = self.app_sm.last_applied().map(|(_, i)| i).unwrap_or(0);
-                rn.advance_apply_to(applied);
+                rn.advance_apply();
             }
 
-            // Periodic snapshot cadence: compact the log every
-            // `snapshot_log_interval` applied entries.
-            self.maybe_snapshot();
+            // Periodic cadence: compact the log every `snapshot_log_interval`
+            // applied entries so it does not grow without bound.
+            self.maybe_compact(rn);
             self.update_metrics(rn);
             Ok(())
         }
@@ -530,85 +381,40 @@ pub(crate) mod raft_impl {
             }
         }
 
-        /// Persist a received snapshot into the log store (one fsync) and
-        /// install its data into the app database, advancing the watermark.
-        fn install_snapshot(&self, snap: &Snapshot) -> PcsResult<()> {
-            let meta = snap.metadata.clone().unwrap_or_default();
-            self.log_store.compact_to(meta.index, snap)?;
-            let applied_bytes = postcard::to_allocvec(&Some((meta.term, meta.index)))
-                .map_err(|e| PcsError::store(format!("encode applied watermark: {e}")))?;
-            let membership_bytes = postcard::to_allocvec(&Vec::<u64>::new())
-                .map_err(|e| PcsError::store(format!("encode membership placeholder: {e}")))?;
-            let db = self.app_sm.db.clone();
-            let db = db
-                .lock()
-                .map_err(|_| PcsError::store("app db mutex poisoned"))?;
-            install_snapshot_bytes(&db, &snap.data, Some((&applied_bytes, &membership_bytes)))
-                .map_err(|e| PcsError::store(format!("install snapshot: {e}")))?;
-            self.app_sm.set_last_applied(meta.term, meta.index);
-            Ok(())
-        }
-
-        /// Apply committed entries, persist the watermark, and complete any
-        /// pending proposals FIFO (data entries only; blank election entries
-        /// carry no client).
-        fn apply_committed(&self, entries: &[raft::eraftpb::Entry]) -> PcsResult<()> {
-            let responses = self.app_sm.apply_batch(entries)?;
-            self.app_sm.persist_applied()?;
-            let mut pending = self.pending.lock().expect("pending lock poisoned");
-            for (_index, response) in responses {
-                if let Some(tx) = pending.pop_front() {
-                    let _ = tx.send(Ok(response));
-                }
-            }
-            Ok(())
-        }
-
-        fn maybe_snapshot(&self) {
-            let Some(applied) = self.app_sm.last_applied() else {
-                return;
-            };
-            let (term, index) = applied;
-            if index.saturating_sub(self.last_snapshot_index.load(Ordering::Relaxed))
-                < self.snapshot_log_interval
+        /// Compact the log once `snapshot_log_interval` entries have been
+        /// applied since the last compaction, writing a metadata-only snapshot
+        /// as the new log base.
+        fn maybe_compact(&self, rn: &ArrowPCSRaft) {
+            let applied = rn.status().applied;
+            if applied == 0
+                || applied.saturating_sub(self.last_snapshot_index.load(Ordering::Relaxed))
+                    < self.snapshot_log_interval
             {
                 return;
             }
-            let db = self.app_sm.db.clone();
-            let db = match db.lock() {
-                Ok(db) => db,
-                Err(_) => return,
-            };
-            let payload = match build_snapshot_bytes(&db) {
-                Ok(p) => p,
+            let term = match self.log_store.term(applied) {
+                Ok(t) => t,
                 Err(_e) => {
                     #[cfg(feature = "tracing")]
-                    tracing::warn!(error = %_e, "snapshot build failed");
+                    tracing::warn!(index = applied, error = %_e, "log compaction: term lookup failed");
                     return;
                 }
             };
-            drop(db);
-            let conf = self.log_store.read_conf_state();
-            let conf = conf.map(|c| raft::eraftpb::ConfState {
-                voters: c.voters,
-                learners: c.learners,
-                ..Default::default()
-            });
-            let conf_state = conf.unwrap_or_default();
+            let conf_state = self.log_store.read_conf_state().unwrap_or_default();
             let snap = Snapshot {
-                data: payload,
+                data: Vec::new(),
                 metadata: Some(raft::eraftpb::SnapshotMetadata {
-                    index,
+                    index: applied,
                     term,
                     conf_state: Some(conf_state),
                 }),
             };
-            if let Err(e) = self.log_store.compact_to(index, &snap) {
+            if let Err(_e) = self.log_store.compact_to(applied, &snap) {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(error = %e, "snapshot compaction failed");
+                tracing::warn!(error = %_e, "log compaction failed");
                 return;
             }
-            self.last_snapshot_index.store(index, Ordering::Relaxed);
+            self.last_snapshot_index.store(applied, Ordering::Relaxed);
         }
 
         fn update_metrics(&self, rn: &ArrowPCSRaft) {
@@ -638,26 +444,41 @@ pub(crate) mod raft_impl {
             l.local_addr().unwrap()
         }
 
-        #[tokio::test]
-        async fn test_arrow_driver_starts_and_shuts_down() {
-            let dir = TempDir::new().unwrap();
-            let addr = free_addr();
-            let config = ArrowRaftDriverConfig {
+        fn single_node_config(listen_addr: SocketAddr) -> ArrowRaftDriverConfig {
+            ArrowRaftDriverConfig {
                 node_id: 1,
-                listen_addr: addr,
+                listen_addr,
                 peers: HashMap::new(),
                 heartbeat_interval_ms: 30,
                 election_timeout_ms: 200,
                 snapshot_log_interval: 10_000,
-            };
+            }
+        }
 
-            let (handle, task) = ArrowRaftDriver::start(
-                config,
-                dir.path().join("arrow_log.redb"),
-                dir.path().join("arrow_app.redb"),
-            )
-            .await
-            .unwrap();
+        /// Wait until `handle` reports the leader role, or fail the test.
+        async fn await_leader(handle: &ArrowRaftDriverHandle) -> ArrowRaftMetrics {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let m = handle.metrics();
+                if m.state == RaftNodeState::Leader {
+                    return m;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "single node should become leader: {m:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_arrow_driver_starts_and_shuts_down() {
+            let dir = TempDir::new().unwrap();
+            let config = single_node_config(free_addr());
+
+            let (handle, task) = ArrowRaftDriver::start(config, dir.path().join("raft-log.redb"))
+                .await
+                .unwrap();
 
             tokio::time::sleep(Duration::from_millis(300)).await;
             handle.shutdown().await;
@@ -667,61 +488,145 @@ pub(crate) mod raft_impl {
             assert!(result.is_ok(), "driver task should exit cleanly");
         }
 
+        /// A single-node cluster elects itself and commits raft's own per-term
+        /// entry, so both the term and the applied index advance past zero
+        /// without anything being proposed.
         #[tokio::test]
-        async fn test_single_node_propose_round_trip() {
+        async fn test_single_node_elects_and_applies_own_entry() {
             let dir = TempDir::new().unwrap();
-            let addr = free_addr();
-            let config = ArrowRaftDriverConfig {
-                node_id: 1,
-                listen_addr: addr,
-                peers: HashMap::new(),
-                heartbeat_interval_ms: 30,
-                election_timeout_ms: 200,
-                snapshot_log_interval: 10_000,
-            };
+            let config = single_node_config(free_addr());
 
-            let (handle, task) = ArrowRaftDriver::start(
-                config,
-                dir.path().join("arrow_log.redb"),
-                dir.path().join("arrow_app.redb"),
-            )
-            .await
-            .unwrap();
+            let (handle, task) = ArrowRaftDriver::start(config, dir.path().join("raft-log.redb"))
+                .await
+                .unwrap();
 
-            // Wait for the single-node cluster to elect itself leader.
+            let metrics = await_leader(&handle).await;
+            assert_eq!(
+                metrics.leader_id,
+                Some(1),
+                "the sole voter must report itself as leader: {metrics:?}"
+            );
+            assert!(
+                metrics.term >= 1,
+                "a leader implies a term of at least 1: {metrics:?}"
+            );
+
+            // raft appends one empty entry when it becomes leader; the drive
+            // loop must acknowledge it.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let m = handle.metrics();
-                if m.state == RaftNodeState::Leader {
+                if m.applied_index >= 1 {
+                    assert!(
+                        m.last_log_index >= m.applied_index,
+                        "log must hold every applied entry: {m:?}"
+                    );
                     break;
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "single node should become leader: {:?}",
-                    m
+                    "applied index must advance past 0: {m:?}"
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // Registering a master batch round-trips through raft.
-            let response = handle
-                .propose(ConsensusCommand::RegisterMasterBatch {
-                    batch_id: 1,
-                    component: "test".to_string(),
-                    schema_id: 1,
-                    ipc_bytes: vec![0u8; 32],
-                    total_rows: 10,
-                    now_at_propose: 0,
-                })
+            handle.shutdown().await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        }
+
+        /// Membership seeded on first boot survives a restart: the second
+        /// `start` reads the persisted conf state instead of re-seeding, and
+        /// the node resumes with the same voter set.
+        #[tokio::test]
+        async fn test_membership_persists_across_restart() {
+            let dir = TempDir::new().unwrap();
+            let log_path = dir.path().join("raft-log.redb");
+
+            let mut config = single_node_config(free_addr());
+            config.peers.insert(2, "127.0.0.1:1".to_string());
+            config.peers.insert(3, "127.0.0.1:2".to_string());
+
+            let (handle, task) = ArrowRaftDriver::start(config, &log_path).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.shutdown().await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+
+            let store = RaftRedbLogStore::open(&log_path).unwrap();
+            assert_eq!(
+                store.read_conf_state().unwrap().voters,
+                vec![1, 2, 3],
+                "the seeded voter set must be persisted"
+            );
+            drop(store);
+
+            // A restart whose config lists no peers must not shrink the
+            // persisted membership.
+            let (handle, task) = ArrowRaftDriver::start(single_node_config(free_addr()), &log_path)
                 .await
-                .expect("proposal succeeds");
-            assert!(matches!(
-                response,
-                ConsensusResponse::MasterBatchRegistered { batch_id: 1 }
-            ));
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.shutdown().await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+
+            let store = RaftRedbLogStore::open(&log_path).unwrap();
+            assert_eq!(
+                store.read_conf_state().unwrap().voters,
+                vec![1, 2, 3],
+                "a restart must reuse the persisted voter set, not re-seed it"
+            );
+        }
+
+        /// With a one-entry cadence the drive loop compacts the log as soon as
+        /// the leader's own entry applies, leaving a metadata-only snapshot as
+        /// the new log base.
+        #[tokio::test]
+        async fn test_log_compaction_writes_metadata_only_snapshot() {
+            let dir = TempDir::new().unwrap();
+            let log_path = dir.path().join("raft-log.redb");
+            let mut config = single_node_config(free_addr());
+            config.snapshot_log_interval = 1;
+
+            let (handle, task) = ArrowRaftDriver::start(config, &log_path).await.unwrap();
+            await_leader(&handle).await;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if handle.metrics().applied_index >= 1 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "applied index must advance before compaction can run"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // One more Ready cycle so `maybe_compact` observes the new applied index.
+            tokio::time::sleep(Duration::from_millis(300)).await;
 
             handle.shutdown().await;
             let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+
+            let store = RaftRedbLogStore::open(&log_path).unwrap();
+            let snap = store
+                .read_snapshot()
+                .unwrap()
+                .expect("compaction must persist a snapshot");
+            let meta = snap.metadata.as_ref().expect("snapshot metadata");
+            assert!(meta.index >= 1, "snapshot index must name a real entry");
+            assert!(
+                snap.data.is_empty(),
+                "the PCS raft holds no application state, so the payload stays empty"
+            );
+            assert_eq!(
+                meta.conf_state.as_ref().expect("conf state").voters,
+                vec![1],
+                "the snapshot must carry the current membership"
+            );
+            assert_eq!(
+                store.first_index().unwrap(),
+                meta.index + 1,
+                "entries up to the snapshot index must be purged"
+            );
         }
     }
 }

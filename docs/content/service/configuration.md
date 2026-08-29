@@ -13,7 +13,7 @@ error; `${VAR:-default}` falls back.
 
 ## The file structure
 
-Six top-level keys. `node` and `workflow` are required; the rest have defaults.
+Seven top-level keys. `node` and `workflow` are required; the rest have defaults.
 
 | Key | Holds | Default |
 |---|---|---|
@@ -21,6 +21,7 @@ Six top-level keys. `node` and `workflow` are required; the rest have defaults.
 | `node` | `id`, optional `name`, `data_dir` | required |
 | `run_mode` | how a standalone run paces itself | `kind="continuous"` |
 | `workflow` | the graph: transformers, sources, processors, sinks, links | required |
+| `store` | the persistent store: a `store "tikv"` block | none, required in cluster mode |
 | `http` | the control-plane address, or `disabled` | `bind="0.0.0.0:8080"` |
 | `observability` | log format and level, OTLP export, the inspector | pretty at `info` |
 
@@ -258,18 +259,42 @@ curl -s http://localhost:8080/ready
 {"status":"ready"}
 ```
 
+## The store block
+
+One `store "tikv"` block names the TiKV the process talks to. It needs a binary
+built with `--features tikv-store`; a `store` block without it is a refusal, not
+an ignored section.
+
+```kdl,name=The store block
+store "tikv" {
+    // One or several PD endpoints, host:port.
+    pd_endpoints "10.0.0.1:2379" "10.0.0.2:2379"
+    key_prefix "pcs"       // alphanumerics, '.', '_' and '-'; default "pcs"
+    timeout_ms 10000       // per-operation client timeout
+    lease_ttl_ms 90000     // claim lease TTL, at least 10000
+    batch_resume #false    // carry processor state across interval and one_shot runs
+}
+```
+
+What it holds depends on the mode. Standalone and stream runs persist source
+cursors and processor priors, so a restart resumes instead of replaying from the
+start. Cluster mode adds the partitions, the claims and the checkpoints, which
+is why `mode "cluster"` refuses to start without this block.
+
+`key_prefix` is the whole isolation boundary. Two deployments sharing one TiKV
+stay apart by choosing different prefixes.
+
 ## The cluster header
 
 In cluster mode the top of the document changes: drop `run_mode`, add the Raft
-timings and the peer list.
+timings and the peer list, and declare the store.
 
 ```kdl,name=The cluster header
 mode "cluster"
 bootstrap #true              // true on exactly one node, on first bring-up only
-lease_ttl_ms 30000           // must be >= 3 x election_timeout_ms
 election_timeout_ms 1500
 heartbeat_interval_ms 300
-snapshot_log_interval 10000  // snapshot every N committed log entries
+snapshot_log_interval 10000  // compact the raft log every N applied entries
 
 // Every member, including this node. node id must appear here.
 // addr is the Raft transport address, not the HTTP control-plane port.
@@ -277,6 +302,9 @@ peer id=1 addr="10.0.0.1:9000"
 peer id=2 addr="10.0.0.2:9000"
 peer id=3 addr="10.0.0.3:9000"
 ```
+
+These timings drive elections, not claims. The claim lease is
+`store "tikv" { lease_ttl_ms }`, and it is the only lease knob.
 
 The workflow that follows carries exactly one `wasm` or `plugin` node and no
 `source`, `sink` or `link`. `validate` reports `mode: cluster` once the header is
@@ -290,8 +318,8 @@ transformers, so every node above binds out of the box. For a narrower binary:
 - `service` registers no source, sink or format by itself. Each `connector-*`
   feature adds one connector, each `transformer-*` one byte format, and all of
   them imply `service` plus `inspector`.
-- `service-cluster` is `service` plus `distributed-raft`, which is what
-  `mode "cluster"` needs.
+- `service-cluster` is `service` plus `distributed-raft`. `mode "cluster"` needs
+  it and `tikv-store` together.
 - Neither implies `wasm`.
 
 <div class="note note-warn">
@@ -310,9 +338,10 @@ node.
 cargo build --release -p pcs-service --bin pcs-service \
   --no-default-features --features mimalloc,connector-file,transformer-csv,wasm
 
-# Same, plus Raft cluster mode.
+# Same, plus cluster mode.
 cargo build --release -p pcs-service --bin pcs-service \
-  --no-default-features --features mimalloc,service-cluster,connector-file,transformer-csv,wasm
+  --no-default-features \
+  --features mimalloc,service-cluster,tikv-store,connector-file,transformer-csv,wasm
 ```
 
 Then run `validate` with the binary you built: a node kind its features do not
@@ -380,12 +409,12 @@ about your component is touched until gate 2.
             <rect class="hd hd-ctl" x="0" y="58" width="430" height="8"/>
             <text class="t-lbl t-ctl" x="12" y="59">1 &nbsp;ServiceConfig::load</text>
             <text class="t-sm" x="12" y="80">read the file, substitute ${VAR}, parse the KDL strictly</text>
-            <text class="t-sm" x="12" y="94">then validate(): data_dir, peer ids, lease TTL, bind addr</text>
+            <text class="t-sm" x="12" y="94">then validate(): data_dir, peer ids, store block, bind addr</text>
             <text class="t-sm" x="12" y="108">unique node ids, link endpoints, no link cycle</text>
             <text class="t-lbl t-ctl" x="448" y="59">rejects</text>
             <text class="t-sm" x="448" y="80">a link into a source</text>
             <text class="t-sm" x="448" y="94">a duplicate node id</text>
-            <text class="t-sm" x="448" y="108">lease_ttl_ms &lt; 3x election</text>
+            <text class="t-sm" x="448" y="108">cluster with no store</text>
         </g>
         <path class="arw arw-bnd" d="M215 120 V132" marker-end="url(#svc-b)"/>
         <g class="anim anim-2">
@@ -423,7 +452,7 @@ about your component is touched until gate 2.
             <text class="t-lbl t-data" x="12" y="335">4 &nbsp;validate_schema_fingerprint</text>
             <text class="t-sm" x="12" y="356">the processor's Arrow schema fingerprint against the one</text>
             <text class="t-sm" x="12" y="370">written into this node's persisted checkpoints</text>
-            <text class="t-sm" x="12" y="384">cluster mode only: inside run_cluster, once redb is open</text>
+            <text class="t-sm" x="12" y="384">cluster mode only: inside run_cluster, once TiKV answers</text>
             <text class="t-lbl t-data" x="448" y="335">rejects</text>
             <text class="t-sm" x="448" y="356">a schema change laid</text>
             <text class="t-sm" x="448" y="370">on top of checkpoints</text>
@@ -447,7 +476,7 @@ about your component is touched until gate 2.
     </svg>
     </div>
     <div class="dgm-key">
-        <span class="k-data"><i></i> state already on disk</span>
+        <span class="k-data"><i></i> state already persisted</span>
         <span class="k-control"><i></i> config and host checks</span>
         <span class="k-boundary"><i></i> the WebAssembly boundary</span>
     </div>

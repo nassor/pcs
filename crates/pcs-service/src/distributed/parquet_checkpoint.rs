@@ -13,8 +13,8 @@
 //! - Long-lived cold storage that outlives a single pipeline run.
 //!
 //! Live distributed operation needs crash recovery and at-least-once semantics, so
-//! there [`RedbSharedStore`] is the primary store and this one is only an archival
-//! sink.
+//! there the TiKV shared store is the primary store and this one is only an
+//! archival sink.
 //!
 //! ## Limitations
 //!
@@ -38,7 +38,6 @@
 //! The Parquet file is written first, the sidecar second. [`read_checkpoint`] returns
 //! `Ok(None)` if either file is missing.
 //!
-//! [`RedbSharedStore`]: crate::distributed::RedbSharedStore
 //! [`read_checkpoint`]: CheckpointStore::load_checkpoint
 
 use std::collections::hash_map::DefaultHasher;

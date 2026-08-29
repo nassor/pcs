@@ -1,9 +1,13 @@
 
 
-# 3-node PCS fulfillment cluster.
+# 3-node PCS fulfillment cluster plus the TiKV that holds the work pool.
 #
 # node1 bootstraps the Raft cluster and runs the order generator.
 # node2 and node3 join as followers and process work claimed from the cluster.
+#
+# The PCS raft carries membership and leadership only. Master batches,
+# row-range claims and checkpoints live in TiKV, so all three nodes point at
+# the same PD endpoint and the same --key-prefix.
 #
 # All invoice output is written to the shared `data` volume under
 # /data/output/node{N}/.
@@ -18,6 +22,43 @@
 #   docker compose run --rm node1 ls /data/output/node1/
 
 services:
+  # Placement driver: the endpoint the raw TiKV client talks to.
+  pd:
+    image: pingcap/pd:v8.1.0
+    command: >-
+      --name=pd
+      --data-dir=/data/pd
+      --client-urls=http://0.0.0.0:2379
+      --peer-urls=http://0.0.0.0:2380
+      --advertise-client-urls=http://pd:2379
+      --advertise-peer-urls=http://pd:2380
+      --initial-cluster=pd=http://pd:2380
+    volumes:
+      - tikv:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2379"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  tikv:
+    image: pingcap/tikv:v8.1.0
+    command: >-
+      --addr=0.0.0.0:20160
+      --advertise-addr=tikv:20160
+      --data-dir=/data/tikv
+      --pd=pd:2379
+    volumes:
+      - tikv:/data
+    depends_on:
+      pd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 20160"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   node1:
     build:
       context: ../..
@@ -30,6 +71,8 @@ services:
       --data-dir /data/node1
       --output-dir /data/output/node1
       --peers node2:9002,node3:9003
+      --pd-endpoints pd:2379
+      --key-prefix fulfillment
       --log-json
     environment:
       RUST_LOG: "pcs=info,distributed_fulfillment=trace"
@@ -37,6 +80,9 @@ services:
       - data:/data
     ports:
       - "9001:9001"
+    depends_on:
+      tikv:
+        condition: service_healthy
     healthcheck:
       # Raft binds a TCP port; check it's accepting connections.
       test: ["CMD-SHELL", "wget -qO /dev/null --timeout=2 http://127.0.0.1:9001/ 2>&1 | grep -q '' || nc -z 127.0.0.1 9001"]
@@ -56,6 +102,8 @@ services:
       --data-dir /data/node2
       --output-dir /data/output/node2
       --peers node1:9001,node3:9003
+      --pd-endpoints pd:2379
+      --key-prefix fulfillment
       --log-json
     environment:
       RUST_LOG: "pcs=info,distributed_fulfillment=trace"
@@ -66,6 +114,8 @@ services:
     depends_on:
       node1:
         condition: service_started
+      tikv:
+        condition: service_healthy
     restart: on-failure
 
   node3:
@@ -78,6 +128,8 @@ services:
       --data-dir /data/node3
       --output-dir /data/output/node3
       --peers node1:9001,node2:9002
+      --pd-endpoints pd:2379
+      --key-prefix fulfillment
       --log-json
     environment:
       RUST_LOG: "pcs=info,distributed_fulfillment=trace"
@@ -88,7 +140,10 @@ services:
     depends_on:
       node1:
         condition: service_started
+      tikv:
+        condition: service_healthy
     restart: on-failure
 
 volumes:
   data:
+  tikv:

@@ -1,9 +1,9 @@
-//! `FulfillmentStore`: a thin wrapper around [`RedbSharedStore`].
+//! `FulfillmentStore`: a thin wrapper around [`TikvSharedStore`].
 //!
 //! [`DistributedRunner`] calls `world_factory()` for a fresh [`Dataset`] but
 //! never loads the master-batch IPC that the generator registered. This wrapper
-//! intercepts [`PartitionSource::claim_next_batch`], reads those bytes from the
-//! Raft state-machine database, and stashes them in a shared slot that
+//! intercepts [`PartitionSource::claim_next_batch`], reads those bytes back
+//! from the shared store, and stashes them in a shared slot that
 //! `world_factory` drains to hydrate real `Order` rows.
 
 use std::io::Cursor;
@@ -12,39 +12,32 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use pcs_service::PcsError;
 use pcs_service::PcsResult;
 use pcs_service::component::Component;
 use pcs_service::dataset::Dataset;
-use pcs_service::distributed::RedbSharedStore;
+use pcs_service::distributed::TikvSharedStore;
 use pcs_service::distributed::checkpoint::{Checkpoint, CheckpointStore};
-use pcs_service::distributed::consensus::state_machine::read_master_batch;
 use pcs_service::distributed::partition::{BatchClaim, PartitionSource};
 
 use crate::components::{Invoice, Order};
 use crate::resources::{FxRateTable, InventoryCatalog, NodeId, TaxRateTable};
 
-/// Wraps [`RedbSharedStore`], intercepting `claim_next_batch` to pre-load the
+/// Wraps [`TikvSharedStore`], intercepting `claim_next_batch` to pre-load the
 /// master-batch Arrow IPC into a shared slot so `world_factory` can hydrate
 /// the dataset with real `Order` rows.
 #[derive(Clone)]
 pub struct FulfillmentStore {
     /// Underlying store for all partition and checkpoint operations.
-    pub inner: Arc<RedbSharedStore>,
-    /// Read-only handle on the Raft state-machine database, the same `Arc` the
-    /// state machine owns. Passed to `read_master_batch`.
-    app_db: Arc<std::sync::Mutex<redb::Database>>,
+    pub inner: Arc<TikvSharedStore>,
     /// IPC bytes stashed by `claim_next_batch`, consumed by `world_factory`.
     pending_world_ipc: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 impl FulfillmentStore {
-    /// Construct a store. `app_db` must be the same `Arc<Mutex<Database>>` passed
-    /// to [`RedbSharedStore::multi_node`], so reads see the same committed data.
-    pub fn new(inner: Arc<RedbSharedStore>, app_db: Arc<std::sync::Mutex<redb::Database>>) -> Self {
+    /// Construct a store over a connected [`TikvSharedStore`].
+    pub fn new(inner: Arc<TikvSharedStore>) -> Self {
         Self {
             inner,
-            app_db,
             pending_world_ipc: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -111,25 +104,17 @@ impl PartitionSource for FulfillmentStore {
         let claim_opt = self.inner.claim_next_batch(instance_id).await?;
 
         if let Some(ref claim) = claim_opt {
-            let batch_id = claim.batch_id;
-            let db = Arc::clone(&self.app_db);
-
-            // The DB read blocks, so it runs on the blocking pool.
-            let ipc_opt = tokio::task::spawn_blocking(move || {
-                let db = db
-                    .lock()
-                    .map_err(|_| PcsError::store("app_db mutex poisoned"))?;
-                let record = read_master_batch(&db, batch_id)?;
-                Ok::<Option<Vec<u8>>, PcsError>(record.map(|r| r.ipc_bytes))
-            })
-            .await
-            .map_err(|e| PcsError::generic(format!("spawn_blocking: {e}")))??;
+            let ipc_opt = self
+                .inner
+                .read_master_batch(claim.batch_id)
+                .await?
+                .map(|record| record.ipc_bytes);
 
             *self.pending_world_ipc.lock().unwrap() = ipc_opt;
 
             #[cfg(feature = "tracing")]
             tracing::debug!(
-                batch_id,
+                batch_id = claim.batch_id,
                 "FulfillmentStore: stashed master-batch IPC for pipeline factory"
             );
         }
@@ -147,6 +132,10 @@ impl PartitionSource for FulfillmentStore {
 
     async fn release_claim(&self, claim_id: Uuid, instance_id: Uuid) -> PcsResult<()> {
         self.inner.release_claim(claim_id, instance_id).await
+    }
+
+    async fn reclaim_expired(&self, now_millis: u64) -> PcsResult<u32> {
+        self.inner.reclaim_expired(now_millis).await
     }
 }
 

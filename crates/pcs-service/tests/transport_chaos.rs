@@ -164,14 +164,15 @@ async fn bidi_partition_elects_and_rejoins() -> anyhow::Result<()> {
         toxi.disable_proxy(&common::RaftClusterHarness::proxy_name(peer, leader_idx))?;
     }
 
-    // The two remaining nodes hold the majority. The isolated old leader keeps
-    // reporting itself leader until it steps down, and `await_leader` returns
-    // whichever node answers first, so poll for a genuinely different leader.
+    // The two remaining nodes hold the majority. The isolated old leader never
+    // steps down (raft-rs defaults: `check_quorum = false`), so its stale
+    // self-report must be excluded: `await_leader` returns whichever node
+    // answers first, and when the isolated leader is `nodes[0]` that
+    // self-report would satisfy the poll forever. Still tolerate windows with
+    // no leader at all.
     let deadline = Instant::now() + Duration::from_secs(30);
     let _new_leader = loop {
-        if let Ok(candidate) = harness.await_leader().await
-            && candidate != first_leader
-        {
+        if let Ok(candidate) = harness.await_leader_excluding(first_leader).await {
             break candidate;
         }
         anyhow::ensure!(
@@ -223,7 +224,19 @@ async fn limit_data_truncated_frame_errors_not_panic() -> anyhow::Result<()> {
     // Nothing panicked and the cluster is still live: it elects a leader and
     // every node agrees on one applied index once the toxic clears. A
     // re-election during the disruption is an acceptable outcome.
-    await_leader_within(&harness, Duration::from_secs(15)).await?;
+    //
+    // The wait must exceed the transport's 30s circuit-open duration: a
+    // truncated replication can leave the faulted follower with an empty log,
+    // and its higher-term campaigns keep stepping down the majority's
+    // elections — raft's up-to-date vote restriction blocks the empty-log node
+    // from winning, and the deterministic 400ms election timeout synchronizes
+    // every node's retries — so the cluster can stay leaderless until
+    // reconnection succeeds. Observed once: 'timed out waiting for Raft leader
+    // election; per-node state: [node1: Follower term=53 applied=0 last_log=0
+    // leader=None; node2: Follower term=53 applied=1 last_log=1 leader=None;
+    // node3: Follower term=53 applied=1 last_log=1 leader=None]' with a 15s
+    // wait.
+    await_leader_within(&harness, Duration::from_secs(45)).await?;
     harness.await_convergence(Duration::from_secs(30)).await?;
 
     harness.shutdown().await;

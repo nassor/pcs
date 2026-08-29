@@ -65,8 +65,8 @@ brew install protobuf                       # macOS
 On Windows, take the `protoc-*-win64.zip` release from
 `github.com/protocolbuffers/protobuf/releases` and put its `bin/` on `PATH`.
 
-`ci.yml` installs it in the `test`, `distributed_chaos`, `wasm_processor` and `polyglot` jobs, the
-four that compile a `pcs-service` test or example target. A missing `protoc` surfaces as a
+`ci.yml` installs it in the `test`, `distributed_chaos`, `wasm_processor`, `polyglot` and `tikv_store` jobs, the
+five that compile a `pcs-service` test or example target. A missing `protoc` surfaces as a
 `raft-proto` build-script failure, not as a feature error, so it reads as unrelated to the change
 that triggered it.
 

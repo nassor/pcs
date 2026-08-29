@@ -57,9 +57,9 @@ header comments:
 | `standalone_polyglot.kdl` | a polyglot processor component | the polyglot build |
 | `nats.kdl` | NATS JetStream at both ends | `connector-nats,wasm` |
 | `postgresql.kdl` | PostgreSQL logical replication to a sink table | `connector-postgresql,wasm` |
-| `kafka.kdl` | Kafka source and sink | `connector-kafka` |
-| `tcp.kdl` | a live TCP ingest stream | `connector-tcp` |
-| `http.kdl` | an HTTP source spooled through a transformer | `connector-http` |
+| `kafka.kdl` | Kafka source and sink | `connector-kafka,wasm` |
+| `tcp.kdl` | a live TCP ingest stream | `connector-tcp,wasm` |
+| `http.kdl` | an HTTP source spooled through a transformer | `connector-http,transformer-csv,wasm` |
 | `tikv.kdl` | a standalone stream run backed by a TiKV store | `tikv-store,connector-file,transformer-csv` |
 | `cluster.kdl` | a three-node cluster template | `service-cluster,tikv-store,connector-file,transformer-csv,wasm` |
 
@@ -134,8 +134,8 @@ Each of these refuses to start or fails loudly; none is silently ignored.
 |---|---|
 | Config file missing | `error: Configuration error: reading config file pcs.kdl: <os error>`, exit 1 |
 | `mode "cluster"` without `service-cluster` | startup error: rebuild with `--features service-cluster`, exit 1 |
-| Cluster config without `store "tikv"` | `mode "cluster" requires a store "tikv" block: TiKV is the only cluster application-data store`, at load time |
-| `store` block without `tikv-store` | `config declares a store block, but this binary was built without the tikv-store feature`, at load time |
+| Cluster config without `store "tikv"` | ``mode "cluster" requires a `store "tikv"` block: TiKV is the only cluster application-data store``, at load time |
+| `store` block without `tikv-store` | ``config declares a `store` block, but this binary was built without the `tikv-store` feature — rebuild with `--features tikv-store``, at load time |
 | A key the service cannot honour | parse error (strict nodes) or ignored key (top level): the split is in [What is not a key](@/service/configuration.md#what-is-not-a-key) |
 | Unreachable TiKV at cluster start | the node fails to start rather than running degraded |
 | `raft-log.redb` without `bootstrap.lock` | unclean shutdown before bootstrap finished; the node refuses to start |
@@ -215,7 +215,7 @@ line and a note that cluster details are not available:
 
 ```text,name=Expected cluster status output
 node 1  mode=cluster
-Note: cluster details are not available in v1.
+Note: cluster details are not available in v1. Full Raft metrics integration is planned for v1.1.
 ```
 
 Query the raw status JSON for what is there:

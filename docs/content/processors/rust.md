@@ -37,8 +37,10 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
-description = "WASM Component Model port of the scheduler_etl example."
+# A sample processor component, not a library a downstream consumer would
+# depend on.
+publish = false
+description = "WASM Component Model port of the scheduler_etl example. Demonstrates field-granular DAG scheduling running inside a WASM processor via pcs-processor."
 
 [lib]
 crate-type = ["cdylib"]
@@ -47,8 +49,9 @@ crate-type = ["cdylib"]
 pcs-processor      = { path = "../../../crates/pcs-processor" }
 serde          = { workspace = true }
 
-# The bindings generator. Gated on wasm32 because src/lib.rs gates the generated
-# module the same way: the host build of this crate is an empty cdylib.
+# The bindings generator. Gated on wasm32 because `src/lib.rs` gates the
+# generated module the same way: the host build of this crate is an empty cdylib
+# and has no use for the generator or its proc-macro dependency tree.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wit-bindgen = { workspace = true }
 ```
@@ -415,10 +418,14 @@ reads a row until it passes.
 `run_mode` is `one_shot`, so `serve` processes the fixture once and exits:
 
 ```text,name=Expected service log for a one-shot run
-INFO pcs_service::service::standalone: iteration starting iteration=1 mode=OneShot
-INFO pcs_service::service::standalone: iteration complete iteration=1 rows_processed=5 duration_ms=2
+DEBUG pcs_service::service::standalone: iteration starting workflow=order-processing iteration=1 mode=OneShot
+DEBUG pcs_service::service::standalone: iteration complete workflow=order-processing iteration=1 rows_processed=5 duration_ms=2
 INFO pcs_service::service::standalone: one-shot mode: exiting after first iteration
 ```
+
+The two iteration lines are `debug` level, so the config's `log_level="info"`
+shows only the third: pass `--log-level debug` (or set
+`observability log_level="debug"`) to see the per-iteration lines.
 
 The sink wrote `/tmp/pcs-order-processing-out.csv`:
 

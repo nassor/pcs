@@ -15,7 +15,7 @@ component against a world and the toolchain, not the host, checks that you
 implemented it.
 
 PCS ships one world. The whole file is
-`crates/pcs-processor/wit/pipeline.wit`, 116 lines, and it ends with this:
+`crates/pcs-processor/wit/pipeline.wit`, 124 lines, and it ends with this:
 
 ```wit,name=The world pipeline.wit ends with
 package pcs:pipeline@0.3.0;
@@ -93,9 +93,10 @@ that happens to satisfy it.
         <span class="k-boundary"><i></i> the component boundary</span>
     </div>
     <figcaption class="dgm-cap">
-        The host side of both interfaces is generated. <code>bindings.rs</code> is 26 lines of
-        <code>wasmtime::component::bindgen!</code> pointed at the same WIT directory the processor
-        compiles against, so the host cannot drift from the contract.
+        The host side of both interfaces is generated. <code>bindings.rs</code> is 20 lines of
+        <code>wasmtime::component::bindgen!</code> pointed at a vendored copy of the WIT the processor
+        compiles against, with <code>tests/wit_vendored.rs</code> keeping the two copies from
+        drifting.
     </figcaption>
 </div>
 

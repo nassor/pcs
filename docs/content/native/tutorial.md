@@ -276,7 +276,7 @@ impl FxRates {
 ```
 
 A transform that does not need its own type can be a closure. `system_fn` pairs
-one `SystemMeta` with one `FnMut(&mut Dataset)`. This summary system writes a
+one `SystemMeta` with one `Fn(&mut Dataset)`. This summary system writes a
 `Summary` resource for `main` to read:
 
 ```rust,name=The summary system built with system_fn

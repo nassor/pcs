@@ -21,7 +21,7 @@
 //! (the default) every iteration passes `None` as prior and discards the
 //! output state, exactly as a build without TiKV.
 //!
-//! ## One trace per iteration
+//! ## One trace per iteration, at `debug`
 //!
 //! Each iteration opens a `workflow.batch` root span holding one `source.drain`
 //! per source, one `runtime.run` per processor, and one `sink.write` per sink,
@@ -31,6 +31,13 @@
 //! native [`Pipeline`](pcs_core::Pipeline), `processor.batch` for a WASM
 //! processor or a native plugin. That tree is the only host-side view of a
 //! pipeline whose systems run inside a guest.
+//!
+//! The whole tree is `debug`: one opens per iteration, and materialising every
+//! one of them costs more per item than the item. The default
+//! `observability log_level="info"` therefore records none of it; set
+//! `log_level="debug"` to get the per-iteration waterfall back. Error and
+//! warning events do not depend on it — each names its own `workflow`,
+//! `iteration` and node, so a failure is diagnosable at `info`.
 //!
 //! ## Example
 //!
@@ -134,6 +141,7 @@ async fn write_staged(
     sink: &mut dyn Sink,
     staged: &mut Vec<RecordBatch>,
     id: &str,
+    workflow_id: &str,
     node_stat: &mut NodeRunStats,
     stats: &mut StandaloneStats,
 ) {
@@ -148,7 +156,12 @@ async fn write_staged(
             }
             Err(_e) => {
                 #[cfg(feature = "tracing")]
-                tracing::error!(sink = id, error = %_e, "sink write error (continuing)");
+                tracing::error!(
+                    workflow = %workflow_id,
+                    sink = id,
+                    error = %_e,
+                    "sink write error (continuing)"
+                );
                 stats.iteration_errors += 1;
                 node_stat.errors += 1;
             }
@@ -160,12 +173,18 @@ async fn write_staged(
 async fn finish_sink(
     sink: &mut dyn Sink,
     id: &str,
+    workflow_id: &str,
     node_stat: &mut NodeRunStats,
     stats: &mut StandaloneStats,
 ) {
     if let Err(_e) = sink.finish().await {
         #[cfg(feature = "tracing")]
-        tracing::error!(sink = id, error = %_e, "sink finish error");
+        tracing::error!(
+            workflow = %workflow_id,
+            sink = id,
+            error = %_e,
+            "sink finish error"
+        );
         stats.iteration_errors += 1;
         node_stat.errors += 1;
     }
@@ -178,6 +197,7 @@ async fn flush_and_finish_all(
     sinks: &mut [Option<Box<dyn Sink>>],
     staged: &mut [Vec<RecordBatch>],
     ids: &[String],
+    workflow_id: &str,
     node_stats: &mut [NodeRunStats],
     stats: &mut StandaloneStats,
 ) {
@@ -189,11 +209,19 @@ async fn flush_and_finish_all(
             sink.as_mut(),
             &mut staged[i],
             &ids[i],
+            workflow_id,
             &mut node_stats[i],
             stats,
         )
         .await;
-        finish_sink(sink.as_mut(), &ids[i], &mut node_stats[i], stats).await;
+        finish_sink(
+            sink.as_mut(),
+            &ids[i],
+            workflow_id,
+            &mut node_stats[i],
+            stats,
+        )
+        .await;
     }
 }
 
@@ -337,8 +365,15 @@ pub async fn run_standalone(
         // Children name it as their explicit parent instead of entering it: the
         // loop awaits, and an entered guard held across an await would adopt
         // every span the runtime opens on this thread meanwhile.
+        //
+        // `debug`, not `info`: one tree of these opens per iteration, and the
+        // default `pcs=info` filter is what keeps a subscriber from
+        // materialising every one of them. `log_level="debug"` brings the
+        // per-iteration traces back. Every error event below therefore names
+        // its own workflow, iteration and node rather than leaning on these
+        // fields.
         #[cfg(feature = "tracing")]
-        let batch_span = tracing::info_span!(
+        let batch_span = tracing::debug_span!(
             "workflow.batch",
             workflow = %workflow_id,
             iteration = stats.iterations + 1,
@@ -348,8 +383,14 @@ pub async fn run_standalone(
         if cancel.is_cancelled() {
             #[cfg(feature = "tracing")]
             tracing::info!(parent: &batch_span, "standalone runner cancelled, draining in-flight work");
-            let flush =
-                flush_and_finish_all(&mut sinks, &mut staged, &ids, &mut node_stats, &mut stats);
+            let flush = flush_and_finish_all(
+                &mut sinks,
+                &mut staged,
+                &ids,
+                &workflow_id,
+                &mut node_stats,
+                &mut stats,
+            );
             #[cfg(feature = "tracing")]
             flush.instrument(batch_span.clone()).await;
             #[cfg(not(feature = "tracing"))]
@@ -358,8 +399,10 @@ pub async fn run_standalone(
         }
 
         let iter_start = Instant::now();
+        // Per-iteration progress, so `debug` alongside the span tree it
+        // annotates; the runner's start and shutdown lines stay at `info`.
         #[cfg(feature = "tracing")]
-        tracing::info!(parent: &batch_span, iteration = stats.iterations + 1, mode = ?run_mode, "iteration starting");
+        tracing::debug!(parent: &batch_span, workflow = %workflow_id, iteration = stats.iterations + 1, mode = ?run_mode, "iteration starting");
 
         let mut total_rows_in: u64 = 0;
         let mut cancelled_mid_pass = false;
@@ -370,7 +413,7 @@ pub async fn run_standalone(
                     let component =
                         components[i].expect("a source node always declares a component");
                     #[cfg(feature = "tracing")]
-                    let drain_span = tracing::info_span!(
+                    let drain_span = tracing::debug_span!(
                         parent: &batch_span,
                         "source.drain",
                         workflow = %workflow_id,
@@ -417,6 +460,8 @@ pub async fn run_standalone(
                                                 #[cfg(feature = "tracing")]
                                                 tracing::warn!(
                                                     parent: &batch_span,
+                                                    workflow = %workflow_id,
+                                                    iteration = stats.iterations + 1,
                                                     from = %ids[i], to = %ids[d], error = %_e,
                                                     "fan-out append error (continuing)"
                                                 );
@@ -432,7 +477,14 @@ pub async fn run_standalone(
                             }
                             Err(_e) => {
                                 #[cfg(feature = "tracing")]
-                                tracing::warn!(parent: &batch_span, source = %ids[i], error = %_e, "source drain error (continuing)");
+                                tracing::warn!(
+                                    parent: &batch_span,
+                                    workflow = %workflow_id,
+                                    iteration = stats.iterations + 1,
+                                    source = %ids[i],
+                                    error = %_e,
+                                    "source drain error (continuing)"
+                                );
                                 stats.iteration_errors += 1;
                                 node_stats[i].errors += 1;
                                 break;
@@ -479,6 +531,8 @@ pub async fn run_standalone(
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(
                                     parent: &batch_span,
+                                    workflow = %workflow_id,
+                                    iteration = stats.iterations + 1,
                                     processor = %ids[i],
                                     error = %_e,
                                     "window watermark advance error (continuing without it)"
@@ -499,7 +553,7 @@ pub async fn run_standalone(
                     // `pipeline.run` and of a processor's host-side
                     // `processor.batch`.
                     #[cfg(feature = "tracing")]
-                    let run_span = tracing::info_span!(
+                    let run_span = tracing::debug_span!(
                         parent: &batch_span,
                         "runtime.run",
                         workflow = %workflow_id,
@@ -563,6 +617,8 @@ pub async fn run_standalone(
                                         #[cfg(feature = "tracing")]
                                         tracing::warn!(
                                             parent: &batch_span,
+                                            workflow = %workflow_id,
+                                            iteration = stats.iterations + 1,
                                             processor = %ids[i],
                                             error = %_e,
                                             "persisting processor state failed (continuing)"
@@ -584,6 +640,8 @@ pub async fn run_standalone(
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!(
                                         parent: &batch_span,
+                                        workflow = %workflow_id,
+                                        iteration = stats.iterations + 1,
                                         processor = %ids[i],
                                         branch = %name,
                                         "routing decision names a branch no link carries (continuing)"
@@ -613,6 +671,8 @@ pub async fn run_standalone(
                                             #[cfg(feature = "tracing")]
                                             tracing::warn!(
                                                 parent: &batch_span,
+                                                workflow = %workflow_id,
+                                                iteration = stats.iterations + 1,
                                                 from = %ids[i], to = %ids[d], error = %_e,
                                                 "fan-out forward error (continuing)"
                                             );
@@ -640,7 +700,14 @@ pub async fn run_standalone(
                         }
                         Err(_e) => {
                             #[cfg(feature = "tracing")]
-                            tracing::error!(parent: &run_span, processor = %ids[i], error = %_e, "processor error (continuing, skipping fan-out)");
+                            tracing::error!(
+                                parent: &run_span,
+                                workflow = %workflow_id,
+                                iteration = stats.iterations + 1,
+                                processor = %ids[i],
+                                error = %_e,
+                                "processor error (continuing, skipping fan-out)"
+                            );
                             stats.iteration_errors += 1;
                             node_stats[i].errors += 1;
                             crate::metrics::instruments().workflow_error(&workflow_id);
@@ -657,7 +724,7 @@ pub async fn run_standalone(
                 NodeRunKind::Sink => {
                     let component = components[i].expect("a sink node always declares a component");
                     #[cfg(feature = "tracing")]
-                    let write_span = tracing::info_span!(
+                    let write_span = tracing::debug_span!(
                         parent: &batch_span,
                         "sink.write",
                         workflow = %workflow_id,
@@ -671,6 +738,7 @@ pub async fn run_standalone(
                         sink.as_mut(),
                         &mut staged[i],
                         &ids[i],
+                        &workflow_id,
                         &mut node_stats[i],
                         &mut stats,
                     );
@@ -687,8 +755,14 @@ pub async fn run_standalone(
         }
 
         if cancelled_mid_pass {
-            let flush =
-                flush_and_finish_all(&mut sinks, &mut staged, &ids, &mut node_stats, &mut stats);
+            let flush = flush_and_finish_all(
+                &mut sinks,
+                &mut staged,
+                &ids,
+                &workflow_id,
+                &mut node_stats,
+                &mut stats,
+            );
             #[cfg(feature = "tracing")]
             flush.instrument(batch_span.clone()).await;
             #[cfg(not(feature = "tracing"))]
@@ -709,7 +783,14 @@ pub async fn run_standalone(
             let finish = async {
                 for i in 0..n {
                     if let Some(sink) = sinks[i].as_mut() {
-                        finish_sink(sink.as_mut(), &ids[i], &mut node_stats[i], &mut stats).await;
+                        finish_sink(
+                            sink.as_mut(),
+                            &ids[i],
+                            &workflow_id,
+                            &mut node_stats[i],
+                            &mut stats,
+                        )
+                        .await;
                     }
                 }
             };
@@ -731,9 +812,12 @@ pub async fn run_standalone(
         // Every processor dataset was already cleared per-node above; a
         // source or sink node has none to clear.
 
+        // Per-iteration progress, so `debug` alongside the span tree it
+        // annotates; the runner's shutdown summary stays at `info`.
         #[cfg(feature = "tracing")]
-        tracing::info!(
+        tracing::debug!(
             parent: &batch_span,
+            workflow = %workflow_id,
             iteration = stats.iterations,
             rows_processed = stats.rows_processed,
             duration_ms = iter_ms,

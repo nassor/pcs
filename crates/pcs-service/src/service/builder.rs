@@ -29,7 +29,7 @@ use pcs_core::io::sink::Sink;
 use pcs_core::io::source::Source;
 use pcs_core::runtime::PipelineRuntime;
 
-use super::config::{NodeKind, ServiceConfig, TransformerSpec, WorkflowSpec};
+use super::config::{NodeKind, RunMode, ServiceConfig, ServiceMode, TransformerSpec, WorkflowSpec};
 #[cfg(feature = "wasm")]
 use super::loader::{LocalModuleResolver, PipelineRuntimeLoader};
 #[cfg(feature = "plugin")]
@@ -55,6 +55,30 @@ const RUNTIME_SOURCE_HELP: &str = "no runtime provided: call ServiceBuilder::wit
      or set 'module'/'library' on the node";
 #[cfg(not(any(feature = "wasm", feature = "plugin")))]
 const RUNTIME_SOURCE_HELP: &str = "no runtime provided: call ServiceBuilder::with_runtime(id, ..)";
+
+/// Whether a config-driven source is handed to the runner wrapped in
+/// [`RetryingSource`].
+///
+/// Sinks always take their wrapper: a `write_batch` the runner cannot re-drive
+/// is lost rows. A source's answer depends on who owns its error policy.
+///
+/// - Batch modes (`one_shot`, `interval`, `continuous`) and cluster mode drain
+///   a source through `drain_into_dataset`, where the first error abandons the
+///   whole iteration. The wrapper is what turns a transient failure into a
+///   retried read instead of a lost iteration.
+/// - `run_mode kind="stream"` is itself the retry loop: `run_stream` polls the
+///   source once per item, and on an error logs it, counts it in
+///   `iteration_errors` and re-polls after a cancellable
+///   `SOURCE_ERROR_BACKOFF`. Wrapping there nests a second retry loop inside
+///   the first, on the item path, with a first backoff an order of magnitude
+///   longer than the runner's own — so a stream source is handed over
+///   unwrapped and the runner's documented policy is the only one that runs.
+fn sources_take_retry_wrapper(config: &ServiceConfig) -> bool {
+    !matches!(
+        &config.mode,
+        ServiceMode::Standalone { config: sc } if sc.run_mode == RunMode::Stream
+    )
+}
 
 /// Intern `name` to a process-lifetime `&'static str`, deduplicating by
 /// content so the same component name declared on several nodes leaks once.
@@ -323,16 +347,21 @@ impl ServiceBuilder {
     /// declaration order, sharing one [`Registry`] and, when enabled, one
     /// [`Inspector`] topology across all of them.
     ///
+    /// Every sink is wrapped in a [`RetryingSink`]. Sources are wrapped in a
+    /// [`RetryingSource`] too, except under `run_mode kind="stream"`, where
+    /// the stream runner's own re-poll is already the retry loop.
+    ///
     /// # Errors
     ///
     /// Returns [`PcsError::Configuration`] if any workflow fails to build; see
     /// [`build_one`](Self::build_one) for the full list of failure modes.
     pub fn build_all(mut self, config: &ServiceConfig) -> Result<Vec<BuiltService>, PcsError> {
         let registry = Arc::new(std::mem::replace(&mut self.registry, Registry::new()));
+        let retry_sources = sources_take_retry_wrapper(config);
 
         let mut out = Vec::with_capacity(config.workflows.len());
         for workflow in &config.workflows {
-            out.push(self.build_one(&registry, workflow)?);
+            out.push(self.build_one(&registry, workflow, retry_sources)?);
         }
 
         if let Some(inspector) = &self.inspector {
@@ -365,6 +394,7 @@ impl ServiceBuilder {
         &mut self,
         registry: &Arc<Registry>,
         workflow: &WorkflowSpec,
+        retry_sources: bool,
     ) -> Result<BuiltService, PcsError> {
         let transformers = build_transformers(registry, &workflow.transformers)?;
         let order = workflow.topological_order()?;
@@ -383,7 +413,7 @@ impl ServiceBuilder {
             let (id, kind) = nodes_meta[nat_idx];
             let built = match kind {
                 NodeKind::Source => {
-                    self.build_source_node(id, workflow, registry, &transformers)?
+                    self.build_source_node(id, workflow, registry, &transformers, retry_sources)?
                 }
                 NodeKind::Sink => self.build_sink_node(id, workflow, registry, &transformers)?,
                 NodeKind::Processor => self.build_processor_node(id, workflow)?,
@@ -427,6 +457,7 @@ impl ServiceBuilder {
         workflow: &WorkflowSpec,
         registry: &Registry,
         transformers: &HashMap<String, Arc<dyn Transformer>>,
+        retry_sources: bool,
     ) -> PcsResult<BuiltNode> {
         let spec = workflow
             .sources
@@ -448,11 +479,16 @@ impl ServiceBuilder {
         if let Some(channels) = &self.channels {
             ctx = ctx.with_channels(channels.clone());
         }
-        let source = Box::new(RetryingSource::new(
-            factory.build(&spec.config, &ctx)?,
-            spec.retry.to_system_config(),
-            &spec.id,
-        ));
+        let built = factory.build(&spec.config, &ctx)?;
+        let source: Box<dyn Source> = if retry_sources {
+            Box::new(RetryingSource::new(
+                built,
+                spec.retry.to_system_config(),
+                &spec.id,
+            ))
+        } else {
+            built
+        };
         Ok(BuiltNode {
             id: spec.id.clone(),
             name: spec.name.clone(),
@@ -1182,6 +1218,94 @@ mod tests {
         };
         assert_eq!(attempts, 1, "single attempt");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "single attempt");
+    }
+
+    /// `run_mode kind="stream"` hands the source over unwrapped: `run_stream`
+    /// is itself the retry loop, so a second one inside `next_batch` would put
+    /// its 100 ms first backoff on the item path in front of the runner's own
+    /// 10 ms re-poll. The error must reach the runner as the connector raised
+    /// it, on the first attempt, not wrapped in `RetryExhausted`.
+    #[tokio::test]
+    async fn a_stream_mode_source_is_not_retry_wrapped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let workflow = flaky_workflow(RetryConfig::default(), RetryConfig::default());
+        let mut config = base_config(workflow);
+        config.mode = ServiceMode::Standalone {
+            config: StandaloneConfig {
+                run_mode: RunMode::Stream,
+            },
+        };
+        let mut service = ServiceBuilder::new()
+            .register_source(FlakySourceFactory {
+                failures: 2,
+                calls: Arc::clone(&calls),
+            })
+            .register_sink(FlakySinkFactory {
+                write_failures: 0,
+                write_calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .build_all(&config)
+            .unwrap_or_else(|e| panic!("build failed: {e}"))
+            .remove(0);
+
+        let node = service.nodes.remove(0);
+        let BuiltNodeKind::Source(mut source) = node.kind else {
+            panic!("expected a source node");
+        };
+        let err = source.next_batch().await.unwrap_err();
+        assert!(
+            !matches!(err, PcsError::RetryExhausted { .. }),
+            "a stream source's error reaches the runner unwrapped, got {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry inside next_batch"
+        );
+    }
+
+    /// The sink keeps its wrapper in stream mode: nothing re-drives a dropped
+    /// `write_batch`.
+    #[tokio::test]
+    async fn a_stream_mode_sink_keeps_its_retry_wrapper() {
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let workflow = flaky_workflow(RetryConfig::default(), RetryConfig::default());
+        let mut config = base_config(workflow);
+        config.mode = ServiceMode::Standalone {
+            config: StandaloneConfig {
+                run_mode: RunMode::Stream,
+            },
+        };
+        let mut service = ServiceBuilder::new()
+            .register_source(FlakySourceFactory {
+                failures: 0,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .register_sink(FlakySinkFactory {
+                write_failures: 1,
+                write_calls: Arc::clone(&write_calls),
+            })
+            .build_all(&config)
+            .unwrap_or_else(|e| panic!("build failed: {e}"))
+            .remove(0);
+
+        let node = service.nodes.remove(1);
+        let BuiltNodeKind::Sink(mut sink) = node.kind else {
+            panic!("expected a sink node");
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .expect("schema should build a batch");
+        sink.write_batch(&batch)
+            .await
+            .expect("retry should recover");
+        assert_eq!(
+            write_calls.load(Ordering::SeqCst),
+            2,
+            "one failure then success"
+        );
     }
 
     #[tokio::test]

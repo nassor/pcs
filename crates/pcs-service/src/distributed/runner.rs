@@ -202,8 +202,12 @@ where
             // dashboard. Children name it as their explicit parent: this body
             // awaits, and an entered guard held across an await would adopt
             // every span the runtime opens on this thread meanwhile.
+            // `debug`, not `info`: the same per-item tree the standalone and
+            // stream runners open, so it carries the same level and the
+            // default `pcs=info` filter treats every runner alike.
+            // `log_level="debug"` brings the per-claim traces back.
             #[cfg(feature = "tracing")]
-            let batch_span = tracing::info_span!(
+            let batch_span = tracing::debug_span!(
                 "workflow.batch",
                 workflow = %self.config.workflow_id,
                 claim = %claim.claim_id,
@@ -253,6 +257,7 @@ where
                             #[cfg(feature = "tracing")]
                             tracing::error!(
                                 parent: &batch_span,
+                                workflow = %self.config.workflow_id,
                                 claim_id = %claim.claim_id,
                                 error = %_e,
                                 "accumulator load failed; releasing claim for retry"
@@ -280,6 +285,7 @@ where
                             #[cfg(feature = "tracing")]
                             tracing::error!(
                                 parent: &batch_span,
+                                workflow = %self.config.workflow_id,
                                 claim_id = %claim.claim_id,
                                 error = %_e,
                                 "processor state load failed; releasing claim for retry"
@@ -315,6 +321,10 @@ where
             let claim_id = claim.claim_id;
             let claim_instance_id = claim.instance_id;
             let store_ref = &self.store;
+            // Borrowed as a local for the same reason as `store_ref`: the async
+            // block must not capture `self`.
+            #[cfg(feature = "tracing")]
+            let workflow_id_for_renewal = self.config.workflow_id.as_str();
             let renewal_branch = async {
                 loop {
                     tokio::time::sleep(renewal_interval).await;
@@ -322,6 +332,7 @@ where
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             parent: &batch_span,
+                            workflow = %workflow_id_for_renewal,
                             %claim_id,
                             error = %e,
                             "mid-execution lease renewal failed; cancelling run_on"
@@ -349,7 +360,7 @@ where
             // for a native pipeline, `processor.batch` for a processor component
             // or a native plugin.
             #[cfg(feature = "tracing")]
-            let run_span = tracing::info_span!(
+            let run_span = tracing::debug_span!(
                 parent: &batch_span,
                 "runtime.run",
                 workflow = %self.config.workflow_id,
@@ -400,6 +411,7 @@ where
                 #[cfg(feature = "tracing")]
                 tracing::error!(
                     parent: &batch_span,
+                    workflow = %self.config.workflow_id,
                     claim_id = %claim.claim_id,
                     error = %e,
                     "checkpoint save failed; releasing claim for retry"
@@ -420,6 +432,7 @@ where
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             parent: &batch_span,
+                            workflow = %self.config.workflow_id,
                             claim_id = %claim.claim_id,
                             error = %e,
                             "accumulator save failed; releasing claim for retry"
@@ -450,6 +463,7 @@ where
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             parent: &batch_span,
+                            workflow = %self.config.workflow_id,
                             claim_id = %claim.claim_id,
                             error = %e,
                             "processor state save failed; releasing claim for retry"
@@ -466,6 +480,7 @@ where
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         parent: &batch_span,
+                        workflow = %self.config.workflow_id,
                         claim_id = %claim.claim_id,
                         error = %e,
                         "skipping ack: claim was released on a post-run persist failure"

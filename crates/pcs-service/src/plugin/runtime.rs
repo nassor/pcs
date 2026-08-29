@@ -235,8 +235,13 @@ impl NativePluginRuntime {
         // The processor's span in the host-side trace. The body has no
         // `.await`, so a plain guard is correct and the plugin's own
         // `log`/`metric` callbacks land inside it.
+        //
+        // `debug`, not `info`: one of these opens per batch under the runner's
+        // own per-item tree, and the default `pcs=info` filter is what keeps a
+        // subscriber from materialising every one. A plugin's own `log`
+        // records keep their declared level and stay visible without it.
         #[cfg(feature = "tracing")]
-        let batch_span = tracing::info_span!(
+        let batch_span = tracing::debug_span!(
             "processor.batch",
             workflow = %self.workflow_id,
             processor = %self.processor_id,

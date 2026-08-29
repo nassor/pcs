@@ -246,12 +246,20 @@ impl<'a> Attempts<'a> {
         self.attempt as u32
     }
 
-    /// The span covering the attempt about to run.
+    /// The span covering the attempt about to run, or a disabled span for the
+    /// first attempt.
     ///
     /// Innermost of the four spans `pcs-core` opens, below `system.execute`: a
-    /// stage that looks slow is usually a system being retried.
+    /// stage that looks slow is usually a system being retried. A first attempt
+    /// carries no such explanation, and a subscriber that captures every span
+    /// pays for one per operation whatever the outcome, so the first attempt
+    /// runs under [`Span::none`](tracing::Span::none) and only a retry opens a
+    /// recorded span.
     #[cfg(feature = "tracing")]
     fn span(&self) -> tracing::Span {
+        if self.attempt == 0 {
+            return tracing::Span::none();
+        }
         info_span!(
             "task_attempt",
             attempt = self.attempt + 1,
@@ -300,8 +308,9 @@ impl<'a> Attempts<'a> {
 /// have no async timer, so delays are skipped and retries are immediate; use
 /// [`run_with_retries_blocking`] from a blocking thread.
 ///
-/// Each attempt runs inside a `task_attempt` span carrying `attempt` and
-/// `max_attempts` under the `tracing` feature.
+/// Each retry after the first attempt runs inside a `task_attempt` span
+/// carrying `attempt` and `max_attempts` under the `tracing` feature; a first
+/// attempt that succeeds opens no span.
 ///
 /// # Example
 ///

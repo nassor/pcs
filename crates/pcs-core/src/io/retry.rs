@@ -12,9 +12,10 @@
 //! permanent error is a bounded backoff window; a [`SystemConfig`] with
 //! [`RetryMode::None`] (one attempt) disables retrying.
 //!
-//! The host's `ServiceBuilder` applies these wrappers to every config-driven
-//! source and sink in `pcs-service`. An embedder that calls a factory directly
-//! gets the wrapper only if it constructs one itself.
+//! The host's `ServiceBuilder` applies these wrappers in `pcs-service`: every
+//! config-driven sink, and every config-driven source except in stream mode,
+//! where the runner's own re-poll is the retry loop. An embedder that calls a
+//! factory directly gets the wrapper only if it constructs one itself.
 
 use std::sync::Arc;
 
@@ -125,6 +126,20 @@ impl<S: Sink + 'static> Sink for RetryingSink<S> {
     }
 }
 
+/// The span covering one attempt, or a disabled span for the first.
+///
+/// A first attempt has no retry to explain, and every one of these wrappers
+/// sits on a per-batch connector call, so a subscriber that records every span
+/// would pay for one per batch per node to report `attempt = 1`. Only a retry
+/// opens a recorded span; `Span::none` costs nothing to enter.
+#[cfg(feature = "tracing")]
+fn attempt_span(attempt: usize, max_attempts: usize) -> tracing::Span {
+    if attempt == 0 {
+        return tracing::Span::none();
+    }
+    tracing::info_span!("task_attempt", attempt = attempt + 1, max_attempts)
+}
+
 /// One `next_batch` pass through the retry policy, returning the batch and the
 /// number of retries consumed.
 ///
@@ -143,7 +158,7 @@ async fn retry_source_next_batch(
     loop {
         let result = {
             #[cfg(feature = "tracing")]
-            let span = tracing::info_span!("task_attempt", attempt = attempt + 1, max_attempts);
+            let span = attempt_span(attempt, max_attempts);
             #[cfg(feature = "tracing")]
             let result = inner.next_batch().instrument(span).await;
             #[cfg(not(feature = "tracing"))]
@@ -188,7 +203,7 @@ async fn retry_sink_write_batch(
     loop {
         let result = {
             #[cfg(feature = "tracing")]
-            let span = tracing::info_span!("task_attempt", attempt = attempt + 1, max_attempts);
+            let span = attempt_span(attempt, max_attempts);
             #[cfg(feature = "tracing")]
             let result = inner.write_batch(batch).instrument(span).await;
             #[cfg(not(feature = "tracing"))]
@@ -229,7 +244,7 @@ async fn retry_sink_finish(config: &SystemConfig, inner: &mut dyn Sink) -> Resul
     loop {
         let result = {
             #[cfg(feature = "tracing")]
-            let span = tracing::info_span!("task_attempt", attempt = attempt + 1, max_attempts);
+            let span = attempt_span(attempt, max_attempts);
             #[cfg(feature = "tracing")]
             let result = inner.finish().instrument(span).await;
             #[cfg(not(feature = "tracing"))]

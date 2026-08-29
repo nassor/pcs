@@ -100,6 +100,11 @@ fn wall_clock_ms() -> u64 {
 /// Mirrors [`run_standalone`](super::standalone::run_standalone): log, count in
 /// `iteration_errors`, continue with the next item. A source error
 /// additionally backs off for 10 ms (cancellable) to avoid a hot error loop.
+///
+/// The per-item span tree (`workflow.batch`, `runtime.run`, `sink.write`) is
+/// `debug`, so the default `log_level="info"` records none of it. Every error
+/// and warning here therefore names its own `workflow`, `iteration` and node
+/// rather than relying on a parent span's fields.
 pub async fn run_stream(
     built: BuiltService,
     cancel: CancellationToken,
@@ -273,7 +278,13 @@ pub async fn run_stream(
             Ok(Some(batch)) => batch,
             Err(_e) => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(source = %ids[source_index], error = %_e, "stream source error (continuing)");
+                tracing::warn!(
+                    workflow = %workflow_id,
+                    iteration = stats.iterations + 1,
+                    source = %ids[source_index],
+                    error = %_e,
+                    "stream source error (continuing)"
+                );
                 stats.iteration_errors += 1;
                 node_stats[source_index].errors += 1;
                 tokio::select! {
@@ -289,8 +300,15 @@ pub async fn run_stream(
 
         // The root span opens once the item is in hand, so its duration is the
         // item's latency and not the wait for input before it.
+        //
+        // `debug`, not `info`: one tree of these opens per item, and the
+        // default `pcs=info` filter is what keeps a subscriber from
+        // materialising every one of them. `log_level="debug"` brings the
+        // per-item traces back. Every error event below therefore names its
+        // own workflow, iteration and node rather than leaning on these
+        // fields.
         #[cfg(feature = "tracing")]
-        let batch_span = tracing::info_span!(
+        let batch_span = tracing::debug_span!(
             "workflow.batch",
             workflow = %workflow_id,
             iteration = stats.iterations + 1,
@@ -318,6 +336,7 @@ pub async fn run_stream(
             {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
+                    workflow = %workflow_id,
                     source = %ids[source_index],
                     error = %_e,
                     "persisting source cursor failed (continuing; at-least-once replay covers it)"
@@ -339,7 +358,15 @@ pub async fn run_stream(
                         .append_record_batch(component, batch.clone())
                     {
                         #[cfg(feature = "tracing")]
-                        tracing::warn!(parent: &batch_span, from = %ids[source_index], to = %ids[d], error = %_e, "fan-out append error (continuing)");
+                        tracing::warn!(
+                            parent: &batch_span,
+                            workflow = %workflow_id,
+                            iteration = stats.iterations,
+                            from = %ids[source_index],
+                            to = %ids[d],
+                            error = %_e,
+                            "fan-out append error (continuing)"
+                        );
                         stats.iteration_errors += 1;
                     }
                 }
@@ -384,6 +411,8 @@ pub async fn run_stream(
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(
                                     parent: &batch_span,
+                                    workflow = %workflow_id,
+                                    iteration = stats.iterations,
                                     processor = %ids[i],
                                     error = %_e,
                                     "window watermark advance error (continuing without it)"
@@ -400,7 +429,7 @@ pub async fn run_stream(
                         .expect("processor node keeps its dataset")
                         .rows() as u64;
                     #[cfg(feature = "tracing")]
-                    let run_span = tracing::info_span!(
+                    let run_span = tracing::debug_span!(
                         parent: &batch_span,
                         "runtime.run",
                         workflow = %workflow_id,
@@ -445,6 +474,7 @@ pub async fn run_stream(
                                 if let Err(_e) = result {
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!(
+                                        workflow = %workflow_id,
                                         processor = %ids[i],
                                         error = %_e,
                                         "persisting processor state failed (continuing)"
@@ -473,6 +503,8 @@ pub async fn run_stream(
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!(
                                         parent: &batch_span,
+                                        workflow = %workflow_id,
+                                        iteration = stats.iterations,
                                         processor = %ids[i],
                                         branch = %name,
                                         "routing decision names a branch no link carries (continuing)"
@@ -500,7 +532,15 @@ pub async fn run_stream(
                                             .expect("downstream processor dataset");
                                         if let Err(_e) = src.forward_into(dst) {
                                             #[cfg(feature = "tracing")]
-                                            tracing::warn!(parent: &batch_span, from = %ids[i], to = %ids[d], error = %_e, "fan-out forward error (continuing)");
+                                            tracing::warn!(
+                                                parent: &batch_span,
+                                                workflow = %workflow_id,
+                                                iteration = stats.iterations,
+                                                from = %ids[i],
+                                                to = %ids[d],
+                                                error = %_e,
+                                                "fan-out forward error (continuing)"
+                                            );
                                             stats.iteration_errors += 1;
                                         }
                                     }
@@ -525,7 +565,14 @@ pub async fn run_stream(
                         }
                         Err(_e) => {
                             #[cfg(feature = "tracing")]
-                            tracing::error!(parent: &run_span, processor = %ids[i], error = %_e, "stream processor error (dropping item for this node)");
+                            tracing::error!(
+                                parent: &run_span,
+                                workflow = %workflow_id,
+                                iteration = stats.iterations,
+                                processor = %ids[i],
+                                error = %_e,
+                                "stream processor error (dropping item for this node)"
+                            );
                             stats.iteration_errors += 1;
                             node_stats[i].errors += 1;
                             crate::metrics::instruments().workflow_error(&workflow_id);
@@ -540,7 +587,7 @@ pub async fn run_stream(
                 NodeRunKind::Sink => {
                     let component = components[i].expect("a sink node always declares a component");
                     #[cfg(feature = "tracing")]
-                    let write_span = tracing::info_span!(
+                    let write_span = tracing::debug_span!(
                         parent: &batch_span,
                         "sink.write",
                         workflow = %workflow_id,
@@ -560,7 +607,14 @@ pub async fn run_stream(
                             }
                             Err(_e) => {
                                 #[cfg(feature = "tracing")]
-                                tracing::error!(parent: &write_span, sink = %ids[i], error = %_e, "stream sink write error (continuing)");
+                                tracing::error!(
+                                    parent: &write_span,
+                                    workflow = %workflow_id,
+                                    iteration = stats.iterations,
+                                    sink = %ids[i],
+                                    error = %_e,
+                                    "stream sink write error (continuing)"
+                                );
                                 stats.iteration_errors += 1;
                                 node_stats[i].errors += 1;
                             }
@@ -575,7 +629,7 @@ pub async fn run_stream(
         }
 
         if cancelled_mid_item {
-            finish_all_sinks(&mut sinks, &ids, &mut node_stats, &mut stats).await;
+            finish_all_sinks(&mut sinks, &ids, &workflow_id, &mut node_stats, &mut stats).await;
             stats.total_duration_ms = start.elapsed().as_millis() as u64;
             stats.nodes = node_stats.clone();
             publish(&live_stats, &stats).await;
@@ -598,7 +652,7 @@ pub async fn run_stream(
         }
     }
 
-    finish_all_sinks(&mut sinks, &ids, &mut node_stats, &mut stats).await;
+    finish_all_sinks(&mut sinks, &ids, &workflow_id, &mut node_stats, &mut stats).await;
     stats.total_duration_ms = start.elapsed().as_millis() as u64;
     stats.nodes = node_stats.clone();
     publish(&live_stats, &stats).await;
@@ -622,6 +676,7 @@ pub async fn run_stream(
 async fn finish_all_sinks(
     sinks: &mut [Option<Box<dyn Sink>>],
     ids: &[String],
+    workflow_id: &str,
     node_stats: &mut [NodeRunStats],
     stats: &mut StandaloneStats,
 ) {
@@ -631,7 +686,12 @@ async fn finish_all_sinks(
         };
         if let Err(_e) = sink.finish().await {
             #[cfg(feature = "tracing")]
-            tracing::error!(sink = %ids[i], error = %_e, "stream sink finish error");
+            tracing::error!(
+                workflow = %workflow_id,
+                sink = %ids[i],
+                error = %_e,
+                "stream sink finish error"
+            );
             stats.iteration_errors += 1;
             node_stats[i].errors += 1;
         }

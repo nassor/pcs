@@ -18,19 +18,31 @@
 //! inspector recovers it by grouping retained `pipeline.stage` /
 //! `system.execute` records on their `stage` / `system` field.
 //!
-//! Every closed span is captured, whatever its name. Nine exist:
+//! Every closed span the subscriber's `EnvFilter` admits is captured, whatever
+//! its name. Nine exist, and their level decides which of them the default
+//! `pcs=info` filter ever reaches this layer:
 //!
-//! | span | opened by | fields |
-//! |---|---|---|
-//! | `pipeline.batch` | the runners | `iteration` or `claim`, `rows` |
-//! | `source.drain` | the runners | `source`, `component`, `rows` |
-//! | `runtime.run` | the runners | `runtime`, `rows_in`, `rows_out` |
-//! | `sink.write` | the runners | `sink`, `component`, `rows` |
-//! | `processor.batch` | `wasm::runner`, `plugin::runtime` | `processor`, `stage`, `rows_in`, `rows_out`, `systems_run`, `retries`, wall time |
-//! | `pipeline.run` | `pcs-core` | `pipeline`, `stages`, `rows` |
-//! | `pipeline.stage` | `pcs-core` | `stage`, `systems` |
-//! | `system.execute` | `pcs-core` | `system` |
-//! | `task_attempt` | `pcs-core` | `attempt`, `max_attempts` |
+//! | span | level | opened by | fields |
+//! |---|---|---|---|
+//! | `workflow.batch` | `debug` | the runners | `workflow`, `iteration` or `claim`, `rows` |
+//! | `source.drain` | `debug` | the runners | `source`, `component`, `rows` |
+//! | `runtime.run` | `debug` | the runners | `runtime`, `rows_in`, `rows_out` |
+//! | `sink.write` | `debug` | the runners | `sink`, `component`, `rows` |
+//! | `processor.batch` | `debug` | `wasm::runner`, `plugin::runtime` | `processor`, `stage`, `rows_in`, `rows_out`, `systems_run`, `retries`, wall time |
+//! | `pipeline.run` | `info` | `pcs-core` | `pipeline`, `stages`, `rows` |
+//! | `pipeline.stage` | `info` | `pcs-core` | `stage`, `systems` |
+//! | `system.execute` | `info` | `pcs-core` | `system` |
+//! | `task_attempt` | `info`, retries only | `pcs-core` | `attempt`, `max_attempts` |
+//!
+//! The five `debug` spans are the per-item runner tree: one whole tree opens
+//! per item, so at `log_level="info"` none of them is materialised. What the
+//! Traces tab shows there is rooted at `pipeline.run` instead, because
+//! `pcs-core`'s spans stay at `info` and the outermost surviving span becomes
+//! the root. `log_level="debug"` restores the runner tree above it and with it
+//! the whole per-item waterfall. Error and warning events raised by the
+//! runners carry their own `workflow`, `iteration` and node fields for exactly
+//! this reason: they are root events at `info`, and the Logs tab is where they
+//! are read.
 //!
 //! The four `pcs-core` names are behind its `tracing` feature, and a processor
 //! compiles without it, so a WASM stage contributes `processor.batch` and

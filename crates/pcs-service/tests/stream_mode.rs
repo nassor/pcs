@@ -408,7 +408,6 @@ async fn stream_rotates_round_robin_across_two_sources() {
 }
 
 /// One frame = u32 big-endian length + one Arrow IPC stream payload.
-
 /// A live source that opens its "subscription" on its first poll, then blocks
 /// for data — the `NatsSource` lifecycle the stream runner must prime. The
 /// flag is what a publisher would observe before publishing: a core-NATS
@@ -476,8 +475,7 @@ async fn stream_primes_every_source_before_blocking_on_any() {
         window: None,
     };
     let (sink, mut rx) = channel_sink(Arc::clone(&schema), 16);
-    let (service, _seen) =
-        built_service(vec![source_a, source_b], vec![sink], Arc::clone(&schema));
+    let (service, _seen) = built_service(vec![source_a, source_b], vec![sink], Arc::clone(&schema));
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -505,12 +503,10 @@ async fn stream_primes_every_source_before_blocking_on_any() {
             // B's subscription is open now: publish to B before A ever
             // receives a message — the ordering core NATS used to drop — and
             // assert the message arrives.
-            tx_b
-                .send(make_batch(Arc::clone(&schema), &[100]))
+            tx_b.send(make_batch(Arc::clone(&schema), &[100]))
                 .await
                 .unwrap();
-            tx_a
-                .send(make_batch(Arc::clone(&schema), &[1]))
+            tx_a.send(make_batch(Arc::clone(&schema), &[1]))
                 .await
                 .unwrap();
 

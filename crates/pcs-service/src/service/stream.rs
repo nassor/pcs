@@ -259,7 +259,9 @@ pub async fn run_stream(
     let mut prefetched: Vec<Option<RecordBatch>> = vec![None; n];
     let mut priming = Vec::with_capacity(source_indices.len());
     for &si in &source_indices {
-        let mut source = sources[si].take().expect("the stream source keeps its source");
+        let mut source = sources[si]
+            .take()
+            .expect("the stream source keeps its source");
         priming.push(async move {
             let outcome = tokio::time::timeout(SOURCE_PRIME_TIMEOUT, source.next_batch()).await;
             (si, source, outcome)

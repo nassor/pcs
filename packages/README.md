@@ -30,6 +30,11 @@ runtime, not additional runtime packages.
 
 Everything but Go is a GitHub Release asset of the `sdk-v0.1.0` tag. Go
 resolves through the module proxy from the `packages/pcs-sdk-go/v0.1.0` tag.
+The `sdk-v0.1.0` release has not been cut yet: no tag or release exists on
+GitHub, so these install commands fail until the Release procedure below is
+run. `cargo xtask pack-sdk` already builds every artifact into
+`target/arrow-ipc-dist/`; the commands show the exact names and coordinates
+the release will serve.
 
 ```bash
 # Go

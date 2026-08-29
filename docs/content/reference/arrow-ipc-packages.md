@@ -36,6 +36,11 @@ The Python wheel, the npm tarball, the NuGet package and a tarball of the Maven
 repository are assets of the `sdk-v0.1.0` GitHub release. Go resolves through
 the module proxy from the `packages/pcs-sdk-go/v0.1.0` tag, and Kotlin resolves
 from the Maven repository this site serves.
+The `sdk-v0.1.0` release has not been cut yet: no tag or release exists on
+GitHub, so the Go, Python, TypeScript and C# install commands below fail
+until the release is created. The Kotlin Maven repository is live: this site
+serves `pcs-sdk-kt` and `pcs-sdk-kt-ksp` 0.1.0 today. The commands show the
+exact names and coordinates the release will serve.
 
 ## Install
 

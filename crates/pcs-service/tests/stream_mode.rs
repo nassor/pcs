@@ -6,7 +6,7 @@
 
 #![cfg(feature = "service")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 use pcs_connector_channel::{ChannelSink, ChannelSource};
 use pcs_connector_tcp::TcpIngestSource;
+use pcs_core::error::PcsError;
+use pcs_core::io::source::Source;
 use pcs_core::runtime::PipelineRuntime;
 use pcs_core::{Dataset, PcsResult};
 use pcs_service::service::builder::{BuiltEdge, BuiltNode, BuiltNodeKind, BuiltService};
@@ -406,6 +408,150 @@ async fn stream_rotates_round_robin_across_two_sources() {
 }
 
 /// One frame = u32 big-endian length + one Arrow IPC stream payload.
+
+/// A live source that opens its "subscription" on its first poll, then blocks
+/// for data — the `NatsSource` lifecycle the stream runner must prime. The
+/// flag is what a publisher would observe before publishing: a core-NATS
+/// message published while the flag is still down is dropped by the server.
+struct SubscribeOnFirstPollSource {
+    inner: ChannelSource,
+    subscribed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Source for SubscribeOnFirstPollSource {
+    fn schema(&self) -> Arc<Schema> {
+        self.inner.schema()
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
+        self.subscribed.store(true, Ordering::SeqCst);
+        self.inner.next_batch().await
+    }
+}
+
+/// The windowing e2e's startup race, at the runner level: two live sources
+/// feeding one processor (the two core-NATS fan-in subjects), with the first
+/// message published on the second subject before the first subject ever
+/// receives one. Core NATS is at-most-once: a message published with no
+/// subscriber is dropped, so the second source's subscription must open while
+/// the runner is parked on the first source with no data. The runner primes
+/// every source's first poll at start; assert the second source subscribes
+/// while the first is idle, then that the message published to it is
+/// delivered rather than lost.
+#[tokio::test]
+async fn stream_primes_every_source_before_blocking_on_any() {
+    let schema = test_schema();
+    let (tx_a, rx_a) = mpsc::channel(4);
+    let (tx_b, rx_b) = mpsc::channel(4);
+    let subscribed_a = Arc::new(AtomicBool::new(false));
+    let subscribed_b = Arc::new(AtomicBool::new(false));
+
+    let source_a = BuiltNode {
+        id: next_id("fanin_a"),
+        name: None,
+        type_name: "SubscribeOnFirstPollSource".to_string(),
+        component: Some(COMP),
+        kind: BuiltNodeKind::Source(Box::new(SubscribeOnFirstPollSource {
+            inner: ChannelSource::from_receiver(Arc::clone(&schema), rx_a),
+            subscribed: Arc::clone(&subscribed_a),
+        })),
+        downstream: Vec::new(),
+        artifact: None,
+        #[cfg(feature = "windows")]
+        window: None,
+    };
+    let source_b = BuiltNode {
+        id: next_id("fanin_b"),
+        name: None,
+        type_name: "SubscribeOnFirstPollSource".to_string(),
+        component: Some(COMP),
+        kind: BuiltNodeKind::Source(Box::new(SubscribeOnFirstPollSource {
+            inner: ChannelSource::from_receiver(Arc::clone(&schema), rx_b),
+            subscribed: Arc::clone(&subscribed_b),
+        })),
+        downstream: Vec::new(),
+        artifact: None,
+        #[cfg(feature = "windows")]
+        window: None,
+    };
+    let (sink, mut rx) = channel_sink(Arc::clone(&schema), 16);
+    let (service, _seen) =
+        built_service(vec![source_a, source_b], vec![sink], Arc::clone(&schema));
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let local = LocalSet::new();
+    let handle =
+        local.spawn_local(async move { run_stream(service, cancel_clone, None, None).await });
+
+    let stats = local
+        .run_until(async move {
+            // The core of the race: B must open its subscription while A's
+            // first poll is parked with no data on it. Before the prime, the
+            // runner never got here — it blocked on A forever, so B stayed
+            // unsubscribed and core NATS dropped B's first message.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !subscribed_b.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "source B must open its subscription while source A is parked: \
+                 the runner primes every source's first poll before blocking on any",
+            );
+
+            // B's subscription is open now: publish to B before A ever
+            // receives a message — the ordering core NATS used to drop — and
+            // assert the message arrives.
+            tx_b
+                .send(make_batch(Arc::clone(&schema), &[100]))
+                .await
+                .unwrap();
+            tx_a
+                .send(make_batch(Arc::clone(&schema), &[1]))
+                .await
+                .unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut got_a = false;
+            let mut got_b = false;
+            while !(got_a && got_b) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "sink must receive both fan-in messages, got a={got_a} b={got_b}"
+                );
+                let batch = recv_timeout(&mut rx).await;
+                for value in batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 column")
+                {
+                    match value.expect("int64 value") {
+                        1 => got_a = true,
+                        100 => got_b = true,
+                        other => panic!("unexpected value {other}"),
+                    }
+                }
+            }
+
+            // EOF both sources so the runner exits cleanly with stats.
+            drop(tx_a);
+            drop(tx_b);
+            handle.await.unwrap().unwrap()
+        })
+        .await;
+
+    assert_eq!(stats.rows_processed, 2, "no fan-in message may be lost");
+    assert_eq!(stats.iteration_errors, 0);
+    assert!(
+        subscribed_a.load(Ordering::SeqCst),
+        "the runner must have polled source A too"
+    );
+}
+
 fn frame(schema: &Arc<Schema>, values: &[i64]) -> Vec<u8> {
     let batch = make_batch(Arc::clone(schema), values);
     let mut payload: Vec<u8> = Vec::new();

@@ -397,7 +397,9 @@ async fn a_queue_group_splits_a_subject_between_two_sources() {
         ndjson(),
     )
     .expect("second source builds");
-    // Both subscribe on their first poll, which must happen before publishing.
+    // A first poll subscribes; the stream runner primes every source's first
+    // poll before the round-robin blocks on any of them, so both
+    // subscriptions exist before publishing starts.
     assert!(first.next_batch().await.expect("empty poll").is_none());
     assert!(second.next_batch().await.expect("empty poll").is_none());
 

@@ -101,8 +101,12 @@ enum Started {
 ///
 /// Connects lazily: [`new`](Self::new) validates the config and opens nothing,
 /// so `pcs-service validate` stays broker-free. The first
-/// [`next_batch`](Source::next_batch) connects, provisions the stream when asked
-/// to, and creates the subscription or consumer.
+/// [`next_batch`](Source::next_batch) connects, provisions the stream when
+/// asked to, and creates the subscription or consumer. The stream runner
+/// primes every source's first poll at start, so a fan-in source's
+/// subscription is open before the rotation blocks on any one of them; core
+/// NATS drops a message published with no subscriber, so without that prime
+/// the first message on a second fan-in subject is lost.
 pub struct NatsSource {
     cfg: NatsSourceConfig,
     schema: Arc<Schema>,

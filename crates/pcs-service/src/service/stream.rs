@@ -77,6 +77,15 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 /// Backoff after a source error, so a permanently failing source cannot spin
 /// the loop at full speed.
 const SOURCE_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// How long a source's first poll may wait before the runner rotates to the
+/// next source.
+///
+/// Long enough for a connector to open its subscriptions (connect + subscribe
+/// on `NatsSource`); short enough that a live pipeline does not linger on an
+/// idle first source while its fan-in peers wait for their first poll.
+const SOURCE_PRIME_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Unix milliseconds now (wall clock), for persisted cursor timestamps.
 fn wall_clock_ms() -> u64 {
     std::time::SystemTime::now()
@@ -237,6 +246,56 @@ pub async fn run_stream(
         "stream runner starting"
     );
 
+    // Prime every source's first poll before the rotation blocks on any one
+    // of them. A connector that subscribes lazily (`NatsSource` opens its
+    // core subscriptions on the first `next_batch`) parks the loop for data
+    // right after subscribing, so an unbounded first poll on the first source
+    // would leave the fan-in sources behind it unsubscribed while messages
+    // land on their subjects. Core NATS is at-most-once: a message published
+    // with no subscriber is dropped. The prime runs the first polls
+    // concurrently under `SOURCE_PRIME_TIMEOUT`; a timeout means the source
+    // opened its subscriptions and is idle, and a batch that arrived during
+    // the prime is handed to the rotation instead of being dropped.
+    let mut prefetched: Vec<Option<RecordBatch>> = vec![None; n];
+    let mut priming = Vec::with_capacity(source_indices.len());
+    for &si in &source_indices {
+        let mut source = sources[si].take().expect("the stream source keeps its source");
+        priming.push(async move {
+            let outcome = tokio::time::timeout(SOURCE_PRIME_TIMEOUT, source.next_batch()).await;
+            (si, source, outcome)
+        });
+    }
+    for (si, source, outcome) in futures::future::join_all(priming).await {
+        sources[si] = Some(source);
+        match outcome {
+            Ok(Ok(Some(batch))) => prefetched[si] = Some(batch),
+            Ok(Ok(None)) => {
+                #[cfg(feature = "tracing")]
+                tracing::info!(
+                    source = %ids[si],
+                    "stream source reached EOF during prime"
+                );
+                exhausted[si] = true;
+                remaining_sources -= 1;
+            }
+            Ok(Err(_e)) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    workflow = %workflow_id,
+                    source = %ids[si],
+                    error = %_e,
+                    "stream source error during prime (continuing)"
+                );
+                stats.iteration_errors += 1;
+                node_stats[si].errors += 1;
+            }
+            // The first poll spent its whole budget without a message: the
+            // source opened whatever it needs and is idle, exactly the state
+            // the loop wants.
+            Err(_elapsed) => {}
+        }
+    }
+
     loop {
         if remaining_sources == 0 {
             break;
@@ -252,15 +311,22 @@ pub async fn run_stream(
             }
         };
 
+        // A batch the source already returned during its primed first poll is
+        // handed to the rotation here; only sources with nothing pending are
+        // actually polled.
         let source = sources[source_index]
             .as_mut()
             .expect("the stream source keeps its source");
-        let next = tokio::select! {
-            r = source.next_batch() => r,
-            _ = cancel.cancelled() => {
-                #[cfg(feature = "tracing")]
-                tracing::info!("stream runner cancelled while waiting for input");
-                break;
+        let next = if let Some(batch) = prefetched[source_index].take() {
+            Ok(Some(batch))
+        } else {
+            tokio::select! {
+                r = source.next_batch() => r,
+                _ = cancel.cancelled() => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!("stream runner cancelled while waiting for input");
+                    break;
+                }
             }
         };
 

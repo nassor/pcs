@@ -70,7 +70,7 @@ TypeScript. `jco componentize` bundles with Rolldown under
 `exports` map and compiled JavaScript so a bare specifier resolves anyway:
 
 ```bash,name=Install the TypeScript SDK
-npm install @nassor/pcs-sdk
+npm install ./nassor-pcs-sdk-0.1.0.tgz
 ```
 
 Kotlin, from the Maven repository served by this site, with the KSP processor

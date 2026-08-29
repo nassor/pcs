@@ -104,7 +104,9 @@ conformance corpus at `packages/arrow-ipc-conformance/`.
 1. Bump `VERSION`, the five manifests that carry a version
    (`pcs-sdk-py/pyproject.toml`, `pcs-sdk-ts/package.json`,
    `pcs-sdk-kt/build.gradle.kts`, `pcs-sdk-kt-ksp/build.gradle.kts`,
-   `pcs-sdk-cs/Pcs.Sdk.csproj`) and the Kotlin stage's
+   `pcs-sdk-cs/Pcs.Sdk.csproj`), the KSP processor's runtime dependency
+   `implementation("io.github.nassor:pcs-sdk-kt:...")` in
+   `pcs-sdk-kt-ksp/build.gradle.kts`, and the Kotlin stage's
    `implementation("io.github.nassor:pcs-sdk-kt:...")` and
    `add("kspWasmWasi", "io.github.nassor:pcs-sdk-kt-ksp:...")` lines in
    `examples/polyglot/stages/kotlin-fee/build.gradle.kts`. Go carries no manifest

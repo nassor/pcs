@@ -215,9 +215,9 @@ variant run-error {
 
 | variant | host behaviour |
 |---|---|
-| `retryable(string)` | Releases the claim and retries on the next tick |
-| `permanent(string)` | Acks the claim, logs, surfaces it to `/status` |
-| `schema-mismatch(string)` | Refuses to replay. **Must never come out of `run-batch`** |
+| `retryable(string)` | Maps to `PcsError::SystemExecution`; the runner releases the claim and returns the error |
+| `permanent(string)` | Same error path: `PcsError::SystemExecution`; the claim is released and the error returned |
+| `schema-mismatch(string)` | **Must never come out of `run-batch`** |
 
 `schema-mismatch` is reserved for a future load-time check. A schema problem
 discovered mid-batch is a processor bug and must be collapsed into `permanent`.

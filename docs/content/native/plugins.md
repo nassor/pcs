@@ -239,13 +239,13 @@ embedded schema constants have drifted from what it declares. All of it happens
 in the constructor, so a running service never holds a plugin whose schemas it
 has not verified.
 
-A plugin returns a status per batch. `PCS_STATUS_RETRYABLE` releases the claim
-for a retry; `PCS_STATUS_PERMANENT` fails the batch; a caught panic is reported
-as permanent. On the Rust side, return a `PcsError` from a system rather than
-panicking: `SystemExecution` and `RetryExhausted` become a retryable status,
-every other variant becomes a permanent one, and the SDK's own guard turns a
-panic into a permanent status. The batch is lost either way, and only the
-retryable status lets the runner release the claim and try again.
+A plugin returns a status per batch. The host maps `PCS_STATUS_RETRYABLE` and
+`PCS_STATUS_PERMANENT` to the same error path, `PcsError::SystemExecution`; the
+runner releases the claim and returns the error either way. A caught panic is
+reported as permanent. On the Rust side, return a `PcsError` from a system
+rather than panicking: `SystemExecution` and `RetryExhausted` become a retryable
+status, every other variant becomes a permanent one, and the SDK's own guard
+turns a panic into a permanent status.
 
 Config values arrive as strings through the generated `pcs_config_get` /
 `pcs_config_parse` functions. Logging and metrics go out through

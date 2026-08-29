@@ -1,6 +1,6 @@
 +++
 title = "Branching"
-description = "Conditional fan-out: a processor names branches for the batch it produced, and the host delivers that batch only to the links carrying those names."
+description = "Run the branching example: one NATS stream, three fan-out splits, and five CSV files to check."
 template = "page.html"
 weight = 4
 +++
@@ -90,100 +90,7 @@ links carrying those names. It never looks at a row to decide.
     </figcaption>
 </div>
 
-## When you need it
-
-Reach for a branch when one stream has to leave through different sinks
-depending on what is in it: priority classes to different queues, regions to
-different tables, rejects to a quarantine file.
-
-Three neighbouring problems are not branching:
-
-- **The same rows in two places.** Two unlabelled links off one node already
-  multicast.
-- **Dropping rows.** A decision covers the whole batch. Per-row filtering is
-  `mark_dead` and `compact` inside the processor.
-- **Throughput.** Splitting work across instances is the
-  [distributed runner](@/distributed.md) claiming partitions.
-
-The batch is the unit of a decision, so `run_mode kind="stream"` gives one
-decision per message and `continuous` gives one per drain.
-
-## The config
-
-A `branch` key on a `link` labels it, and the name is matched against what the
-upstream processor returns.
-
-```kdl,name=A branch key labels each link
-workflow "orders" {
-    wasm "classify" module="pipelines/classify.wasm"
-
-    link from="orders_in" to="classify"
-
-    link from="classify" to="eu_out" branch="eu"
-    link from="classify" to="us_out" branch="us"
-}
-```
-
-What the host does with each batch:
-
-| The batch's decision | Where the output goes |
-|---|---|
-| none returned | every downstream link, labelled or not |
-| `["eu"]` | the links labelled `eu` |
-| `["eu", "us"]` | the links labelled `eu` and the links labelled `us` |
-| `[]` | nowhere: the batch is dropped |
-| a name no link carries | that name delivers nowhere; the host logs a warning and carries on |
-
-A decision selects labelled links only, so a deciding processor whose links
-carry no labels delivers nothing.
-
-Three shapes are refused at load time, before the first batch:
-
-| Refused | Why |
-|---|---|
-| `branch` on a link out of a source | a source multicasts unconditionally, so the label would lie |
-| one node labelling some outbound links and not others | all or none, otherwise the unlabelled ones would silently duplicate every branch |
-| a name outside `^[A-Za-z0-9][A-Za-z0-9_-]*$`, or over 64 bytes | branch names share the id charset |
-
-Check the labels before running anything. `validate` refuses all three shapes,
-and the grammar sits in
-[the workflow structure](@/service/configuration.md#the-workflow-structure).
-
-```bash,name=Validate a branching config
-pcs-service validate --config service.kdl
-
-OK: workflow graph validated (components and schemas agree end to end)
-```
-
-## The processor side
-
-A processor decides by inserting a `RouteDecision` resource into the batch
-dataset before its systems finish.
-
-```rust,name=The processor inserts a RouteDecision
-data.insert_resource(RouteDecision(vec!["eu".to_string()]));
-```
-
-It is a resource rather than a component because resources do not cross the
-Arrow IPC boundary, so the decision never appears in the output rows. The SDK
-macro reads it after the systems run and reports the names in
-`run-result.routes`:
-[the WIT contract](@/processors/wit-contract.md#run-metrics-and-run-result). A
-native plugin uses the same type from `pcs-plugin`.
-
-## Watching a branch
-
-Each labelled edge reports its own throughput. The dashboard draws the branch
-name on a chip at the edge's midpoint and reads `pcs_processor_rows_out_total`
-under `processor="<id>", branch="<name>"`. An edge that stays blank while its
-sibling moves is an unreachable branch.
-
-## The runnable example
-
-`examples/branching/branching.kdl` is one stream workflow carrying every way
-output fans out. A NATS core subject feeds it in `run_mode kind="stream"`, so
-both routers decide per message. It needs a clone of the repository, a NATS
-broker, and the two processors.
+## What the example demonstrates
 
 <div class="dgm animate-in">
     <div class="dgm-scroll"><svg viewBox="0 0 660 366" role="img" aria-labelledby="br-title br-desc">
@@ -269,14 +176,20 @@ broker, and the two processors.
         <span class="k-data"><i></i> data plane</span>
         <span class="k-boundary"><i></i> the two processor runtimes</span>
     </div>
-    <figcaption class="dgm-cap">
-        One workflow, three splits. The source split is unconditional; each router split
-        is one decision per batch, and the sinks divide the stream because of it.
     </figcaption>
 </div>
 
-Seven `link` lines are the whole graph. The source's three carry no `branch`, so
-`out_mirror` keeps a verbatim copy of the stream the two routers split.
+| Split | Edge | Where each batch goes |
+|-------|------|----------------------|
+| Source | `in` → `out_mirror`, `router_wasm`, `router_plugin` | Every downstream, unconditionally |
+| WASM processor | `router_wasm` → `out_wasm_high` / `out_wasm_low` | Only the branch the decision names |
+| Plugin | `router_plugin` → `out_plugin_premium` / `out_plugin_standard` | Only the branch the decision names |
+
+The publisher draws `priority` 50/50 between `"high"` and `"low"`. Both routers
+read the first row's priority: the wasm one names branch `high` or `low`, the
+plugin maps the same values to `premium` and `standard`. One publisher therefore
+fills four branch files, and `out_mirror` keeps a verbatim copy of the whole
+stream. Seven `link` lines are the whole graph:
 
 ```kdl,name=Seven links are the whole graph
 link from="in" to="out_mirror"
@@ -290,21 +203,28 @@ link from="router_plugin" to="out_plugin_premium" branch="premium"
 link from="router_plugin" to="out_plugin_standard" branch="standard"
 ```
 
-Both routers read the first row's `priority`. The wasm one names `high` or
-`low`, the plugin maps the same values to `premium` and `standard`, and that is
-why one publisher fills four files.
+The source's three links carry no `branch`, so they multicast unconditionally.
+A processor labels every outbound link or none; the load-time rules behind that
+are in [the workflow structure](@/service/configuration.md#the-load-time-graph-rules).
 
-### Build the processors
+## Prerequisites
 
-From the repository root:
+- A clone of the repository, from the root of which every command runs.
+- Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`.
+- Docker for the NATS broker.
+- The default feature bundle plus `plugin`: the serve and validate commands
+  below pass `--features connector-file,transformer-csv,wasm,plugin`.
+
+## 1. Build the processors
 
 ```bash,name=Build both processors
 cargo build --release -p branching-wasm --target wasm32-wasip2
 cargo build -p branching-plugin
 ```
 
-The plugin artifact name is platform specific. The config defaults to the Linux
-name, so only macOS and Windows need `PCS_PLUGIN_LIB`:
+Runs the same on Linux, macOS and Windows (PowerShell). The plugin artifact name
+is platform specific. The config defaults to the Linux name, so only macOS and
+Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
@@ -312,22 +232,52 @@ name, so only macOS and Windows need `PCS_PLUGIN_LIB`:
 | macOS | `target/debug/libbranching_plugin.dylib` | `target/debug/libbranching_plugin.dylib` |
 | Windows | `target/debug/branching_plugin.dll` | `target/debug/branching_plugin.dll` |
 
-A mislabelled graph is caught before anything runs, so validate first, with
-`PCS_PLUGIN_LIB` set on macOS and Windows:
+## 2. Validate the config
+
+A mislabelled graph is caught before anything runs. On macOS and Windows set
+`PCS_PLUGIN_LIB` as in the table above:
+
+Linux:
 
 ```bash,name=Validate the branching config
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate \
   --config examples/branching/branching.kdl --strict
 ```
 
-### Run it
+macOS:
 
-Start NATS, then the service, then the publisher. `PCS_OUT_DIR` names the
-directory the five sink files land in, and it must exist first.
+```bash,name=Validate with the dylib name
+PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate \
+  --config examples/branching/branching.kdl --strict
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate --config examples/branching/branching.kdl --strict
+```
+
+Expected output ends with `OK: all declared types resolved in built-in
+registry`.
+
+## 3. Start NATS
 
 ```bash,name=Start NATS
 docker run -d --name pcs-nats -p 4222:4222 nats:2.11-alpine
 ```
+
+Runs the same on all three platforms. Stop it later with
+`docker rm -f pcs-nats`.
+
+## 4. Start the service
+
+`PCS_OUT_DIR` names the directory the five sink files land in, and it must
+exist before `serve` starts. The config writes forward-slash paths, which work
+on Windows too, so `C:/pcs-branching` is fine as it stands.
+
+Linux:
 
 ```bash,name=Start the service
 mkdir -p /tmp/pcs-branching
@@ -337,23 +287,62 @@ cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -
   --config examples/branching/branching.kdl
 ```
 
-Then, in another terminal:
+macOS:
+
+```bash,name=Start the service with the dylib name
+mkdir -p /tmp/pcs-branching
+
+PCS_OUT_DIR=/tmp/pcs-branching \
+PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve \
+  --config examples/branching/branching.kdl
+```
+
+Windows (PowerShell):
+
+```powershell
+mkdir C:\pcs-branching
+
+$env:PCS_OUT_DIR = "C:/pcs-branching"
+$env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve --config examples/branching/branching.kdl
+```
+
+The stream runner waits for messages, so no output files exist yet. Leave this
+terminal running.
+
+## 5. Run the publisher
+
+In another terminal:
 
 ```bash,name=Run the publisher
 cargo run -p pcs-service --example branching_publish -- --rate 50
 ```
 
-On macOS and Windows add `PCS_PLUGIN_LIB` to the serve command. The config writes
-forward-slash paths, so `PCS_OUT_DIR=C:/pcs-branching` works as it stands.
+Runs the same on all three platforms. The publisher's flags: `--count` (0 runs
+until Ctrl-C, the default), `--rate` messages per second (default 50), `--url`
+(default `nats://localhost:4222`), `--subject` (default `branching.orders`),
+`--seed`.
 
-The publisher's flags: `--count` (0 runs until Ctrl-C, the default), `--rate`
-messages per second (default 50), `--url` (default `nats://localhost:4222`),
-`--subject` (default `branching.orders`), `--seed`.
+## 6. Check the output files
 
-### What each output file holds
+After a few seconds all five files exist and grow while the publisher runs.
+Each `FileSink` appends and writes its CSV header once. The mirror's line count
+splitting across each pair is the proof:
 
-The publisher draws `priority` 50/50 between `"high"` and `"low"`, so all four
-branches fill continuously while it runs.
+Linux/macOS:
+
+```bash,name=Confirm each branch got its share
+wc -l /tmp/pcs-branching/*.csv
+```
+
+Windows (PowerShell):
+
+```powershell
+Get-ChildItem C:\pcs-branching\*.csv | ForEach-Object {
+  "$($_.Name): $((Get-Content $_.FullName).Count) lines"
+}
+```
 
 | Output | Holds |
 |--------|-------|
@@ -364,13 +353,17 @@ branches fill continuously while it runs.
 | `out-plugin-standard.csv` | the `"low"` messages |
 
 Each router pair partitions the same stream under different names, so
-`out-wasm-high.csv` and `out-plugin-premium.csv` hold the same rows. Every
-`FileSink` appends and writes its CSV header once. The mirror's line count
-splitting across each pair is the proof:
+`out-wasm-high.csv` and `out-plugin-premium.csv` hold the same rows. Stop the
+publisher and the service with Ctrl-C when you are done.
 
-```bash,name=Confirm each branch got its share
-wc -l /tmp/pcs-branching/*.csv
-```
+## Files
+
+| Path | What it is |
+|------|-----------|
+| `examples/branching/branching.kdl` | the workflow: one source, two routers, five sinks, seven links |
+| `examples/branching/wasm/` | `branching-wasm`, the WebAssembly router (component) |
+| `examples/branching/plugin/` | `branching-plugin`, the native router (cdylib) |
+| `examples/branching/branching_publish.rs` | the publisher, a `pcs-service` example |
 
 **Next:** [Windowing](@/service/windowing.md), the other thing a processor node
 declares in its own block.

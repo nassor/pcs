@@ -14,14 +14,14 @@ aliases = ["/getting-started/"]
 <dt>You need</dt>
 <dd>Rust <strong>1.95</strong> or newer, and a clone of the repository</dd>
 <dt>Not needed</dt>
-<dd>No database, no broker, no cluster, no WebAssembly toolchain</dd>
+<dd>No database, no broker, no cluster, no WebAssembly toolchain (until step 8)</dd>
 </dl>
 
 Every piece of code below is quoted from
-`examples/native/first_pipeline.rs`, which CI compiles. The last
-step runs it and shows the real output.
+`examples/native/first_pipeline.rs`, which CI compiles. The last steps run it
+and show the real output.
 
-## 1. Clone and build
+## 1. Create the project
 
 <div class="note">
 <span class="note-label">Before you start</span>
@@ -31,13 +31,47 @@ have cloned the repository and are running from its root.
 
 </div>
 
-```bash,name=Clone the repository and build
-git clone https://github.com/nassor/pcs
-cd pcs
+```bash,name=Create the project
+cargo new order-pipeline
+cd order-pipeline
+```
+
+Runs the same on Linux, macOS and Windows (PowerShell). Step 1 is done when
+`Cargo.toml` and `src/main.rs` exist in `order-pipeline/`.
+
+## 2. Add the dependencies
+
+The engine is `pcs-core`; `pcs-service` re-exports it under `pcs_service::`,
+which is what the code below imports. Inside the clone, both are path
+dependencies:
+
+```toml,name=The Cargo.toml dependencies
+[dependencies]
+pcs-service = { path = "../crates/pcs-service", default-features = false }
+# The `runtime` feature (tokio and rayon stage parallelism) is pcs-core's
+# default. The direct dependency pins it on; pcs-service re-exports the same
+# types.
+pcs-core = { path = "../crates/pcs-core" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+arrow-array = "59.2"
+arrow-schema = "59.2"
+```
+
+Depend on `pcs-service` alone, with its default features, when you also want
+the host (wasmtime and the HTTP control plane) in the same binary; the lean
+pair above keeps the build to the columnar engine.
+
+```bash,name=Build the skeleton
 cargo build
 ```
 
-## 2. Describe your data
+Runs the same on all three platforms. The first build takes most of the 15
+minutes while the workspace dependencies compile. Step 2 is done when the build
+finishes.
+
+## 3. Describe your data
 
 A `Component` is a plain Rust struct plus the Arrow schema for its fields. PCS
 stores one `RecordBatch` per component, so a field is a **column**, not a
@@ -84,9 +118,9 @@ impl Order {
 ```
 
 [Dataset & Components](@/dataset.md) covers registration, appends, soft deletes
-and the IPC round trip.
+and the IPC round trip. Step 3 is done when `cargo check` accepts the file.
 
-## 3. Seed rows
+## 4. Write the systems
 
 A `System` is one transform plus the `meta()` that declares what it touches.
 `SeedOrders` appends the batch every later stage reads.
@@ -151,14 +185,11 @@ impl System for SeedOrders {
 strongest declaration there is, so nothing can share a stage with it, and this
 system lands alone in stage 0.
 
-## 4. Write two transforms
-
-Here is the payoff. `ConvertCurrency` writes `usd_amount` and `FlagExpress`
-writes `express`. The writes are disjoint, so PCS puts both in **one stage** and
-runs them concurrently. You never wrote a stage list.
-
-Both implement `ParallelSystem`, which takes `&Dataset` and returns the columns
-it produced as a `WriteSet` rather than mutating in place.
+Two more transforms, and here is the payoff. `ConvertCurrency` writes
+`usd_amount` and `FlagExpress` writes `express`. The writes are disjoint, so PCS
+puts both in **one stage** and runs them concurrently. You never wrote a stage
+list. Both implement `ParallelSystem`, which takes `&Dataset` and returns the
+columns it produced as a `WriteSet` rather than mutating in place.
 
 ```rust,name=ConvertCurrency writes usd_amount
 struct ConvertCurrency;
@@ -217,11 +248,10 @@ Both read `amount`, and two reads never conflict. Add a third system writing
 `amount` and the plan re-derives itself with no change to these two.
 [Systems](@/systems.md) has the full conflict table.
 
-## 5. Read a resource
-
-A `Resource` is a Rust singleton on the `Dataset`, keyed by type. Use one for
-configuration and lookup tables: values that are not columnar and do not need a
-row per entry.
+`ConvertCurrency` reads a `FxRates` resource. A `Resource` is a Rust singleton
+on the `Dataset`, keyed by type; use one for configuration and lookup tables.
+Resources are **not** serialised by `write_ipc`, so they never cross an Arrow
+IPC boundary.
 
 ```rust,name=The FxRates resource
 /// USD-base exchange rates, held as a resource rather than a column.
@@ -245,25 +275,9 @@ impl FxRates {
 }
 ```
 
-Install it with `with_resource(...)` at build time and claim it with
-`read_resource::<FxRates>()` in `meta()`, as `ConvertCurrency` does above.
-Resources are **not** serialised by `write_ipc`, so they never cross an Arrow
-IPC boundary. That is why a WebAssembly processor keeps configuration on the
-system struct instead.
-
-## 6. Summarise with a closure
-
 A transform that does not need its own type can be a closure. `system_fn` pairs
-one `SystemMeta` with one `FnMut(&mut Dataset)`. This one writes a second
-resource for `main` to read:
-
-```rust,name=The resource the summary writes
-struct Summary {
-    rows: usize,
-    express: usize,
-    total_usd: f64,
-}
-```
+one `SystemMeta` with one `FnMut(&mut Dataset)`. This summary system writes a
+`Summary` resource for `main` to read:
 
 ```rust,name=The summary system built with system_fn
 fn make_summary_system() -> impl System {
@@ -319,9 +333,10 @@ fn make_summary_system() -> impl System {
 ```
 
 The inner block matters: the column view borrows the dataset, so it has to drop
-before `insert_resource` takes `&mut`.
+before `insert_resource` takes `&mut`. Step 4 is done when `cargo check`
+accepts the systems.
 
-## 7. Assemble and run
+## 5. Assemble the pipeline
 
 Register the component, install the resource, add the systems, run.
 
@@ -358,9 +373,15 @@ async fn main() -> Result<(), PcsError> {
 }
 ```
 
-```bash,name=Run the example
-cargo run -p pcs-service --example first_pipeline
+Step 5 is done when `cargo check` accepts `main`.
+
+## 6. Run it
+
+```bash,name=Run the pipeline
+cargo run
 ```
+
+Runs the same on all three platforms. Expected output:
 
 ```text,name=Expected console output
 seeded 5 orders
@@ -372,8 +393,6 @@ order 5       12.00 EUR ->      12.96 USD  express=false
 stages: [[0], [1, 2], [3]]
 5 orders, 2 express, 10568.44 USD total
 ```
-
-## 8. Read the plan back
 
 `pipeline.stages()` returns `Vec<Vec<usize>>`: one inner vector per stage,
 holding system indices in **registration order**. The line above reads
@@ -387,7 +406,175 @@ holding system indices in **registration order**. The line above reads
 
 `stages()` returns `None` until the first `run()` builds the plan.
 [Pipeline](@/pipeline.md) covers the conflict graph, the topological sort and
-per-system retry.
+per-system retry. Step 6 is done when the numbers above match yours.
+
+## 7. Make it an ETL
+
+The repository's `scheduler_etl` example is the same shape one size up: four
+systems over a `Transaction` component, with the validation and enrichment
+writes sharing a stage.
+
+```rust,name=The stage 1 pair from scheduler_etl
+// Marks each row valid when its amount is positive. Writes only `valid`, which
+// is disjoint from EnrichSystem's `usd_amount`, so both land in stage 1.
+struct ValidateSystem;
+
+#[async_trait]
+impl System for ValidateSystem {
+    fn meta(&self) -> SystemMeta {
+        SystemMeta::new("validate")
+            .reads(Transaction::AMOUNT) // decides validity
+            .writes(Transaction::VALID) // the only field it touches
+    }
+
+    async fn run(&self, pipeline: &mut Dataset) -> Result<(), PcsError> {
+        // reads `amount`, builds the `valid` BooleanArray, and swaps it into
+        // the component's RecordBatch with `replace_batch`
+        ...
+    }
+}
+```
+
+`EnrichSystem` writes only `usd_amount` and reads `amount` plus `currency` and
+the `FxRates` resource, so the field-level DAG puts it in the same stage as
+`ValidateSystem`:
+
+```text
+Stage 0:  [IngestSystem]                  writes every Transaction field
+Stage 1:  [ValidateSystem, EnrichSystem]  write "valid" and "usd_amount"
+Stage 2:  [ReportSystem]                  reads both
+```
+
+The full file, quoted from `examples/native/scheduler_etl.rs`, is the same
+primitives you already used, plus `Dataset::replace_batch` for the
+column swaps. Run the shipped example to see it:
+
+```bash,name=Run the ETL example
+cargo run -p pcs-service --example scheduler_etl
+```
+
+Runs the same on all three platforms. The example is a `pcs-service` target,
+so it compiles the crate's dev-dependencies; `raft-proto` in that set has a
+build script that needs `protoc` on PATH (see AGENTS.md). The visible result
+is the transaction report and the derived stage layout:
+
+```text,name=Expected ETL output
+Starting ETL pipeline...
+[ingest]    loaded 9 transactions
+[validate]  7 valid, 2 rejected
+[enrich]    converted 9 rows to USD
+
+╔═══════════════════════════════════════════════════════╗
+║       ARROW ETL PIPELINE — TRANSACTION REPORT        ║
+╠═══════════════════════════════════════════════════════╣
+║  #1001      1500.00 USD                                ║
+║  #1002      2300.50 EUR →    2484.54 USD           ║
+║  #1003       750.00 GBP →     952.50 USD           ║
+║  #1004       -50.00 USD  REJECTED                     ║
+║  #1005      5000.00 JPY →      33.50 USD           ║
+║  #1006       320.75 EUR →     346.41 USD           ║
+║  #1007      1200.00 GBP →    1524.00 USD           ║
+║  #1008         0.00 USD  REJECTED                     ║
+║  #1009       680.00 CAD →     503.20 USD           ║
+╠═══════════════════════════════════════════════════════╣
+║  Total rows:      9                                  ║
+║  Valid:           7                                  ║
+║  Rejected:        2                                  ║
+║  Total USD:         7344.15                         ║
+║  Average USD:       1049.16                         ║
+╚═══════════════════════════════════════════════════════╝
+
+Stage layout (field-level DAG):
+  Stage 0: [0]
+  Stage 1: [1, 2]
+  Stage 2: [3]
+  (ValidateSystem and EnrichSystem share stage 1
+   because they write disjoint fields of Transaction)
+
+Pipeline complete: 7/9 valid, 2 rejected, $7344.15 total USD
+```
+
+Step 7 is done when the report prints and the two stage-1 systems share a
+stage without any stage list in your code.
+
+## 8. Ship the same pipeline as a component
+
+Make a second crate for the component, at the repository root next to
+`order-pipeline/` (the SDK pins `pcs-core` to its `processor` feature, which
+swaps the rayon stages for sequential execution):
+
+```bash,name=Create the processor crate
+cd ..
+cargo new order-pipeline-processor --lib
+cd order-pipeline-processor
+```
+
+Runs the same on all three platforms.
+
+```toml,name=The processor crate manifest
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcs-processor = { path = "../crates/pcs-processor" }
+serde = { version = "1", features = ["derive"] }
+
+# The bindings generator, wasm32-only like the `bindings` module in lib.rs.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.61.1"
+```
+
+```rust,name=Export the build function
+use pcs_processor::prelude::*;
+
+// The WIT bindings, generated from the same package the host compiles against.
+#[cfg(target_arch = "wasm32")]
+#[allow(warnings)]
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../crates/pcs-processor/wit",
+        world: "pcs-pipeline",
+        generate_all,
+    });
+}
+
+fn build() -> Pipeline {
+    let mut pipeline = Pipeline::new("order-pipeline");
+    pipeline.data.register_component::<Order>().expect("register Order");
+    pipeline.add_system(SeedOrders);
+    pipeline.add_system(ConvertCurrency);
+    pipeline.add_system(FlagExpress);
+    pipeline.add_system(make_summary_system());
+    pipeline
+}
+
+#[cfg(target_arch = "wasm32")]
+pcs_processor::export_pipeline!(build);
+```
+
+`export_pipeline!` writes the `describe` and `run-batch` exports plus the
+`pcs_config_get` and `pcs_config_parse` accessors, all referencing
+`crate::bindings`, which is why the bindings module and the wasm32-only
+`wit-bindgen` dependency live in this crate. The `Order` component and the four
+systems from steps 3 to 5 move into this crate; the two `ParallelSystem` impls
+are re-declared as plain `System` impls, because the processor build has no
+`runtime` feature and refuses a `ParallelSystem` at run time. Their column math
+is unchanged: compute the arrays, then land them with `data.apply_write_set`
+instead of returning a `WriteSet`. Build it for the wasm target, from inside
+the crate:
+
+```bash,name=Build the component
+rustup target add wasm32-wasip2
+cargo build --release --target wasm32-wasip2
+```
+
+Runs the same on all three platforms. The artifact takes the crate name with
+hyphens turned to underscores, so step 8 is done when
+`target/wasm32-wasip2/release/order_pipeline_processor.wasm` exists.
+`pcs-service` loads that file through a `wasm` node in a KDL config, with
+sources and sinks declared around it; `examples/configs/standalone_wasm.kdl`
+is the shape, and [the Rust processor page](@/processors/rust.md) walks the
+full authoring flow.
 
 ## 9. Where to go next
 
@@ -395,7 +582,7 @@ per-system retry.
   hardcoding a seed system.
 - [Scheduler](@/scheduler.md): several pipelines in one process, with dependency
   edges between them.
-- [Distributed Runner](@/distributed.md): the same pipeline against claimed row
+- [Distributed processing](@/distributed.md): the same pipeline against claimed row
   ranges across nodes, with checkpoints.
-- [WASM Processors](@/processors/_index.md): ship this same pipeline as a
-  component that `pcs-service` loads at runtime.
+- [Native plugins](@/native/plugins.md): the same pipeline as a shared library
+  the service loads at runtime, without the sandbox.

@@ -1,14 +1,16 @@
 # PCS Service Example Configs
 
-This directory contains runnable KDL configurations for `pcs-service`.
+This directory holds runnable KDL configurations for the `pcs-service`
+binary itself, one per connector plus standalone and cluster templates. Each
+is a `--config` argument to `pcs-service validate` or `pcs-service serve`.
 
 ## Required features
 
 Every config in this directory declares a `wasm` node inside its `workflow`
 block, and that node only exists when the `wasm` feature is on. `service` does
-**not** imply it, so `--features service` alone rejects these files with
-`unknown field 'wasm', there are no fields`. Each `type="..."` also needs the
-feature that registers its factory. Build with:
+not imply it, so `--features service` alone rejects these files with `unknown
+field 'wasm', there are no fields`. Each `type="..."` also needs the feature
+that registers its factory. Build and run with:
 
 | Config | Features |
 |--------|----------|
@@ -21,42 +23,113 @@ feature that registers its factory. Build with:
 | `http.kdl` | `connector-http,transformer-csv,wasm` |
 | `tikv.kdl` | `tikv-store,connector-file,transformer-csv` |
 
+## Build the binary
+
+The `pcs-service` binary needs at least the features of the config you plan to
+run, so a build usually carries the same feature list:
+
+```text
+cargo build -p pcs-service --features connector-file,transformer-csv,wasm --bin pcs-service
+```
+
+Runs the same on Linux, macOS and Windows (PowerShell).
+
+## How to run the standalone example
+
+```text
+# Validate the config. No side effects; exits 0 on success.
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/standalone.kdl --strict
+
+# Run the pipeline. Reads fixtures/orders.csv, writes /tmp/pcs-standalone-orders-out.csv.
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm --bin pcs-service -- serve --config examples/configs/standalone.kdl
+```
+
+Runs the same on Linux, macOS and Windows (PowerShell).
+
+The process exits after one pipeline iteration because `run_mode` sets
+`kind="one_shot"`. Check `/tmp/pcs-standalone-orders-out.csv` for the output.
+The config's wasm node names `pipelines/orders.wasm`, a component that must
+exist when the pipeline loads.
+
+## How to validate the cluster example
+
+Cluster mode requires `--features service-cluster,tikv-store`. Without
+`tikv-store` the `store "tikv"` block is a configuration error, and without a
+`store` block cluster mode is rejected outright. The cluster config also names
+the file connector and wasm features.
+
+```text
+PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
+cargo run -p pcs-service --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:PCS_NODE_ID = "1"
+$env:PCS_DATA_DIR = "C:\tmp\pcs-node-1"
+cargo run -p pcs-service --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
+```
+
+To run a three-node cluster you need three processes, each with a distinct
+`PCS_NODE_ID` and `PCS_DATA_DIR`, with `PCS_BOOTSTRAP=true` on exactly one
+node during the first bring-up. See the comments in `cluster.kdl` for the
+step-by-step procedure.
+
+## How to run the TiKV-backed config
+
+`tikv.kdl` needs a local PD and TiKV. With the `store` block present, `serve`
+persists the raw config file to TiKV before the pipeline builds, writes
+stream-mode source cursors and processor priors back as items flow, and a
+restarted service resumes from its last save point.
+
+```text
+cargo run -p pcs-service --features tikv-store,connector-file,transformer-csv --bin pcs-service -- validate --config examples/configs/tikv.kdl
+cargo run -p pcs-service --features tikv-store,connector-file,transformer-csv --bin pcs-service -- serve --config examples/configs/tikv.kdl
+```
+
+Runs the same on Linux, macOS and Windows (PowerShell).
+
+The pipeline reads `examples/configs/fixtures/orders.csv` and writes
+`/tmp/pcs-tikv-orders-out.csv`.
+
 ## Built-in factories
 
 Each factory lives in the crate that owns it and reaches the registry only when
 its `pcs-service` feature is on. `service` alone registers nothing.
 
 A connector moves bytes and a transformer decides what they mean, so a config
-that names a file needs both: a `source`/`sink` node with `type="FileSource"`/
-`type="FileSink"` from `connector-file`, and a declared `transformer "..."
-format="csv"` node from `transformer-csv` that the source/sink references by id
-through its own `transformer="..."` property. Kafka, NATS and TCP resolve their
-byte format the same way and default to none: a byte-carrying source or sink
-always names its `transformer` explicitly, there is no implicit default format.
+that names a file needs both: a `source`/`sink` node with
+`type="FileSource"`/`type="FileSink"` from `connector-file`, and a declared
+`transformer "..." format="csv"` node from `transformer-csv` that the
+source/sink references by id through its own `transformer="..."` property.
+Kafka, NATS and TCP resolve their byte format the same way and default to
+none: a byte-carrying source or sink always names its `transformer`
+explicitly, there is no implicit default format.
 
 ### Sources
 
-| config `type`     | Description                              | Required config keys      | Crate | Feature |
-|-------------------|------------------------------------------|---------------------------|-------|---------|
-| `FileSource`      | Reads a local file in whatever format its `transformer` names | `path`       | `pcs-connector-file` | `connector-file` |
-| `HttpSource`      | One GET, decoded in whatever format its `transformer` names | `url`, plus `schema_fields` where the format needs it | `pcs-connector-http` | `connector-http` |
-| `PostgresSource`  | Polling, outbox or `pgoutput` reads      | `name`, `connection`, `mode`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
-| `KafkaSource`     | Consumes a Kafka topic                   | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
-| `S3Source`        | Lists a prefix once and drains every object in key order | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
-| `tcp`             | Live framed messages off a listener, stream mode only | `bind`, `schema_fields`   | `pcs-connector-tcp` | `connector-tcp` |
-| `ChannelSource`   | In-process channel (testing/internal)    | `schema_fields`           | `pcs-connector-channel` | `connector-channel` |
+| config `type` | Description | Required config keys | Crate | Feature |
+|---------------|-------------|----------------------|-------|---------|
+| `FileSource` | Reads a local file in whatever format its `transformer` names | `path` | `pcs-connector-file` | `connector-file` |
+| `HttpSource` | One GET, decoded in whatever format its `transformer` names | `url`, plus `schema_fields` where the format needs it | `pcs-connector-http` | `connector-http` |
+| `PostgresSource` | Polling, outbox or `pgoutput` reads | `name`, `connection`, `mode`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
+| `KafkaSource` | Consumes a Kafka topic | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
+| `S3Source` | Lists a prefix once and drains every object in key order | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
+| `tcp` | Live framed messages off a listener, stream mode only | `bind`, `schema_fields` | `pcs-connector-tcp` | `connector-tcp` |
+| `ChannelSource` | In-process channel (testing/internal) | `schema_fields` | `pcs-connector-channel` | `connector-channel` |
 
 ### Sinks
 
-| config `type`   | Description                               | Required config keys      | Crate | Feature |
-|-----------------|-------------------------------------------|---------------------------|-------|---------|
-| `FileSink`      | Writes a local file in whatever format its `transformer` names | `path`, `schema_fields`, optional `truncate` | `pcs-connector-file` | `connector-file` |
-| `HttpSink`      | One request per batch, body written by its `transformer` | `url`, `schema_fields`, optional `method` | `pcs-connector-http` | `connector-http` |
-| `PostgresSink`  | `COPY FORMAT binary`, optional upsert     | `name`, `connection`, `table`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
-| `KafkaSink`     | Produces to a Kafka topic                 | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
-| `S3Sink`        | Accumulates rows and uploads one object per flush | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
-| `tcp`           | Dials a peer and writes one length-prefixed frame per message | `connect`, `schema_fields` | `pcs-connector-tcp` | `connector-tcp` |
-| `ChannelSink`   | In-process channel (testing/internal)     | `schema_fields`           | `pcs-connector-channel` | `connector-channel` |
+| config `type` | Description | Required config keys | Crate | Feature |
+|---------------|-------------|----------------------|-------|---------|
+| `FileSink` | Writes a local file in whatever format its `transformer` names | `path`, `schema_fields`, optional `truncate` | `pcs-connector-file` | `connector-file` |
+| `HttpSink` | One request per batch, body written by its `transformer` | `url`, `schema_fields`, optional `method` | `pcs-connector-http` | `connector-http` |
+| `PostgresSink` | `COPY FORMAT binary`, optional upsert | `name`, `connection`, `table`, `schema_fields` | `pcs-connector-postgresql` | `connector-postgresql` |
+| `KafkaSink` | Produces to a Kafka topic | `brokers`, `topic`, `schema_fields` | `pcs-connector-kafka` | `connector-kafka` |
+| `S3Sink` | Accumulates rows and uploads one object per flush | `connection`, `schema_fields` | `pcs-connector-s3` | `connector-s3` |
+| `tcp` | Dials a peer and writes one length-prefixed frame per message | `connect`, `schema_fields` | `pcs-connector-tcp` | `connector-tcp` |
+| `ChannelSink` | In-process channel (testing/internal) | `schema_fields` | `pcs-connector-channel` | `connector-channel` |
 
 ### Retry
 
@@ -74,17 +147,17 @@ format="..."` node, and every source/sink that moves bytes in that format
 names it through its own `transformer="id"` property. `options` is an
 optional table handed to the format's own factory.
 
-| `format`      | Stream read | Stream write | Message codec | Schema rule | Crate | Feature |
-|---------------|-------------|--------------|---------------|-------------|-------|---------|
-| `csv`         | yes         | yes          | no            | `schema_fields` required | `pcs-transformer-csv` | `transformer-csv` |
-| `ndjson`      | yes         | yes          | one per row   | inferred when absent | `pcs-transformer-ndjson` | `transformer-ndjson` |
-| `parquet`     | yes         | yes          | no            | read from the file; `schema_fields` rejected on a source | `pcs-transformer-parquet` | `transformer-parquet` |
-| `avro`        | yes         | yes          | one per row   | read from the file; `schema_fields` rejected on a source, required on a sink and on the message surface | `pcs-transformer-avro` | `transformer-avro` |
-| `arrow-ipc`   | no          | no           | one per batch | `schema_fields` required | `pcs-transformer-arrow-ipc` | `transformer-arrow-ipc` |
+| `format` | Stream read | Stream write | Message codec | Schema rule | Crate | Feature |
+|----------|-------------|--------------|---------------|-------------|-------|---------|
+| `csv` | yes | yes | no | `schema_fields` required | `pcs-transformer-csv` | `transformer-csv` |
+| `ndjson` | yes | yes | one per row | inferred when absent | `pcs-transformer-ndjson` | `transformer-ndjson` |
+| `parquet` | yes | yes | no | read from the file; `schema_fields` rejected on a source | `pcs-transformer-parquet` | `transformer-parquet` |
+| `avro` | yes | yes | one per row | read from the file; `schema_fields` rejected on a source, required on a sink and on the message surface | `pcs-transformer-avro` | `transformer-avro` |
+| `arrow-ipc` | no | no | one per batch | `schema_fields` required | `pcs-transformer-arrow-ipc` | `transformer-arrow-ipc` |
 
-`options`: `csv` takes `has_headers` (bool, default `#true`), `ndjson`
-takes `infer_max` (integer, default `1024`), `avro` takes `compression` (string,
-one of `null`, `deflate`, `snappy`, `zstd`, default `null`) and `schema_id`
+`options`: `csv` takes `has_headers` (bool, default `#true`), `ndjson` takes
+`infer_max` (integer, default `1024`), `avro` takes `compression` (string, one
+of `null`, `deflate`, `snappy`, `zstd`, default `null`) and `schema_id`
 (integer, the Confluent registry id), and the other two take none.
 
 **Important**: `FileSink` opens the output file as soon as the factory is
@@ -115,21 +188,19 @@ silently dropped section.
 `UInt64`, `Float32`, `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `Date32`,
 `Date64`. All names are case-insensitive.
 
----
-
 ## Standalone vs cluster mode
 
-| Feature              | `mode "standalone"`             | `mode "cluster"`                         |
-|----------------------|---------------------------------|------------------------------------------|
-| Feature flag         | `service`                       | `service-cluster` plus `tikv-store`      |
-| Consensus            | None                            | Raft (raft-rs), membership and leadership |
-| `store "tikv"` block | Optional                        | Required, validation error if absent     |
-| `source` nodes allowed | Yes                           | No, validation error if declared         |
-| `sink` nodes allowed  | Yes                             | No, validation error if declared         |
-| `link` nodes allowed  | Yes                             | No, validation error if declared         |
-| Ingestion mechanism  | `Source` trait (file/channel)   | `PartitionSource` (distributed pull)     |
-| Crash recovery       | Restart from source             | Checkpoint + lease semantics             |
-| Minimum nodes        | 1                               | 1 (1-node Raft is valid for testing)     |
+| Feature | `mode "standalone"` | `mode "cluster"` |
+|---------|---------------------|------------------|
+| Feature flag | `service` | `service-cluster` plus `tikv-store` |
+| Consensus | None | Raft (raft-rs), membership and leadership |
+| `store "tikv"` block | Optional | Required, validation error if absent |
+| `source` nodes allowed | Yes | No, validation error if declared |
+| `sink` nodes allowed | Yes | No, validation error if declared |
+| `link` nodes allowed | Yes | No, validation error if declared |
+| Ingestion mechanism | `Source` trait (file/channel) | `PartitionSource` (distributed pull) |
+| Crash recovery | Restart from source | Checkpoint + lease semantics |
+| Minimum nodes | 1 | 1 (1-node Raft is valid for testing) |
 
 A cluster-mode workflow declares exactly one processor node (`wasm` or
 `plugin`) and nothing else: the distributed runner ingests through
@@ -140,99 +211,6 @@ Cluster mode has no local application store. Master batches, row-range claims
 and checkpoints all live in TiKV, so every node needs the same `pd_endpoints`
 and the same `key_prefix`; the node's own `data_dir` holds only
 `raft-log.redb`, `bootstrap.lock` and `node-id`.
-
----
-
-## Files in this directory
-
-| File                      | Description                                        |
-|---------------------------|----------------------------------------------------|
-| `standalone.kdl`          | Runnable single-node config using built-in types   |
-| `cluster.kdl`             | Runnable cluster template; needs `tikv-store` and a PD |
-| `standalone_wasm.kdl`     | Standalone config that loads a WASM processor pipeline |
-| `extension_example.kdl`   | Non-runnable template showing user-defined types   |
-| `fixtures/orders.csv`     | Tiny CSV fixture used by `standalone.kdl`          |
-| `standalone_polyglot.kdl` | Runs the Python processor from `examples/polyglot/` |
-| `kafka.kdl`               | Runnable config driving Kafka at both ends, needs a broker |
-| `nats.kdl`                | Runnable config driving NATS at both ends, needs a server |
-| `s3.kdl`                  | Runnable config driving S3 at both ends, needs a bucket |
-| `tcp.kdl`                 | Runnable config driving TCP at both ends, listens and dials |
-| `http.kdl`                | Runnable config driving HTTP at both ends, needs an endpoint |
-
----
-
-## How to run the standalone example
-
-```bash
-# Build the service binary (once).
-cargo build --features connector-file,transformer-csv,wasm --bin pcs-service
-
-# Validate the config (no side-effects; exits 0 on success).
-cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- validate \
-  --config examples/configs/standalone.kdl --strict
-
-# Run the pipeline (reads fixtures/orders.csv, writes /tmp/pcs-standalone-orders-out.csv).
-cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- serve \
-  --config examples/configs/standalone.kdl
-```
-
-The process exits after one pipeline iteration because `run_mode` sets
-`kind="one_shot"`. Check `/tmp/pcs-standalone-orders-out.csv` for the output.
-
-Expected output from `validate --strict`:
-
-```
-OK: workflow graph validated (components and schemas agree end to end)
-OK: config is structurally valid
-  node.id:  1
-  node.name: pcs-standalone
-  mode:     standalone
-  workflow: orders
-  processors: pipelines/orders.wasm
-  sources:  1
-  sinks:    1
-  http.bind: 127.0.0.1:0
-  log_level: info
-OK: all declared types resolved in built-in registry
-```
-
----
-
-## How to validate the cluster example
-
-Cluster mode requires `--features service-cluster,tikv-store`. Without
-`tikv-store` the `store "tikv"` block is a configuration error, and without a
-`store` block cluster mode is rejected outright.
-
-```bash
-PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-cargo run --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate \
-  --config examples/configs/cluster.kdl --strict
-```
-
-Expected output:
-
-```
-OK: workflow graph validated (components and schemas agree end to end)
-OK: config is structurally valid
-  node.id:  1
-  node.name: pcs-node-1
-  mode:     cluster
-  workflow: events
-  processors: pipelines/events.wasm
-  sources:  0
-  sinks:    0
-  http.bind: 0.0.0.0:8080
-  log_level: info
-OK: all declared types resolved in built-in registry
-```
-
-To run a three-node cluster you need three processes, each with a distinct
-`PCS_NODE_ID` and `PCS_DATA_DIR`, with `PCS_BOOTSTRAP=true` on exactly one
-node during the first bring-up. See the comments in `cluster.kdl` and
-`docs/operations/running-pcs.md` for the step-by-step procedure.
-
----
 
 ## How to extend pcs-service with user factories
 
@@ -262,12 +240,29 @@ See `extension_example.kdl` for a commented config showing all the types you
 would register in a real order-processing service. Validate it to see the
 unknown-factory warning behavior:
 
-```bash
-cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- validate \
-  --config examples/configs/extension_example.kdl
-# exits 0, warns about unknown types (MongoSource, ClickHouseSink)
-
-cargo run --features connector-file,transformer-csv,wasm --bin pcs-service -- validate \
-  --config examples/configs/extension_example.kdl --strict
-# exits 1, unknown types are errors in --strict mode
+```text
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/extension_example.kdl
 ```
+
+This exits 0 and warns about the unknown types (`MongoSource`,
+`ClickHouseSink`). With `--strict` it exits 1, because unknown types are
+errors in strict mode.
+
+## Files in this directory
+
+| File | Description |
+|------|-------------|
+| `standalone.kdl` | runnable single-node config using built-in types |
+| `cluster.kdl` | runnable cluster template; needs `tikv-store` and a PD |
+| `standalone_wasm.kdl` | standalone config that loads a WASM processor pipeline |
+| `extension_example.kdl` | non-runnable template showing user-defined types |
+| `standalone_polyglot.kdl` | runs the Python processor from `examples/polyglot/` |
+| `standalone_plugin.kdl` | runs the native plugin fixture |
+| `postgresql.kdl` | runnable config driving PostgreSQL at both ends |
+| `kafka.kdl` | runnable config driving Kafka at both ends, needs a broker |
+| `nats.kdl` | runnable config driving NATS at both ends, needs a server |
+| `s3.kdl` | runnable config driving S3 at both ends, needs a bucket |
+| `tcp.kdl` | runnable config driving TCP at both ends, listens and dials |
+| `http.kdl` | runnable config driving HTTP at both ends, needs an endpoint |
+| `tikv.kdl` | standalone config backed by a TiKV store |
+| `fixtures/` | the CSV inputs these configs read |

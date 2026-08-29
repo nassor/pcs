@@ -324,6 +324,8 @@ panic.
 
 `examples/configs/nats.kdl` is a commented config covering both halves:
 
+Runs the same on Linux, macOS and Windows (PowerShell):
+
 <div class="code">
 <div class="code-cap"><span>Bash</span><em>validating examples/configs/nats.kdl with the connector-nats feature</em></div>
 

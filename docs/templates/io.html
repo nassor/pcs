@@ -195,7 +195,7 @@
     <div class="code-cap"><span>Rust</span><em>crates/pcs-core/src/io/source.rs</em></div>
     <pre><code class="language-rust">#[async_trait]
 pub trait Source: Send + Sync {
-    /// Fixed per source instance — must not change between calls.
+    /// Fixed per source instance. Must not change between calls.
     fn schema(&amp;self) -&gt; Arc&lt;Schema&gt;;
 
     /// Pull the next batch, or `None` at EOF.
@@ -535,7 +535,7 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
     <li>It walks the <b>target's</b> fields and looks each one up in the batch <b>by name</b>,
         so column order in the incoming batch does not matter.</li>
     <li>A column in the batch that the target does not name is <b>dropped</b>.</li>
-    <li>A column the target names that the batch does not have is an <b>error</b> &mdash;
+    <li>A column the target names that the batch does not have is an <b>error</b>:
         <code>cast_batch: source batch missing column '&lt;name&gt;'</code>. A cast cannot
         invent data.</li>
     <li>A column whose type already matches is cloned, not converted. Arrow arrays are
@@ -649,7 +649,7 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
         <tr>
             <td><strong>DataFusion SQL</strong></td>
             <td><code>DataFusionSource</code></td>
-            <td>&mdash;</td>
+            <td>none</td>
             <td><code>pcs-connector-datafusion</code></td>
         </tr>
         <tr>
@@ -811,8 +811,8 @@ assert!(src.next_batch().await?.is_none());</code></pre>
 <p>
     One caveat if you reach these through the config file: <code>ChannelSourceFactory</code> and
     <code>ChannelSinkFactory</code> cannot hand the other endpoint back to you, so they build
-    a pair whose sender is dropped immediately &mdash; an instant-EOF source. For real use,
-    construct the channel yourself and pass the endpoint in programmatically.
+    a pair whose sender is dropped immediately, an instant-EOF source. For real use, construct
+    the channel yourself and pass the endpoint in programmatically.
 </p>
 
 <h2 id="datafusion">SQL results as a Source</h2>
@@ -923,11 +923,13 @@ let builder = register_builtin_factories(ServiceBuilder::new())
 </p>
 
 <p>
-    Two load-time gates then run before the first iteration. The workflow graph is validated
+    Two load-time gates run before the first iteration. The workflow graph is validated
     inline as part of <code>ServiceBuilder::build</code>: every <code>link</code> must carry a
     component both ends agree on, with field-for-field identical Arrow schemas, and every
     component a processor declares must be delivered by some inbound link. A runtime that
-    declares nothing opts its edges out of the component checks.
+    declares nothing opts its edges out of the component checks. The
+    <a href="{{ get_url(path='@/service/configuration.md') }}">Configuration</a> page lists
+    every key.
 </p>
 
 <p>

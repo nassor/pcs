@@ -27,9 +27,10 @@
 <h2 id="anatomy">What a Dataset holds</h2>
 
 <p>
-    Four things. The first one matters most: <b>one Arrow <code>RecordBatch</code> per
-    registered component</b>, and every batch holds the same number of rows. That shared
-    row count is what makes a single <code>Row</code> index meaningful across all of them.
+    Four things. The one that matters most: <b>one Arrow <code>RecordBatch</code> per
+    registered component</b>, and every batch holds the same number of rows. A single
+    <code>Row</code> index is meaningful across all of them only because of that shared
+    row count.
 </p>
 
 <div class="dgm animate-in">
@@ -43,7 +44,7 @@
         </desc>
 
         <text class="t-title" x="0" y="14">Dataset</text>
-        <text class="t-sm" x="0" y="30">row_count = 4 &mdash; the same for every component</text>
+        <text class="t-sm" x="0" y="30">row_count = 4 : the same for every component</text>
 
         <!-- component blocks: the recurring primitive -->
         <g class="anim anim-1">
@@ -73,7 +74,7 @@
             <rect class="row" x="176" y="72" width="136" height="18" rx="3"/>
             <text class="t-sm" x="184" y="85">shares : UInt64</text>
             <rect class="row-x" x="176" y="94" width="136" height="18" rx="3"/>
-            <text class="t-sm" x="184" y="107">&mdash;</text>
+            <text class="t-sm" x="184" y="107">n/a</text>
 
             <path class="ln" d="M176 120 H312"/>
             <text class="t-sm" x="184" y="136">1_200_000</text>
@@ -146,8 +147,8 @@
 </div>
 
 <p>
-    A <code>Pipeline</code> wraps a <code>Dataset</code> together with a set of systems, but
-    a <code>Dataset</code> is useful on its own for ad-hoc columnar work.
+    A <code>Dataset</code> is useful on its own for ad-hoc columnar work; a
+    <code>Pipeline</code> wraps one together with a set of systems.
 </p>
 
 <h2 id="component">Defining a Component</h2>
@@ -201,7 +202,7 @@ impl Component for Price {
 
 <p>
     Register every component <b>before</b> the first append. Registration reserves the
-    component's batch slot; appending after the fact would break the shared row count, so
+    component's batch slot, and appending afterwards would break the shared row count, so
     <code>register_component</code> returns an error once rows exist.
 </p>
 
@@ -246,11 +247,11 @@ assert_eq!(data.rows(), 3);</code></pre>
 
 <div class="code">
     <div class="code-cap"><span>Rust</span><em>pick the level you need</em></div>
-    <pre><code class="language-rust">// 1. Raw Arrow — for whole-batch operations
+    <pre><code class="language-rust">// 1. Raw Arrow, for whole-batch operations
 let batch: &amp;RecordBatch = data.columns::&lt;Price&gt;().expect("registered");
 let value: &amp;ArrayRef    = data.column::&lt;Price&gt;("value").expect("field");
 
-// 2. Typed view — borrows the batch, hands back concrete Arrow arrays
+// 2. Typed view: borrows the batch, hands back concrete Arrow arrays
 let prices = data.view::&lt;Price&gt;()?;
 let value  = prices.f64(Price::VALUE)?;
 let symbol = prices.str(Price::SYMBOL)?;
@@ -258,7 +259,7 @@ for i in 0..prices.len() {
     println!("{} = {}", symbol.value(i), value.value(i));
 }
 
-// 3. Back into Rust structs — allocates, so keep it for small batches
+// 3. Back into Rust structs. Allocates, so keep it for small batches.
 let restored: Vec&lt;Price&gt; = Price::from_record_batch(batch)?;</code></pre>
 </div>
 
@@ -358,7 +359,7 @@ if data.should_compact() {
 
 <p>
     A resource is a plain Rust singleton stored beside the columns, keyed by
-    <code>TypeId</code>. Use them for configuration, lookup tables, or summary output:
+    <code>TypeId</code>. Use one for configuration, a lookup table, or summary output:
     anything that is not per-row.
 </p>
 
@@ -392,9 +393,12 @@ data.get_resource_mut::&lt;FxRates&gt;().unwrap().gbp = 1.30;</code></pre>
 <h2 id="ipc">Arrow IPC round-trip</h2>
 
 <p>
-    A dataset serializes to Arrow IPC. Those are the same bytes the distributed runner uses
-    for checkpoints, and the same bytes that cross the WebAssembly boundary. Encoding
-    writes contiguous buffers; there is no per-field dispatch.
+    A dataset serializes to Arrow IPC. Those are the same bytes the
+    <a href="{{ get_url(path='@/distributed.md') }}">distributed runner</a> uses for
+    checkpoints and the same bytes that cross the WebAssembly boundary; the
+    <a href="{{ get_url(path='@/reference/wire-format.md') }}">wire format reference</a>
+    pins their layout. Encoding writes contiguous buffers, so there is no per-field
+    dispatch.
 </p>
 
 <div class="code">
@@ -403,7 +407,7 @@ data.get_resource_mut::&lt;FxRates&gt;().unwrap().gbp = 1.30;</code></pre>
 let mut buf = Vec::new();
 data.write_ipc(&amp;mut buf)?;
 
-// Decode — read_ipc takes any std::io::Read
+// Decode. read_ipc takes any std::io::Read.
 let restored = Dataset::read_ipc(&amp;mut &amp;buf[..])?;
 assert_eq!(restored.rows(), data.rows());</code></pre>
 </div>
@@ -413,8 +417,10 @@ assert_eq!(restored.rows(), data.rows());</code></pre>
     <p>
         <b>Resources</b> are absent from the payload, so re-attach them after decoding.
         Every component in the stream must hold <b>at most the row count</b> the alive
-        bitmap declares — fewer rows is a windowing processor's reduced result
-        component — or <code>read_ipc</code> rejects the stream as corrupt.
+        bitmap declares, or <code>read_ipc</code> rejects the stream as corrupt. Fewer
+        rows is legal: it is a
+        <a href="{{ get_url(path='@/service/windowing.md') }}">windowing</a>
+        processor's reduced result component.
     </p>
 </div>
 

@@ -250,6 +250,7 @@ cargo run -p pcs-service --features wasm,tracing --example polyglot_orders
 # The same assertions, automated.
 cargo test -p pcs-service --features wasm --test polyglot_chain -- --nocapture
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 The driver prints all six `describe()` responses first. All six report the
 same `schema_fingerprint` and `declared_components: ["Order"]`, and the

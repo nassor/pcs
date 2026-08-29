@@ -120,6 +120,7 @@ project cross-compiles from Windows, Linux and macOS:
 ```bash,name=The whole build in one command
 dotnet build -c Release
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 That is the whole build, and it is `build` rather than `publish`: the SDK hangs a
 `Publish` target off `Build`. The finished component lands at
@@ -302,8 +303,16 @@ under `dotnet test` without a wasm runtime. It drives a processor through stub
 bindings, and the codec in the same assembly decodes the real
 `examples/polyglot/generated/fixture_input.pcs`:
 
+Linux/macOS:
+
 ```bash,name=Run the SDK test suite
 cd packages/pcs-sdk-cs && dotnet test tests
+```
+
+Windows (PowerShell):
+
+```powershell
+cd packages\pcs-sdk-cs; dotnet test tests
 ```
 
 Then the two commands every recipe ends with:
@@ -311,6 +320,12 @@ Then the two commands every recipe ends with:
 ```bash,name=Validate the finished component
 wasm-tools validate --features component-model tier-cs.wasm
 wasm-tools component wit tier-cs.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model tier-cs.wasm
+wasm-tools component wit tier-cs.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output

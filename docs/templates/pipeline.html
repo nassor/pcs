@@ -28,7 +28,7 @@
 <h2 id="anatomy">What a Pipeline holds</h2>
 
 <p>
-    Five things, and only the first two are yours to fill in:
+    Five things, and only the first two are yours to fill:
 </p>
 
 <ul>
@@ -41,7 +41,7 @@
 
 <p>
     The plan is not something you build. It is a pure function of the systems you added and
-    the schemas they declare against, and PCS computes it the first time it needs it.
+    the schemas they declare against, computed the first time it is needed.
 </p>
 
 <h2 id="build">Building one</h2>
@@ -181,7 +181,7 @@ pipeline.data.append::&lt;Transaction&gt;(&amp;seed)?;</code></pre>
 
             <path class="ln" d="M206 152 H418"/>
 
-            <text class="t-sm" x="206" y="170">0 &mdash; 1</text>
+            <text class="t-sm" x="206" y="170">0 and 1</text>
             <text class="t-sm t-ctl" x="254" y="170">amount</text>
             <text class="t-sm" x="332" y="170">read then read</text>
             <text class="t-sm" x="206" y="186">shared, but neither writes it: no edge</text>
@@ -209,7 +209,7 @@ pipeline.data.append::&lt;Transaction&gt;(&amp;seed)?;</code></pre>
             <rect class="blk blk-ctl" x="436" y="56" width="218" height="76" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="56" width="218" height="20" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="68" width="218" height="8"/>
-            <text class="t-lbl" x="448" y="71">Stage 0 &mdash; vec![0, 1]</text>
+            <text class="t-lbl" x="448" y="71">Stage 0: vec![0, 1]</text>
             <text class="t-sm" x="448" y="92">[0] validate</text>
             <text class="t-sm" x="448" y="108">[1] enrich</text>
             <text class="t-sm t-ctl" x="448" y="124">no edge between them</text>
@@ -219,7 +219,7 @@ pipeline.data.append::&lt;Transaction&gt;(&amp;seed)?;</code></pre>
             <rect class="blk blk-ctl" x="436" y="156" width="218" height="52" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="156" width="218" height="20" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="168" width="218" height="8"/>
-            <text class="t-lbl" x="448" y="171">Stage 1 &mdash; vec![2]</text>
+            <text class="t-lbl" x="448" y="171">Stage 1: vec![2]</text>
             <text class="t-sm" x="448" y="194">[2] limit waits on 0 and 1</text>
 
             <path class="arw arw-ctl" d="M545 208 V226" marker-end="url(#pl-c)"/>
@@ -227,7 +227,7 @@ pipeline.data.append::&lt;Transaction&gt;(&amp;seed)?;</code></pre>
             <rect class="blk blk-ctl" x="436" y="232" width="218" height="52" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="232" width="218" height="20" rx="8"/>
             <rect class="hd hd-ctl" x="436" y="244" width="218" height="8"/>
-            <text class="t-lbl" x="448" y="247">Stage 2 &mdash; vec![3]</text>
+            <text class="t-lbl" x="448" y="247">Stage 2: vec![3]</text>
             <text class="t-sm" x="448" y="270">[3] report waits on 2</text>
 
             <text class="t-sm" x="436" y="306">stages() yields indices, not names</text>
@@ -593,7 +593,7 @@ println!(
 <table class="rule-table">
     <thead><tr><th>Mode</th><th>Attempts</th><th>Wait before retry <em>n</em></th></tr></thead>
     <tbody>
-        <tr><td><code>None</code></td><td>1</td><td>&mdash;</td></tr>
+        <tr><td><code>None</code></td><td>1</td><td>none</td></tr>
         <tr><td><code>Fixed { retries, delay }</code></td><td><code>retries + 1</code></td><td><code>delay</code>, constant</td></tr>
         <tr><td><code>ExponentialBackoff { .. }</code></td><td><code>max_retries + 1</code></td><td><code>base_delay * multiplier^n</code>, clamped to <code>max_delay</code>, then multiplied by <code>1 ± jitter</code></td></tr>
     </tbody>
@@ -635,7 +635,7 @@ impl System for CallPricingApi {
     <code>SystemConfig::minimal()</code> is the fail-fast setting:
     <code>RetryMode::None</code>, one attempt. A single failed attempt is still wrapped:
     the driver returns <code>PcsError::RetryExhausted { attempts: 1 }</code>, never the
-    bare error. Reach for <code>source</code> when you need the original.
+    bare error. Reach for <code>source</code> when you need the original error.
 </p>
 
 <p>
@@ -644,9 +644,8 @@ impl System for CallPricingApi {
     all-parallel stage holding more than one system dispatches each onto a blocking
     thread, where the driver is <code>run_with_retries_blocking</code> and the wait is
     <code>std::thread::sleep</code>. Processor builds compiled without the
-    <code>runtime</code> feature have no async timer at all, so there the delays are
-    skipped and retries fire immediately. Whichever path runs, the retry counts land in
-    the same total.
+    <code>runtime</code> feature have no async timer, so delays are skipped there and
+    retries fire immediately. Either path lands its retry counts in the same total.
 </p>
 
 <p>
@@ -665,7 +664,7 @@ impl System for CallPricingApi {
 
 <p>
     An error that survives its retry budget aborts the whole call. What survives in the
-    dataset depends on which kind of stage it happened in.
+    dataset depends on the kind of stage it happened in.
 </p>
 
 <ul>

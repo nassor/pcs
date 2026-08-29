@@ -1,8 +1,8 @@
-# pcs-arrow-ipc conformance corpus
+# Arrow IPC conformance corpus
 
-One set of test vectors, five codecs. Every codec under `packages/arrow-ipc-*`
-runs this corpus, so all five agree on exactly which streams are valid and which
-are not, and a sixth implementation has an acceptance suite the day it starts.
+One set of test vectors, five codecs. All five `pcs-sdk-*` codecs run this
+corpus, so they agree on exactly which streams are valid and which are not,
+and a sixth implementation has an acceptance suite the day it starts.
 
 The format itself is specified in
 [the wire format reference](https://nassor.github.io/pcs/reference/wire-format/).

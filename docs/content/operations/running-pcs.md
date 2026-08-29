@@ -1,110 +1,177 @@
 +++
 title = "Operating pcs-service"
-description = "Bootstrapping a three-node cluster, sizing the lease TTL, what a node writes to disk, and the runbooks for when one fails."
+description = "Build and install the binary, pick a config, run the modes, probe the control plane, and the failure modes to expect."
 template = "page.html"
 +++
 
 # Operating pcs-service
 
-Running a `pcs-service` deployment: bringing up a Raft cluster, what it writes to
-disk, and what to do when a node fails.
+Running a `pcs-service` deployment: building the binary, choosing a config,
+running the modes, probing the control plane, and what to do when a node fails.
 
 Three pages come first. [Installation](@/quickstart/installation.md) installs the
 binary. [Configuration](@/service/configuration.md) is the config surface and the
 load-time gates. [Observability](@/service/observability.md) is the HTTP probes,
 readiness and graceful shutdown. This page starts where those leave off.
 
-A cluster node needs `--features service-cluster,tikv-store`, and neither is in
-the default bundle. `mode "cluster"` in a binary without `service-cluster`
-produces a startup error and exits 1. So does a cluster config with no
-`store "tikv"` block: TiKV is the only cluster application-data store.
+## 1. Build and install
 
----
+`cargo install pcs-service` from a clone of the repository builds the **default
+bundle**: `mimalloc`, `service`, `wasm`, `windows`, `parquet-checkpoint`, every
+connector except Kafka, and all five transformers. That binary serves, runs
+WASM pipelines, and binds every node kind except `plugin` and cluster mode.
 
-## Cluster Mode
-
-### When to Use Cluster Mode
-
-Use cluster when:
-- A single node failure must not halt processing.
-- The workload exceeds one machine's throughput.
-
-Do not default to cluster mode. Raft needs at least three nodes for quorum,
-membership is managed manually, a TiKV has to be running beside it, and
-standalone with a good backup strategy is usually enough.
-
-### Cluster Mode and the Workflow Graph
-
-**A cluster-mode workflow declares exactly one processor node and no `source`,
-`sink` or `link`.** Config validation returns an error otherwise:
-
-```text,name=The error config validation returns
-cluster mode runs exactly one 'wasm' or 'plugin' node with no source, sink or
-link (2 node(s), 1 link(s) declared)
+```bash,name=Install the default bundle
+cargo install pcs-service
 ```
 
-Cluster mode ingests through `PartitionSource`, a distributed pull mechanism:
-batches are registered by a producer external to the config, through
-`register_master_batch`. Each node drives that one runtime and checkpoints its
-output, rather than draining it into a locally declared sink.
+Runs the same on Linux, macOS and Windows (PowerShell). Two features stay
+opt-in because of what they pull in:
 
-### Cluster Config
+- `connector-kafka` builds vendored C through `librdkafka-sys`, which needs
+  `cmake` and a C toolchain.
+- `service-cluster` and `tikv-store` make a cluster node, a deliberate
+  deployment choice. `mode "cluster"` in a binary without `service-cluster`
+  refuses to start, and so does a cluster config without a
+  `store "tikv"` block: TiKV is the only cluster application-data store.
 
-```kdl,name=The cluster header and its timings
-mode "cluster"
-bootstrap #false                 // #true on the initial node ONLY at first start-up
-
-// Raft timing. These drive elections, not claims.
-election_timeout_ms 1500         // 1.5 s
-heartbeat_interval_ms 300        // 300 ms
-snapshot_log_interval 10000      // compact the raft log every 10 000 entries
-
-// id is unique per node; override with --node-id or PCS_NODE_ID.
-// data_dir holds the raft log and must be persistent storage.
-node id=1 name="node-1" data_dir="/var/lib/pcs/data"
-
-// Application data: partitions, claims, checkpoints, configs, cursors and
-// processor priors. Required in cluster mode, and the same for every node.
-store "tikv" {
-    pd_endpoints "10.0.0.1:2379" "10.0.0.2:2379" "10.0.0.3:2379"
-    key_prefix "pcs"             // every key this deployment writes sits under it
-    timeout_ms 10000
-    lease_ttl_ms 90000           // claim lease, at least 10000
-}
-
-// Raft transport addresses, not HTTP.
-peer id=1 addr="10.0.0.1:9000"
-peer id=2 addr="10.0.0.2:9000"
-peer id=3 addr="10.0.0.3:9000"
-
-// Exactly one processor node, and no source, sink or link. The processor's
-// `describe()` supplies its component list; nothing in the config names it.
-workflow "events" {
-    wasm "process_events" module="/var/lib/pcs/pipelines/events.wasm"
-}
-
-http bind="0.0.0.0:8080"
-
-observability log_format="json" log_level="info"
+```bash,name=Install with cluster support and Kafka
+cargo install pcs-service --features service-cluster,tikv-store,connector-kafka
 ```
 
-### Bootstrap a Three-Node Cluster
+For a deliberately narrow binary, pick the features from
+[the configuration page](@/service/configuration.md#which-features-add-which-nodes).
+
+## 2. Pick a config
+
+`pcs-service serve` needs no flags: `--config`/`-c` defaults to `pcs.kdl` in
+the current directory and reads the `PCS_CONFIG` env var. The repository ships
+runnable configs under `examples/configs/`, each with its build command in the
+header comments:
+
+| Config | What it runs | Needs |
+|---|---|---|
+| `standalone.kdl` | CSV in, one WASM processor, CSV out | `connector-file,transformer-csv,wasm` |
+| `standalone_wasm.kdl` | the order-processing component over CSV | `connector-file,transformer-csv,wasm` |
+| `standalone_plugin.kdl` | the native plugin fixture over CSV | `connector-file,transformer-csv,plugin` |
+| `standalone_polyglot.kdl` | a polyglot processor component | the polyglot build |
+| `nats.kdl` | NATS JetStream at both ends | `connector-nats,wasm` |
+| `postgresql.kdl` | PostgreSQL logical replication to a sink table | `connector-postgresql,wasm` |
+| `kafka.kdl` | Kafka source and sink | `connector-kafka` |
+| `tcp.kdl` | a live TCP ingest stream | `connector-tcp` |
+| `http.kdl` | an HTTP source spooled through a transformer | `connector-http` |
+| `tikv.kdl` | a standalone stream run backed by a TiKV store | `tikv-store,connector-file,transformer-csv` |
+| `cluster.kdl` | a three-node cluster template | `service-cluster,tikv-store,connector-file,transformer-csv,wasm` |
+
+```bash,name=Validate a config with the features it needs
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- \
+  validate --config examples/configs/standalone.kdl
+```
+
+Runs the same on all three platforms.
+
+## 3. Choose a run mode
+
+`mode "standalone"` plus `run_mode` paces the loop; `mode "cluster"` runs the
+distributed runner. The same `serve` command starts either, whichever the config
+declares. `--node-id` (env `PCS_NODE_ID`) overrides `node.id`, and `--port` (env
+`PCS_HTTP_PORT`) overrides the HTTP bind port; `--port 0` prints the
+OS-assigned address on stdout. `one_shot` exits after one pass, which is what a
+cron entry or a test harness wants:
+
+```bash,name=Run one pass and exit
+pcs-service serve --config examples/configs/standalone.kdl
+```
+
+The rest of `run_mode` is on [the configuration page](@/service/configuration.md#pacing-a-standalone-run).
+
+## 4. Probe the control plane
+
+Four endpoints answer on `http.bind`, `0.0.0.0:8080` by default:
+
+```bash,name=Probe the three health endpoints
+curl -s http://localhost:8080/health
+curl -s http://localhost:8080/ready
+curl -s http://localhost:8080/metrics | grep '^pcs_'
+```
+
+- `/health` is the one to alert on: the watchdog counter behind it goes stale
+  within 5 seconds if the main loop wedges, and the endpoint returns 503.
+- `/ready` reports the process, not the workflow: the flag flips once the
+  runner is spawned, so 200 never means an iteration succeeded. Read
+  `iterations` on `/status` for that.
+- `/metrics` is Prometheus exposition 0.0.4 with the nineteen series. A series
+  appears once its writer has recorded a value, so `pcs_raft_*` show up on a
+  cluster node and `pcs_processor_*` once a processor has run a batch.
+- `/status` is the JSON node identity plus per-workflow runner counters. No
+  `ClusterProbe` is wired into `serve`, so `"cluster"` is `null` even in
+  cluster mode; the Raft gauges carry term, commit index and leader.
+
+## 5. Tune what the config exposes
+
+Every tuning knob is a config key, not a flag:
+
+| Want to | Key |
+|---|---|
+| Pace a standalone run | `run_mode kind="continuous" | "one_shot" | "interval"` with `interval_ms` |
+| Retry connector operations | the `retry` child on a `source` or `sink` |
+| Change the claim lease | `store "tikv" { lease_ttl_ms }`, the only lease knob, at least 10000 |
+| Drive elections | `election_timeout_ms`, `heartbeat_interval_ms` (cluster only) |
+| Compact the raft log more often | `snapshot_log_interval` (cluster only) |
+| See per-item spans | `observability log_level="debug"` (costs about 2.8 µs per item) |
+| Size the in-process buffers | `observability.inspector.max_spans`, `max_logs`, `max_samples`, `retention_secs` |
+| Accept late rows in a window | `window allowed_lateness_ms` |
+
+The buffer caps matter on a busy node: a capacity eviction is counted and
+reported as `buffers.dropped` in `/api/snapshot`, so a buffer sized too small
+says so instead of quietly forgetting.
+
+## 6. Failure modes
+
+Each of these refuses to start or fails loudly; none is silently ignored.
+
+| Condition | What happens |
+|---|---|
+| Config file missing | `error: Configuration error: reading config file pcs.kdl: <os error>`, exit 1 |
+| `mode "cluster"` without `service-cluster` | startup error: rebuild with `--features service-cluster`, exit 1 |
+| Cluster config without `store "tikv"` | `mode "cluster" requires a store "tikv" block: TiKV is the only cluster application-data store`, at load time |
+| `store` block without `tikv-store` | `config declares a store block, but this binary was built without the tikv-store feature`, at load time |
+| A key the service cannot honour | parse error (strict nodes) or ignored key (top level): the split is in [What is not a key](@/service/configuration.md#what-is-not-a-key) |
+| Unreachable TiKV at cluster start | the node fails to start rather than running degraded |
+| `raft-log.redb` without `bootstrap.lock` | unclean shutdown before bootstrap finished; the node refuses to start |
+| `node-id` file disagreeing with `node.id` | the data directory belongs to a different node; refused |
+| Raft not settling within 30 s | `serve` exits 1 |
+
+`pcs-service validate --config <file>` runs the load-time gates without
+starting anything, so most of these surface in CI.
+
+## 7. Cluster mode
+
+### Bootstrap a three-node cluster
 
 This walkthrough assumes three machines at `10.0.0.1` to `10.0.0.3`, Raft on
 port 9000, HTTP on port 8080, and a TiKV already serving PD on port 2379. Bring
 TiKV up first: a node whose `store "tikv"` endpoints are unreachable fails to
-start.
+start. The config template is `examples/configs/cluster.kdl`; the header and
+its keys are on [the configuration page](@/service/configuration.md#the-cluster-header).
 
-**Step 1: Prepare data directories** (all three nodes):
+**Step 1: Prepare the data directories** (all three nodes):
+
+Linux/macOS:
 
 ```bash,name=Step 1 prepare the data directories
 mkdir -p /var/lib/pcs/data
 ```
 
-**Step 2: Pre-flight check on node 1**:
+Windows (PowerShell):
+
+```powershell
+New-Item -ItemType Directory -Force -Path C:\pcs\data
+```
+
+**Step 2: Pre-flight check on node 1**, with `bootstrap #true` in its config:
 
 ```bash,name=Step 2 pre-flight check on node 1
-# On 10.0.0.1 with bootstrap #true in the config:
 pcs-service cluster init --config node1.kdl
 ```
 
@@ -133,34 +200,42 @@ pcs-service serve --config node1.kdl
 **Step 4: Start nodes 2 and 3** (with `bootstrap #false`):
 
 ```bash,name=Step 4 start nodes 2 and 3
-# On 10.0.0.2:
 pcs-service serve --config node2.kdl
-
-# On 10.0.0.3:
 pcs-service serve --config node3.kdl
 ```
 
-**Step 5: Verify**:
+**Step 5: Verify from node 1:**
 
 ```bash,name=Step 5 verify from node 1
 pcs-service cluster status --addr http://10.0.0.1:8080
 ```
 
-No Raft probe is wired into the HTTP state, so the command prints:
+No Raft probe is wired into the HTTP state, so the command prints a summary
+line and a note that cluster details are not available:
 
 ```text,name=Expected cluster status output
 node 1  mode=cluster
-Note: cluster details are not available in v1. Full Raft metrics integration
-is planned for v1.1.
+Note: cluster details are not available in v1.
 ```
 
-Query the raw status JSON:
+Query the raw status JSON for what is there:
+
+Linux/macOS:
 
 ```bash,name=Query the raw status JSON
 curl -s http://10.0.0.1:8080/status | jq .
 ```
 
-### Membership Management
+Windows (PowerShell):
+
+```powershell
+curl.exe -s http://10.0.0.1:8080/status | ConvertFrom-Json | ConvertTo-Json -Depth 10
+```
+
+The three Raft gauges on `/metrics` carry term, commit index and leader:
+`pcs_raft_leader_id` reports `-1` while there is no leader.
+
+### Membership management
 
 `cluster join` and `cluster leave` do not change membership. Both commands print
 a manual workaround.
@@ -179,7 +254,7 @@ a manual workaround.
 2. Remove its `peer` node from all remaining nodes' configs.
 3. Restart the remaining nodes.
 
-### Failure Semantics (Cluster)
+### Failure semantics (cluster)
 
 At-least-once delivery, enforced by TiKV-backed leases:
 
@@ -195,15 +270,11 @@ At-least-once delivery, enforced by TiKV-backed leases:
 another node. Processing pauses by up to one TTL for any range in flight at kill
 time. No data is permanently lost.
 
----
-
-## Where State Lives
+### Where state lives
 
 Two places, and only one of them is on the node.
 
-### `node.data_dir`
-
-Three files, all local, none of them application state.
+`node.data_dir` holds three files, all local, none of them application state:
 
 - `raft-log.redb` holds this node's Raft log: its vote, its entries and its view
   of the membership.
@@ -216,46 +287,36 @@ Three files, all local, none of them application state.
 Nothing else is written there. A node that loses its data directory loses its
 place in the membership, never a claim or a checkpoint.
 
-**`raft-log.redb`**: grows until compaction. The driver compacts once applied
+`raft-log.redb` grows until compaction. The driver compacts once applied
 entries pass `snapshot_log_interval` (default: 10 000); there is no manual
 force-compaction command. Nothing is proposed into this log, so its entries are
 Raft's own per-term bookkeeping and it grows slowly. If it grows unexpectedly,
 check that `pcs_raft_commit_index` is advancing.
 
-### TiKV
-
-Everything the pipeline touches, under the `key_prefix` the `store "tikv"` block
-declares: registered master batches, one record per 512-row range carrying that
-range's claim state, checkpoint IPC bytes, the schema-id ledger, source cursors,
-processor priors, and persisted configs. Every node reads and writes the same
-copy. Claim transitions are compare-and-swap, so TiKV arbitrates them without a
-coordinator and no PCS node dispatches work to another.
+Everything the pipeline touches lives in TiKV under the `key_prefix` the
+`store "tikv"` block declares: registered master batches, one record per
+512-row range carrying that range's claim state, checkpoint IPC bytes, the
+schema-id ledger, source cursors, processor priors, and persisted configs. Every
+node reads and writes the same copy. Claim transitions are compare-and-swap, so
+TiKV arbitrates them without a coordinator and no PCS node dispatches work to
+another.
 
 Back up TiKV, not the data directories. Two deployments can share one TiKV by
 picking different `key_prefix` values.
 
-### Payload Caps
+### Payload caps
 
-- **`MAX_LOG_ENTRY_BYTES`**: 1 MiB, defined in
-  `crates/pcs-service/src/distributed/partition.rs`. Caps the Arrow IPC payload
-  of a registered master batch and the runner's own stage checkpoint.
-- **`TIKV_MAX_CHECKPOINT_BYTES`**: 4 MiB, defined in
-  `crates/pcs-service/src/distributed/tikv_store.rs`. The ceiling the TiKV store
-  reports through `CheckpointStore::max_checkpoint_bytes`, which the window
-  accumulator and the processor state blob are measured against. It leaves
-  headroom under TiKV's own raw-value limit.
-- **`MAX_FRAME_BYTES`**: 16 MiB, defined in
-  `crates/pcs-service/src/distributed/consensus/transport/mod.rs`. Caps a single
-  length-prefixed TCP frame on the peer transport. That transport carries Raft
-  messages only, so no application payload ever reaches it.
+| Cap | Value | Where |
+|---|---|---|
+| `MAX_LOG_ENTRY_BYTES` | 1 MiB | `crates/pcs-service/src/distributed/partition.rs`; caps the Arrow IPC payload of a registered master batch and the runner's own stage checkpoint |
+| `TIKV_MAX_CHECKPOINT_BYTES` | 4 MiB | `crates/pcs-service/src/distributed/tikv_store.rs`; the ceiling the store reports through `CheckpointStore::max_checkpoint_bytes` |
+| `MAX_FRAME_BYTES` | 16 MiB | `crates/pcs-service/src/distributed/consensus/transport/mod.rs`; caps one length-prefixed TCP frame on the peer transport, which carries Raft messages only |
 
 If registration rejects a batch, split the input across several `batch_id`s
 rather than raising the constant. Row ranges are 512 rows apiece however large
 the batch is, so smaller batches cost no parallelism.
 
----
-
-## Checkpoint Strategies
+### Checkpoint strategies
 
 Checkpoint strategy is set on `DistributedRunner`, in code rather than config.
 
@@ -268,41 +329,29 @@ Checkpoint strategy is set on `DistributedRunner`, in code rather than config.
 The default is `EveryStage`. For long pipelines with expensive stages, consider
 `EveryNStages` to reduce write pressure on TiKV.
 
----
-
-## Shutdown and SIGKILL
-
-[Observability](@/service/observability.md#graceful-shutdown) covers the signal
-handling and the 30-second budget. Two behaviours belong to a cluster.
+### Shutdown
 
 On a clean stop the claiming node completes or releases its current batch before
-exiting. The remaining nodes elect a new leader after `election_timeout_ms * 2` if
-the exiting node was the leader.
+exiting. The remaining nodes elect a new leader after `election_timeout_ms * 2`
+if the exiting node was the leader.
 
 `SIGKILL` bypasses the handler. The claim expires after `lease_ttl_ms` and is
 retried by another node, so processing pauses by up to one lease TTL for any range
 in flight at kill time. No data is permanently lost.
 
----
-
-## Log Output
+## Log output
 
 `log_format "json"` under `observability`, or `--log-format json`, switches
 from the coloured development output to structured JSON for Loki, CloudWatch or
-Datadog. `--log-level`, `PCS_LOG_LEVEL` or `observability.log_level` sets the
-filter:
+Datadog. `--log-level` (env `PCS_LOG_LEVEL`) sets the filter, and a set
+`RUST_LOG` beats both: see the levels on
+[the observability page](@/service/observability.md#span-levels).
 
-- `error`: production default when logs are expensive
-- `info`: startup, shutdown, batch completion, leader changes
-- `debug`: per-stage timing, lease renewal events
-- `trace`: Arrow IPC encode and decode, Raft message flow, very verbose
+`otlp_endpoint` exports the span tree over OTLP/HTTP; the exporter appends
+`/v1/traces` to the collector root. Metrics are not exported that way; they stay
+on `/metrics`.
 
-`otlp_endpoint` exports the `workflow.batch` span tree over OTLP/HTTP. Metrics are
-not exported that way; they stay on `/metrics`. See [Tracing](@/tracing.md).
-
----
-
-## Environment Variables
+## Environment variables
 
 | Variable | Equivalent flag | Description |
 |----------|----------------|-------------|
@@ -314,11 +363,10 @@ not exported that way; they stay on `/metrics`. See [Tracing](@/tracing.md).
 | `PCS_LOG_LEVEL` | `--log-level` | Tracing filter |
 | `PCS_OTLP_ENDPOINT` | `--otlp-endpoint` | OTLP/HTTP collector root for span export |
 
-The config file also supports `${VAR}` and `${VAR:-default}` placeholder expansion.
+The config file also supports `${VAR}` and `${VAR:-default}` placeholder
+expansion, plus a `variables` block that wins over the environment.
 
----
-
-## Exit Codes
+## Exit codes
 
 | Exit | Condition |
 |------|-----------|
@@ -326,11 +374,9 @@ The config file also supports `${VAR}` and `${VAR:-default}` placeholder expansi
 | `1` | Runner error, config validation failure, or 30-second shutdown budget exceeded |
 
 `cluster join` and `cluster leave` exit 0 and print a manual workaround rather
-than an error, because dynamic membership is not implemented.
+than an error, because membership changes are manual.
 
----
-
-## Common Operational Scenarios
+## Common operational scenarios
 
 ### One node crashed permanently
 

@@ -26,6 +26,7 @@ Requires **Python 3.10 or newer**; CI verifies 3.14.
 ```bash,name=Install componentize-py
 pip install componentize-py==0.25.0
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 The processor imports `pcs_sdk`, which carries the codec as the internal
 `pcs_sdk.arrow_ipc` module. Both are plain Python under `packages/`, and
@@ -38,6 +39,12 @@ nothing has to be installed to build the component.
 componentize-py -d ../../../../crates/pcs-processor/wit -w pcs-pipeline bindings .
 componentize-py -d ../../../../crates/pcs-processor/wit -w pcs-pipeline componentize app \
     -p . -p ../../../../packages/pcs-sdk-py/src -o enrich-py.wasm
+```
+Windows (PowerShell):
+
+```powershell
+componentize-py -d ..\..\..\..\crates\pcs-processor\wit -w pcs-pipeline bindings .
+componentize-py -d ..\..\..\..\crates\pcs-processor\wit -w pcs-pipeline componentize app -p . -p ..\..\..\..\packages\pcs-sdk-py\src -o enrich-py.wasm
 ```
 
 Do **not** pass `--stub-wasi`. The bundled CPython needs the real WASI imports,
@@ -222,8 +229,18 @@ is driven end to end on the host exactly as the host drives it inside the
 component. `pcs_sdk.LOCAL_HOST` is that stand-in. Wire bytes are real either way,
 because both paths go through `pcs_sdk.arrow_ipc`.
 
+Linux/macOS:
+
 ```bash,name=Run the SDK test suite
 cd packages/pcs-sdk-py && PYTHONPATH=src python -m unittest discover -s tests
+```
+
+Windows (PowerShell):
+
+```powershell
+cd packages/pcs-sdk-py
+$env:PYTHONPATH = "src"
+python -m unittest discover -s tests
 ```
 
 <div class="note note-warn">
@@ -240,6 +257,12 @@ stage.
 ```bash,name=Validate the finished component
 wasm-tools validate --features component-model enrich-py.wasm
 wasm-tools component wit enrich-py.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model enrich-py.wasm
+wasm-tools component wit enrich-py.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output
@@ -258,6 +281,13 @@ cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- valid
   --config examples/configs/standalone_polyglot.kdl --strict
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve \
   --config examples/configs/standalone_polyglot.kdl
+```
+Runs the same on Linux, macOS and Windows (PowerShell), each command on one line.
+
+```powershell
+cargo xtask polyglot
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- validate --config examples/configs/standalone_polyglot.kdl --strict
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve --config examples/configs/standalone_polyglot.kdl
 ```
 
 It reads `examples/configs/fixtures/polyglot_orders.csv`, runs the component,

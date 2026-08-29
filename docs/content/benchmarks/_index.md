@@ -43,6 +43,18 @@ RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C codegen-units=1" \
   cargo run --release -p pcs-service --features service,wasm --example stream_latency
 ```
 
+The `cargo xtask bench` commands above run the same on Linux, macOS and
+Windows. On Windows the `stream_latency` command sets its flags through the
+environment instead:
+
+Windows (PowerShell):
+
+```powershell
+cargo build --release -p pcs-processor-smoketest --target wasm32-wasip2
+$env:RUSTFLAGS = "-C target-cpu=native -C opt-level=3 -C codegen-units=1"
+cargo run --release -p pcs-service --features service,wasm --example stream_latency
+```
+
 The harness knows each benchmark's package and features, so do not pass your
 own: `batch_vs_stream` needs `pcs-core`'s `io` feature and `vs_datafusion_q6` needs none,
 while `tpch_q6`, `tpch_q1`, `parallelism_compute` and `ipc_checkpoint` are built
@@ -50,7 +62,7 @@ with no extra features. Cargo's metadata hash encodes the feature set, so a
 different `--features` list produces a *different binary*.
 
 Recorded on **2026-08-22**, on an **AMD Ryzen 9 9950X3D** (16 cores, 32 logical
-CPUs, two L3 domains covering logical CPUs 0–15 and 16–31, DDR5) running
+CPUs, two L3 domains covering logical CPUs 0 to 15 and 16 to 31, DDR5) running
 **Windows 11**, Rust 1.98.0, built with `RUSTFLAGS="-C target-cpu=native -C
 opt-level=3 -C codegen-units=1"` and `[profile.bench] lto = "thin"`. Criterion
 sample size 10 (20 for `item_size`), 1 000 000 rows and `seed=42` unless stated
@@ -62,7 +74,7 @@ work, not for this page.
 **These numbers assume mimalloc**, which the `pcs-service` binary and every
 benchmark binary install as the global allocator. The library never installs an
 allocator, so an embedder on Windows should expect worse pipeline figures
-without it: switching allocator is worth 2.3–2.6× on this suite. Do not reach
+without it: switching allocator is worth 2.3 to 2.6× on this suite. Do not reach
 for `MIMALLOC_PURGE_DELAY=0` to bound RSS, which costs 3.85× on IPC encode.
 
 `FilterStage`, `ComputeStage`, `AggregateStage`, `RevenueStage` and `TaxStage`
@@ -192,15 +204,15 @@ wall time of processing them in a single batch.** A pipeline handed 100 000 rows
 should never run in stream mode; a pipeline that must answer one item
 immediately has nothing to amortise anyway.
 
-The floor is measurable on its own. An empty-DAG pipeline — one system that does
-nothing — over 10 000 single-row items runs in 2.468 ms: **247 ns per item** of
+The floor is measurable on its own. An empty-DAG pipeline, one system that does
+nothing, over 10 000 single-row items runs in 2.468 ms: **247 ns per item** of
 framework overhead. Of the 864 ns a real item costs, roughly a quarter is the
 runner and the rest is two systems doing Arrow array construction and write-set
 application on a single row. Arrow's per-array fixed costs, not the runner, are
 what make a one-row item cost anything.
 
 For scale, a scalar row loop over the same 100 000 rows takes 153.5 µs, and
-`Pipeline::run` — the batch entry point, no IO — takes 269.6 µs, within 1.2% of
+`Pipeline::run`, the batch entry point with no IO, takes 269.6 µs, within 1.2% of
 the equivalent single-invocation `run_stream` measurement of 266.3 µs.
 
 ### Service-level latency
@@ -274,7 +286,7 @@ Native stream mode is a **2 µs p99** round trip end to end, at microsecond
 timer granularity. The WASM boundary costs two orders of magnitude more: a fresh
 wasmtime `Store` per call, plus Arrow IPC in and out. Linking and instantiation
 planning are hoisted to load time via `InstancePre`, so what remains is store
-creation, instantiation and the IPC round trip — and the IPC section below shows
+creation, instantiation and the IPC round trip, and the IPC section below shows
 that half is substantial at one row.
 
 Those figures are the engine, not the deployment. `stream_latency` installs no
@@ -404,7 +416,7 @@ rows against 2.1 ns/row at 16 384), and per-row cost is flat at about 3 ns from
 Whatever dispatch costs at 131 072 rows, it is not visible as a step in this
 curve.
 
-## TPC-H Q1 — aggregation
+## TPC-H Q1: aggregation
 
 Aggregation over a 12-column lineitem batch with `GROUP BY (returnflag,
 linestatus)`. Source: `crates/pcs-core/benches/tpch_q1.rs`.
@@ -481,7 +493,7 @@ expressed over columns it is three passes and a materialised group key where the
 scalar version fuses everything into one. That is the aggregate bar, longer on
 its own than the entire scalar baseline.
 
-## TPC-H Q6 — filter and sum, narrow versus wide
+## TPC-H Q6: filter and sum, narrow versus wide
 
 Sum of revenue behind three compound predicates. Run twice: once on the
 12-column schema, once on a 30-column schema where 18 columns are never read.
@@ -560,8 +572,8 @@ the narrow case to 2.30× faster than the scalar loop.
 
 The scalar baseline degrades with column count: 2.096 ms → 12.41 ms for 2.5× the
 columns, because a row-oriented pass pulls every field into cache whether it is
-read or not. PCS goes 910.2 µs → 916.9 µs over the same change — **flat to
-within 0.7%** — because it reads the four columns the predicates name and never
+read or not. PCS goes 910.2 µs → 916.9 µs over the same change, **flat to
+within 0.7%**, because it reads the four columns the predicates name and never
 touches the other 26.
 
 Schema width is a multiplier, not a crossover. PCS wins the narrow case on the

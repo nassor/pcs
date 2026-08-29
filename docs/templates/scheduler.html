@@ -209,7 +209,7 @@ sched.add_pipeline_with_config(
 
             <path class="ln" d="M0 260 H654"/>
             <text class="t-sm" x="0" y="280">One tick awaits them one at a time: <tspan class="t-ctl">ingest, metrics, enrich, report</tspan>.</text>
-            <text class="t-sm" x="0" y="296">Parallelism lives one level down &mdash; inside a pipeline, across its ParallelSystems.</text>
+            <text class="t-sm" x="0" y="296">Parallelism lives one level down : inside a pipeline, across its ParallelSystems.</text>
         </g>
 
         <defs>
@@ -220,7 +220,7 @@ sched.add_pipeline_with_config(
     </svg>
     </div>
     <div class="dgm-key">
-        <span class="k-control"><i></i> stages, edges, priority &mdash; the plan</span>
+        <span class="k-control"><i></i> stages, edges, priority: the plan</span>
         <span class="k-data"><i></i> each pipeline's own Dataset</span>
     </div>
     <figcaption class="dgm-cap">
@@ -248,8 +248,8 @@ sched.add_pipeline_with_config(
 
 <p>
     Because each pipeline owns its dataset, that sequencing is a scheduling choice rather
-    than a safety requirement: two stage-mates share no state to race over. It also keeps
-    a tick cheap to reason about, since you drive the cadence yourself.
+    than a safety requirement: two stage-mates share no state to race over. You drive the
+    cadence yourself.
 </p>
 
 <div class="code">
@@ -569,17 +569,18 @@ if let Some(p) = sched.get_mut("ingest") {
         </tr>
         <tr>
             <td><strong>The distributed runner</strong></td>
-            <td>One workload that must span several nodes with claim leases, checkpoints and crash recovery. See <a href="{{ get_url(path='@/distributed.md') }}">Distributed Runner</a>.</td>
+            <td>One workload that must span several nodes with claim leases, checkpoints and crash recovery. See <a href="{{ get_url(path='@/distributed.md') }}">Distributed processing</a>.</td>
         </tr>
     </tbody>
 </table>
 
 <p>
     One boundary to know. <code>Scheduler</code> is a <code>pcs-core</code> API that you
-    drive from your own binary. <code>pcs-service</code> re-exports the type, but a service
-    configuration describes exactly one pipeline and the service never constructs a
-    scheduler. A multi-pipeline setup is something you write a <code>main</code> for, or
-    split across several service instances.
+    drive from your own binary. <code>pcs-service</code> re-exports the type, but a
+    <a href="{{ get_url(path='@/service/_index.md') }}">service configuration</a> describes
+    exactly one pipeline and the service never constructs a scheduler. A multi-pipeline
+    setup is something you write a <code>main</code> for, or split across several
+    <a href="{{ get_url(path='@/operations/running-pcs.md') }}">service instances</a>.
 </p>
 
 <h2 id="next">Next</h2>
@@ -592,7 +593,7 @@ if let Some(p) = sched.get_mut("ingest") {
     </a>
     <a href="{{ get_url(path='@/distributed.md') }}" class="next-card">
         <span class="next-card-label">Concept 05</span>
-        <h3>Distributed Runner</h3>
+        <h3>Distributed processing</h3>
         <p>Take one pipeline across several nodes, with leases and checkpoints instead of ticks.</p>
     </a>
 </div>

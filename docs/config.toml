@@ -58,9 +58,15 @@ path = "@/pipeline.md"
 [[extra.nav.items]]
 title = "Scheduler"
 path = "@/scheduler.md"
+[[extra.nav.items]]
+title = "Sources & Sinks"
+path = "@/io.md"
+[[extra.nav.items]]
+title = "Distributed processing"
+path = "@/distributed.md"
 
 [[extra.nav]]
-label = "Service"
+label = "The service"
 [[extra.nav.items]]
 title = "Overview"
 path = "@/service/_index.md"
@@ -73,6 +79,9 @@ path = "@/service/observability.md"
 [[extra.nav.items]]
 title = "Live dashboard"
 path = "@/service/dashboard.md"
+
+[[extra.nav]]
+label = "How-to guides"
 [[extra.nav.items]]
 title = "Branching"
 path = "@/service/branching.md"
@@ -84,10 +93,49 @@ title = "Operating pcs-service"
 path = "@/operations/running-pcs.md"
 
 [[extra.nav]]
-label = "Moving data"
+label = "WASM Processors"
 [[extra.nav.items]]
-title = "Sources & Sinks"
-path = "@/io.md"
+title = "Overview"
+path = "@/processors/_index.md"
+[[extra.nav.items]]
+title = "The WIT contract"
+path = "@/processors/wit-contract.md"
+[[extra.nav.items]]
+title = "Processors"
+path = "@/processors/languages.md"
+[[extra.nav.items.children]]
+title = "Rust"
+path = "@/processors/rust.md"
+[[extra.nav.items.children]]
+title = "Go"
+path = "@/processors/go.md"
+[[extra.nav.items.children]]
+title = "Python"
+path = "@/processors/python.md"
+[[extra.nav.items.children]]
+title = "TypeScript"
+path = "@/processors/typescript.md"
+[[extra.nav.items.children]]
+title = "Kotlin"
+path = "@/processors/kotlin.md"
+[[extra.nav.items.children]]
+title = "C#"
+path = "@/processors/csharp.md"
+
+[[extra.nav]]
+label = "Native"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/native/_index.md"
+[[extra.nav.items]]
+title = "Build your first pipeline"
+path = "@/native/tutorial.md"
+[[extra.nav.items]]
+title = "Native plugins"
+path = "@/native/plugins.md"
+
+[[extra.nav]]
+label = "Reference"
 [[extra.nav.items]]
 title = "Connectors"
 path = "@/connectors/_index.md"
@@ -136,63 +184,15 @@ path = "@/transformers/avro.md"
 [[extra.nav.items.children]]
 title = "arrow-ipc"
 path = "@/transformers/arrow-ipc.md"
-
-[[extra.nav]]
-label = "WASM Processors"
-[[extra.nav.items]]
-title = "Overview"
-path = "@/processors/_index.md"
-[[extra.nav.items]]
-title = "The WIT contract"
-path = "@/processors/wit-contract.md"
-[[extra.nav.items]]
-title = "Processors"
-path = "@/processors/languages.md"
-[[extra.nav.items.children]]
-title = "Rust"
-path = "@/processors/rust.md"
-[[extra.nav.items.children]]
-title = "Go"
-path = "@/processors/go.md"
-[[extra.nav.items.children]]
-title = "Python"
-path = "@/processors/python.md"
-[[extra.nav.items.children]]
-title = "TypeScript"
-path = "@/processors/typescript.md"
-[[extra.nav.items.children]]
-title = "Kotlin"
-path = "@/processors/kotlin.md"
-[[extra.nav.items.children]]
-title = "C#"
-path = "@/processors/csharp.md"
-
-[[extra.nav]]
-label = "Native"
-[[extra.nav.items]]
-title = "Overview"
-path = "@/native/_index.md"
-[[extra.nav.items]]
-title = "Build your first pipeline"
-path = "@/native/tutorial.md"
-[[extra.nav.items]]
-title = "Native plugins"
-path = "@/native/plugins.md"
-
-[[extra.nav]]
-label = "Running at scale"
-[[extra.nav.items]]
-title = "Distributed Runner"
-path = "@/distributed.md"
-
-[[extra.nav]]
-label = "Reference"
 [[extra.nav.items]]
 title = "Host to processor wire format"
 path = "@/reference/wire-format.md"
 [[extra.nav.items]]
 title = "The SDK packages"
 path = "@/reference/arrow-ipc-packages.md"
+[[extra.nav.items]]
+title = "Windowed aggregation"
+path = "@/reference/windowing.md"
 [[extra.nav.items]]
 title = "Tracing"
 path = "@/tracing.md"

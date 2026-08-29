@@ -25,6 +25,7 @@ Requires **Go 1.25.5 or newer**; CI verifies 1.26.3.
 ```bash,name=Install componentize-go
 go install github.com/bytecodealliance/componentize-go@v0.4.1
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 <div class="note note-warn">
 <span class="note-label">componentize-go on Windows</span>
@@ -47,6 +48,13 @@ go mod edit \
     -require=github.com/nassor/pcs/packages/pcs-sdk-go@v0.0.0 \
     -replace=github.com/nassor/pcs/packages/pcs-sdk-go=../../../../packages/pcs-sdk-go
 componentize-go -d ../../../../crates/pcs-processor/wit -w pcs-pipeline build -o validate-go.wasm
+```
+Windows (PowerShell):
+
+```powershell
+componentize-go -d ..\..\..\..\crates\pcs-processor\wit -w pcs-pipeline bindings --format
+go mod edit -require=github.com/nassor/pcs/packages/pcs-sdk-go@v0.0.0 -replace=github.com/nassor/pcs/packages/pcs-sdk-go=..\..\..\..\packages\pcs-sdk-go
+componentize-go -d ..\..\..\..\crates\pcs-processor\wit -w pcs-pipeline build -o validate-go.wasm
 ```
 
 The `replace` directive points at this repository's `packages/`, so the SDK
@@ -270,8 +278,16 @@ A transform is an ordinary function and a processor built without `Bind` drops
 its logs and metrics, so both test on the host. The SDK's own suite and the
 codec's now live in one module, so one command covers both:
 
+Linux/macOS:
+
 ```bash,name=Run the SDK test suite
 cd packages/pcs-sdk-go && go test ./...
+```
+
+Windows (PowerShell):
+
+```powershell
+cd packages\pcs-sdk-go; go test ./...
 ```
 
 <div class="note note-warn">
@@ -286,6 +302,12 @@ Host-side tests belong in a module of their own.
 ```bash,name=Validate the finished component
 wasm-tools validate --features component-model validate-go.wasm
 wasm-tools component wit validate-go.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model validate-go.wasm
+wasm-tools component wit validate-go.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output

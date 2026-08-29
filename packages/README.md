@@ -1,22 +1,22 @@
 # pcs-sdk
 
 One package per language. Each SDK is the zero-ceremony processor authoring
-package for its language, and each now also carries the Arrow IPC codec that
-reads and mutates the PCS host to processor wire format using nothing but the
-language's standard library. A WebAssembly processor can decode a batch without
-an Arrow dependency that survives its componentizer: the codec is internal to
-the SDK, keeping its original package/module/namespace name.
+package for its language, and each carries the Arrow IPC codec that reads and
+mutates the PCS host to processor wire format using only the language's
+standard library. A WebAssembly processor can decode a batch without an Arrow
+dependency that survives its componentizer: the codec is internal to the SDK,
+which keeps the package's original module and namespace name.
 
 The format itself is specified in
 [the wire format reference](https://nassor.github.io/pcs/reference/wire-format/).
-A sixth language reimplements it from there.
+A sixth language can reimplement it from there.
 
 ## Coordinates
 
 All five ship in lockstep at the version in `VERSION`: one wire format, one
 version. The Kotlin KSP symbol processor (`pcs-sdk-kt-ksp`) and the C# source
 generator (`Pcs.Sdk.Generators`) are build-time companions packed with their
-runtime; they are not additional runtime packages.
+runtime, not additional runtime packages.
 
 | Language | Directory | Coordinate | Codec import |
 |---|---|---|---|
@@ -46,8 +46,8 @@ dotnet nuget add source <download-dir> -n pcs-local
 dotnet add package Pcs.Sdk --version 0.1.0
 ```
 
-Kotlin resolves from a static Maven repository served by the docs site, with the
-KSP processor alongside the runtime:
+Kotlin resolves from a static Maven repository served by the docs site, with
+the KSP processor alongside the runtime:
 
 ```kotlin
 repositories {
@@ -63,11 +63,17 @@ dependencies {
 
 ## Tests
 
-Every suite reads `examples/polyglot/generated/`, so run the emitter first:
+Every suite reads `examples/polyglot/generated/`, so run the emitter first. It
+runs the same on Linux, macOS and Windows (PowerShell), from the repository
+root:
+
+```bash,name=Runs the same on Linux, macOS and Windows (PowerShell)
+cargo run -p pcs-service --features wasm --example polyglot_schema_emit -- emit
+```
+
+The five suites differ per shell. Linux/macOS:
 
 ```bash
-cargo run -p pcs-service --features wasm --example polyglot_schema_emit -- emit
-
 cd packages/pcs-sdk-go && go test ./...
 cd packages/pcs-sdk-py && PYTHONPATH=src python -m unittest discover -s tests
 cd packages/pcs-sdk-ts && npm ci && npm run typecheck && npm run build && npm test
@@ -75,7 +81,17 @@ cd packages/pcs-sdk-kt && gradle jvmTest
 cd packages/pcs-sdk-cs && dotnet test tests
 ```
 
-Each suite covers both the SDK and its absorbed codec, including the shared
+Windows (PowerShell):
+
+```powershell
+cd packages\pcs-sdk-go; go test ./...
+$env:PYTHONPATH = "src"; cd packages\pcs-sdk-py; python -m unittest discover -s tests
+cd packages\pcs-sdk-ts; npm ci; npm run typecheck; npm run build; npm test
+cd packages\pcs-sdk-kt; gradle jvmTest
+cd packages\pcs-sdk-cs; dotnet test tests
+```
+
+Each suite covers the SDK and its absorbed codec, including the shared
 conformance corpus at `packages/arrow-ipc-conformance/`.
 
 ## Release

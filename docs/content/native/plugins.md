@@ -1,6 +1,6 @@
 +++
 title = "Native plugins"
-description = "A shared library the host loads at runtime: two C symbols, the same Arrow IPC wire format a processor speaks, and none of the sandbox."
+description = "Build a cdylib exporting the pcs-plugin-abi C ABI, point a plugin node at it, and run."
 template = "page.html"
 weight = 2
 +++
@@ -92,32 +92,13 @@ boundary.
     </figcaption>
 </div>
 
-## What a plugin costs you
+## 1. Create a cdylib crate
 
-A processor is sandboxed, portable and preemptible. A wasmtime epoch deadline
-bounds every call, and a trap ends the batch instead of the service.
-
-A plugin has none of that. It runs in-process with full host privileges, it
-cannot be interrupted, and a memory error in it is a memory error in the host.
-What it buys is the absence of the sandbox: native threads, native extensions,
-and no componentizer in the build.
-
-<div class="note note-warn">
-<span class="note-label">A plugin is an operator trusted path</span>
-
-A wedged plugin wedges the thread driving it, and a segfault in one takes the
-service down with it. The optional `sha3_256` digest below is the only integrity
-gate there is. Point the `plugin` node at a library you built or a library you
-trust the way you trust the service binary itself.
-
-</div>
-
-## Authoring one in Rust
-
-`pcs-plugin` is the Rust SDK. A plugin crate sets `crate-type = ["cdylib"]`,
-depends on it, and hands a function that builds a `Pipeline` to
-`export_plugin!`. Every block below is from
-`crates/pcs-plugin-smoketest/src/lib.rs`, which CI builds.
+`pcs-plugin` is the Rust SDK. A plugin crate sets `crate-type = ["cdylib"]`
+and depends on it; `export_plugin!` writes the two exported symbols, the four
+vtable thunks, and the `pcs_config_get` and `pcs_config_parse` functions into
+the crate. Every block below is from `crates/pcs-plugin-smoketest/src/lib.rs`,
+which CI builds.
 
 ```toml,name=The plugin crate manifest
 [lib]
@@ -127,6 +108,12 @@ crate-type = ["cdylib"]
 pcs-plugin = { path = "../pcs-plugin" }
 serde      = { workspace = true }
 ```
+
+## 2. Export the pipeline
+
+Hand `export_plugin!` a function that builds a `Pipeline`. The pipeline's
+components and systems are the plugin's, written exactly as in a
+[native pipeline](@/native/tutorial.md).
 
 ```rust,name=The build function and the export macro
 use pcs_plugin::prelude::*;
@@ -144,22 +131,126 @@ pub fn build() -> Pipeline {
 pcs_plugin::export_plugin!(build, state = Total);
 ```
 
-The macro writes both exported symbols, the four vtable thunks, and the
-`pcs_config_get` and `pcs_config_parse` functions into the crate.
-`cargo build --release` on it produces the library.
-
 The optional `state = T` names the one component whose rows survive a batch,
 and `export_plugin!(build)` without it declares a stateless plugin. `T` must
 not be registered in `build()`: the macro decodes the prior checkpoint into a
 `ProcessorState<T>` resource before the pipeline runs and captures it
 afterwards, so those rows never appear in the output. A plugin's process
-memory does survive between calls, and keeping state there is still wrong.
-Consecutive batches of one partition may land on different processes, and
-only the checkpoint travels with the claim.
+memory does survive between calls, and keeping state there is still wrong:
+consecutive batches of one partition may land on different processes, and only
+the checkpoint travels with the claim.
 
-Config values arrive as strings through those generated functions. Logging and
-metrics go out through `pcs_plugin::host`, the native counterpart of the
-`host-io` interface a processor imports.
+## 3. Build it
+
+```bash,name=Build the plugin
+cargo build
+```
+
+Runs the same on all three platforms. The artifact name is platform specific:
+
+| Platform | Artifact |
+|----------|----------|
+| Linux | `target/debug/libpcs_plugin_smoketest.so` |
+| macOS | `target/debug/libpcs_plugin_smoketest.dylib` |
+| Windows | `target/debug/pcs_plugin_smoketest.dll` |
+
+## 4. Write the config node
+
+A `plugin` node in the workflow names the library. The key is `library`, not
+`module`; a `link` treats a plugin node exactly like a `wasm` node.
+
+```kdl,name=The plugin node in a service config
+workflow "counter" {
+    plugin "process_counter" library="${PCS_PLUGIN_LIB:-target/debug/libpcs_plugin_smoketest.so}" {
+        // Optional. Hex digest of the library file's bytes, with an optional
+        // `sha3-256:` prefix; a mismatch refuses the load.
+        // sha3_256="sha3-256:abc123..."
+        config "smoketest.multiplier"="10"
+    }
+}
+```
+
+A relative `library` resolves against the loader base directory. An absolute
+path ignores it. An unknown key in the node is a parse error.
+
+## 5. Validate and run
+
+```bash,name=Validate the config
+cargo run -p pcs-service --features connector-file,transformer-csv,plugin -- validate \
+  --config examples/configs/standalone_plugin.kdl --strict
+```
+
+Linux/macOS:
+
+```bash,name=Run the service
+cargo run -p pcs-service --features connector-file,transformer-csv,plugin -- serve \
+  --config examples/configs/standalone_plugin.kdl
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:PCS_PLUGIN_LIB = "target/debug/pcs_plugin_smoketest.dll"
+cargo run -p pcs-service --features connector-file,transformer-csv,plugin -- serve --config examples/configs/standalone_plugin.kdl
+```
+
+The config reads `examples/configs/fixtures/counter_input.csv`, runs the
+plugin, and writes `/tmp/pcs-counter-out.csv` with the `seen` column filled.
+`validate` opens no connection, but the plugin library is loaded and its
+`describe` runs, so a broken library fails there rather than at the first
+batch.
+
+To load a plugin from your own binary instead of the config, call
+`pcs_service::plugin::NativePluginRuntime::open` with the library path and the
+config map. There is no name argument: the manifest name is authoritative.
+
+```bash,name=Build the plugin then load it
+cargo build -p pcs-plugin-smoketest
+cargo run -p pcs-service --features plugin --example native_plugin
+```
+
+## What a plugin costs you
+
+A processor is sandboxed, portable and preemptible. A wasmtime epoch deadline
+bounds every call, and a trap ends the batch instead of the service.
+
+A plugin has none of that. It runs in-process with full host privileges, it
+cannot be interrupted, and a memory error in it is a memory error in the host.
+What it buys is the absence of the sandbox: native threads, native extensions,
+and no componentizer in the build.
+
+<div class="note note-warn">
+<span class="note-label">A plugin is an operator trusted path</span>
+
+A wedged plugin wedges the thread driving it, and a segfault in one takes the
+service down with it. The optional `sha3_256` digest is the only integrity
+gate there is. Point the `plugin` node at a library you built or a library you
+trust the way you trust the service binary itself.
+
+</div>
+
+## How the host loads one
+
+Load ordering is fixed: check `pcs_abi_version` against the host's own, verify
+the digest when one is set, call `describe`, decode every component schema, then
+recompute the schema fingerprint from what was decoded. A fingerprint that
+disagrees with the manifest fails the load, because it means the plugin's
+embedded schema constants have drifted from what it declares. All of it happens
+in the constructor, so a running service never holds a plugin whose schemas it
+has not verified.
+
+A plugin returns a status per batch. `PCS_STATUS_RETRYABLE` releases the claim
+for a retry; `PCS_STATUS_PERMANENT` fails the batch; a caught panic is reported
+as permanent. On the Rust side, return a `PcsError` from a system rather than
+panicking: `SystemExecution` and `RetryExhausted` become a retryable status,
+every other variant becomes a permanent one, and the SDK's own guard turns a
+panic into a permanent status. The batch is lost either way, and only the
+retryable status lets the runner release the claim and try again.
+
+Config values arrive as strings through the generated `pcs_config_get` /
+`pcs_config_parse` functions. Logging and metrics go out through
+`pcs_plugin::host`, the native counterpart of the `host-io` interface a
+processor imports.
 
 ```rust,name=Reading a config value in a system
 let multiplier = match pcs_config_parse::<i64>(MULTIPLIER_KEY) {
@@ -178,45 +269,9 @@ pcs_plugin::host::metric("smoketest.rows", rows as f64);
 pcs_plugin::host::info("smoketest", &format!("numbered {rows} rows through {advanced}"));
 ```
 
-Return a `PcsError` from a system rather than panicking. `SystemExecution` and
-`RetryExhausted` become a retryable status, every other variant becomes a
-permanent one, and a caught panic is reported as permanent. The batch is lost
-either way, and only the retryable status lets the runner release the claim and
-try again.
-
-## How the host loads one
-
-```kdl,name=The plugin node in a service config
-pipeline {
-    plugin library="/var/lib/pcs/pipelines/libpcs_plugin_smoketest.so" {
-        // Optional. Hex digest of the library file's bytes, with an optional
-        // `sha3-256:` prefix.
-        sha3_256 "abc123..."
-        config "smoketest.multiplier"="10"
-    }
-}
-```
-
-A relative `library` resolves against the loader base directory. An unknown key
-in the node is a parse error, and setting both a `wasm` and a `plugin` node
-fails the build rather than picking one.
-
-Load ordering is fixed: check `pcs_abi_version` against the host's own, verify
-the digest when one is set, call `describe`, decode every component schema, then
-recompute the schema fingerprint from what was decoded. A fingerprint that
-disagrees with the manifest fails the load, because it means the plugin's
-embedded schema constants have drifted from what it declares. All of it happens
-in the constructor, so a running service never holds a plugin whose schemas it
-has not verified.
-
-To load one from your own binary, call
-`pcs_service::plugin::NativePluginRuntime::open` with the library path and the
-config map. There is no name argument: the manifest name is authoritative.
-
-```bash,name=Build the plugin then load it
-cargo build -p pcs-plugin-smoketest
-cargo run -p pcs-service --features plugin --example native_plugin
-```
+The plugin ABI's `metric` callback writes no series of its own: the host records
+the same six `pcs_processor_*` series from the per-batch metrics a plugin
+reports, exactly as it does for a WASM processor.
 
 ## Plugins in other languages
 

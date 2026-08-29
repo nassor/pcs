@@ -41,8 +41,8 @@ Reach for PCS when:
 
 Look elsewhere when you want SQL (use [DataFusion](https://datafusion.apache.org/)), or you have
 fewer than ~10k rows total and a `Vec` would do. For per-item processing, run the same pipeline in
-[stream mode](https://nassor.github.io/pcs/service/): sub-millisecond per item in-process. Batch mode
-remains the default for throughput.
+[stream mode](https://nassor.github.io/pcs/service/), under a millisecond per item in-process.
+Batch mode remains the default for throughput.
 
 The name is a nod to ECS (Entity Component System) from game development. Where ECS organises game
 entities as components that systems act on each frame, PCS organises a data `Pipeline` as
@@ -76,29 +76,30 @@ Numbers and methodology: [benchmark results](https://nassor.github.io/pcs/benchm
 
 ## Quick start
 
+Fifteen minutes, in a checkout of this repository. The commands run the same on Linux, macOS
+and Windows (PowerShell):
+
 ```bash
+git clone https://github.com/nassor/pcs
+cd pcs
+
 rustup target add wasm32-wasip2
-cargo install wasm-tools    --locked --version 1.246.2
+cargo install wasm-tools --locked --version 1.246.2   # pinned in examples/polyglot/PINS.md
 ```
 
-Run a working pipeline without writing anything:
+Then run a working pipeline without writing anything:
 
 ```bash
 cargo run -p pcs-service --example scheduler_etl
 ```
 
-Then compile that same style of pipeline to a WebAssembly component and confirm it exports the PCS
-world:
+The example target compiles the crate's dev-dependencies, so it also needs
+`protoc` on PATH (`raft-proto` in that set has a build script that calls it;
+see AGENTS.md for the Windows install).
 
-```bash
-cargo build --release -p order-processing-wasm --target wasm32-wasip2
-
-wasm-tools validate --features component-model \
-    target/wasm32-wasip2/release/order_processing_wasm.wasm
-```
-
-`rustc` links a `wasm32-wasip2` cdylib into a Component Model component itself, so plain
-`cargo build` is the whole toolchain: no componentizer, no preview1 adapter step.
+It prints the stage plan PCS derived from the systems' field declarations (ValidateSystem and
+EnrichSystem share stage 1 because they write disjoint fields), then a summary report: 9
+transactions, 7 valid, 2 rejected.
 
 For your own component, your own system, and the config that runs it, follow
 **[Build your first pipeline](https://nassor.github.io/pcs/native/tutorial/)**.
@@ -131,13 +132,15 @@ on the WASM Processors page.
 
 | | |
 |---|---|
+| **[Quick start](https://nassor.github.io/pcs/quickstart/)** | Install the binary, then run a real pipeline in 15 minutes |
+| **[What PCS is](https://nassor.github.io/pcs/)** | The one-paragraph pitch and the end-to-end diagram |
 | **[Build your first pipeline](https://nassor.github.io/pcs/native/tutorial/)** | A native pipeline in nine steps, from the component to the stage plan |
 | **[Dataset & Components](https://nassor.github.io/pcs/dataset/)** | How data is stored, appended, deleted, and serialised |
 | **[Systems](https://nassor.github.io/pcs/systems/)** | Writing a transform and declaring its field access |
 | **[Pipeline](https://nassor.github.io/pcs/pipeline/)** | Stage derivation and per-system retry |
 | **[Scheduler](https://nassor.github.io/pcs/scheduler/)** | Several pipelines in one process, with dependencies |
 | **[Sources & Sinks](https://nassor.github.io/pcs/io/)** | Getting rows in and out |
-| **[Distributed Runner](https://nassor.github.io/pcs/distributed/)** | Row-range leases, checkpoints, Raft |
+| **[Distributed processing](https://nassor.github.io/pcs/distributed/)** | Row-range leases, checkpoints, Raft |
 | **[Service](https://nassor.github.io/pcs/service/)** | KDL config schema, validation gates, HTTP control plane |
 | **[Operating pcs-service](https://nassor.github.io/pcs/operations/running-pcs/)** | Deployment, tuning, failure modes |
 | **[Tracing](https://nassor.github.io/pcs/tracing/)** | Spans, metrics, and the Prometheus endpoint |
@@ -151,44 +154,18 @@ Apache-2.0 [SDK packages](./packages/), and toolchain pins for [Rust
 processors](./crates/pcs-processor/PINS.md) and [the other
 languages](./examples/polyglot/PINS.md).
 
-## Workspace
+## Main crates
 
-| Crate | Contents |
+| Crate | What it holds |
 |---|---|
-| `pcs-core` | `Dataset`, `Component`, `System`, `Pipeline`, `Scheduler`, and the `Source`/`Sink` traits. Arrow-only dependencies; used by both host and processor. |
-| `pcs-config` | The configuration language: parses KDL into `ConfigValue`, the value type every factory reads. |
-| `pcs-connector` | The factory contract every connector implements: `SourceFactory`, `SinkFactory`. |
-| `pcs-connector-channel` | In-memory mpsc `Source` and `Sink`. |
-| `pcs-connector-datafusion` | `Source` over a DataFusion SQL query. |
-| `pcs-connector-file` | Local-file `Source` and `Sink`. A transformer supplies the format. |
-| `pcs-connector-http` | HTTP and HTTPS `Source` and `Sink`. One GET in, one request per batch out. |
-| `pcs-connector-kafka` | Kafka `Source` and `Sink`. |
-| `pcs-connector-nats` | NATS `Source` and `Sink`, core subjects or JetStream. |
-| `pcs-connector-postgresql` | PostgreSQL `Source` and `Sink`. |
-| `pcs-connector-tcp` | Live TCP `Source` that listens and `Sink` that dials, over one length-prefixed frame. |
-| `pcs-processor` | Processor SDK. Re-exports `pcs-core`, provides `export_pipeline!`, owns the canonical WIT at `wit/pipeline.wit`. |
-| `pcs-processor-smoketest` | Minimal processor component used by CI to gate the Arrow IPC wire format. |
-| `pcs-plugin` | Native plugin host: loads a shared library through the `pcs-plugin-abi` C ABI. |
-| `pcs-plugin-abi` | The C ABI a native plugin exports. |
-| `pcs-plugin-smoketest` | Minimal native plugin used by CI as a fixture. |
-| `pcs-service` | Host binary: wasmtime, distribution, config, HTTP, and the factory registry. |
-| `pcs-transformer` | The byte-format contract: `Transformer`, `BatchReader`, `BatchWriter`, `MessageDecoder`, and the `TransformerRegistry`. |
-| `pcs-transformer-arrow-ipc` | Arrow IPC message codec, format `arrow-ipc`. |
-| `pcs-transformer-avro` | Avro object container file reader and writer plus message codec, format `avro`. |
-| `pcs-transformer-csv` | CSV reader and writer, format `csv`. |
-| `pcs-transformer-ndjson` | Newline-delimited JSON reader, writer, and message codec, format `ndjson`. |
-| `pcs-transformer-parquet` | Parquet reader and writer, format `parquet`. |
-| `polyglot-settle-wasm` | Rust stage of the polyglot example: writes `settlement`, keeps the ledger. |
+| `pcs-core` | `Dataset`, `Component`, `System`, `Pipeline`, `Scheduler`, the `Source`/`Sink` traits |
+| `pcs-service` | The host binary: wasmtime, KDL config, HTTP control plane, distributed runner |
+| `pcs-processor` | The processor SDK and the canonical `pcs:pipeline@0.3.0` WIT world |
+| `pcs-connector-*`, `pcs-transformer-*` | One transport and one byte format per crate |
+| `pcs-plugin`, `pcs-plugin-abi` | The native plugin host and its C ABI |
 
-## Building from source
-
-```bash
-cargo build --features service,wasm          # standalone binary, no connectors
-cargo build --features connector-file,transformer-csv,wasm   # with the file connector reading CSV
-cargo build --features service-cluster,wasm  # with Raft cluster support
-cargo test --workspace --all-features     # full suite
-cargo clippy --all-targets --all-features -- -D warnings
-```
+The full workspace map, every feature flag, and the build and test commands live in
+[`AGENTS.md`](./AGENTS.md).
 
 ## Project status
 
@@ -204,4 +181,5 @@ feedback are very welcome.
 
 ## License
 
-Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
+Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE). The `packages/`
+subtree is Apache-2.0, see [packages/LICENSE-APACHE](packages/LICENSE-APACHE).

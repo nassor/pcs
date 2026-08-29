@@ -131,6 +131,8 @@ without headers, append cleanly.
 transport. `examples/configs/standalone.kdl` is a runnable service config over
 `examples/configs/fixtures/orders.csv`:
 
+Runs the same on Linux, macOS and Windows (PowerShell):
+
 <div class="code">
 <div class="code-cap"><span>Bash</span><em>validating examples/configs/standalone.kdl with connector-file and transformer-csv</em></div>
 

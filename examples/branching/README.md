@@ -12,21 +12,28 @@ output fans out, each split to its own sink:
 
 | Split | Edge | Where each batch goes |
 |-------|------|----------------------|
-| Source | `in` → `out_mirror`, `router_wasm`, `router_plugin` | Every downstream, unconditionally |
-| WASM processor | `router_wasm` → `out_wasm_high` / `out_wasm_low` | Only the branch the decision names |
-| Plugin | `router_plugin` → `out_plugin_premium` / `out_plugin_standard` | Only the branch the decision names |
+| Source | `in` to `out_mirror`, `router_wasm`, `router_plugin` | Every downstream, unconditionally |
+| WASM processor | `router_wasm` to `out_wasm_high` / `out_wasm_low` | Only the branch the decision names |
+| Plugin | `router_plugin` to `out_plugin_premium` / `out_plugin_standard` | Only the branch the decision names |
 
 A NATS core subject feeds the workflow in `run_mode kind="stream"`, so every
 message is its own batch and the routers decide per message. The publisher
-(`branching_publish`, a `pcs-service` example like the Quick Start's
-`quickstart_publish`) draws priority 50/50 between `"high"` and `"low"`, so
-both branches of both processor splits fire continuously while it runs.
+(`branching_publish`, a `pcs-service` example) draws priority 50/50 between
+`"high"` and `"low"`, so both branches of both processor splits fire
+continuously while it runs.
+
+## Prerequisites
+
+- Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
+- `protoc` on `PATH`, because the `branching_publish` example compiles a
+  `pcs-service` example target (see `AGENTS.md` for install commands)
+- A Docker daemon, for the NATS container
 
 ## Build the processors
 
 The same two commands work on every platform, from the repository root:
 
-```bash
+```text
 cargo build --release -p branching-wasm --target wasm32-wasip2
 cargo build -p branching-plugin
 ```
@@ -46,61 +53,62 @@ and Windows need `PCS_PLUGIN_LIB`:
 Start NATS, then the service, then the publisher. `PCS_OUT_DIR` names the
 directory the five sink files land in; it must exist before `serve` starts.
 
-### NATS
+1. Start NATS:
 
-```bash
+```text
 docker run -d --name pcs-nats -p 4222:4222 nats:2.11-alpine
 ```
 
+Runs the same on all three platforms.
+
 Stop it with `docker rm -f pcs-nats`.
 
-### Linux
+2. Start the service.
 
-```bash
+Linux:
+
+```text
 mkdir -p /tmp/pcs-branching
-
 PCS_OUT_DIR=/tmp/pcs-branching \
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve \
   --config examples/branching/branching.kdl
 ```
 
-Then, in another terminal:
+macOS:
 
-```bash
-cargo run -p pcs-service --example branching_publish -- --rate 50
-```
-
-### macOS
-
-The same as Linux, with `PCS_PLUGIN_LIB` set on the serve command:
-
-```bash
+```text
 mkdir -p /tmp/pcs-branching
-
 PCS_OUT_DIR=/tmp/pcs-branching \
 PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve \
   --config examples/branching/branching.kdl
 ```
 
-### Windows (PowerShell)
+Windows (PowerShell):
 
 ```powershell
 mkdir C:\pcs-branching
-
 $env:PCS_OUT_DIR = "C:/pcs-branching"
 $env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve --config examples/branching/branching.kdl
 ```
 
-Then, in another terminal:
+The config's paths use forward slashes, which work on Windows too; the
+`C:/pcs-branching` output path above follows the same rule.
+
+3. Publish, in another terminal:
+
+Linux and macOS:
+
+```text
+cargo run -p pcs-service --example branching_publish -- --rate 50
+```
+
+Windows (PowerShell):
 
 ```powershell
 cargo run -p pcs-service --example branching_publish -- --rate 50
 ```
-
-The config's paths use forward slashes, which work on Windows too; the
-`C:/pcs-branching` output path above follows the same rule.
 
 ## What each file holds
 
@@ -115,13 +123,14 @@ The publisher's messages carry `priority "high"` or `priority "low"`.
 | `out-plugin-standard.csv` | the `"low"` messages |
 
 `out_mirror` proves the source split: every batch is written there verbatim
-while the same batch feeds both routers. The wasm router (`examples/branching/
-wasm`) reads the first row's priority and inserts a `RouteDecision` naming
-branch `high` or `low`; the plugin (`examples/branching/plugin`) maps the same
-values to branches `premium` and `standard`. The host delivers each batch only
-to the links whose `branch` the decision names, which is what separates the
-sinks. The CSV header is written once, before the first batch, so each file
-stays a readable table however long the stream runs.
+while the same batch feeds both routers. The wasm router
+(`examples/branching/wasm`) reads the first row's priority and inserts a
+`RouteDecision` naming branch `high` or `low`; the plugin
+(`examples/branching/plugin`) maps the same values to branches `premium` and
+`standard`. The host delivers each batch only to the links whose `branch` the
+decision names, which is what separates the sinks. The CSV header is written
+once, before the first batch, so each file stays a readable table however long
+the stream runs.
 
 The publisher's flags: `--count` (0 runs until Ctrl-C, the default), `--rate`
 messages per second (default 50), `--url` (default `nats://localhost:4222`),
@@ -130,7 +139,21 @@ messages per second (default 50), `--url` (default `nats://localhost:4222`),
 Validate the config first, if you like (set `PCS_PLUGIN_LIB` as in the table
 above on macOS and Windows):
 
-```bash
+```text
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate \
   --config examples/branching/branching.kdl --strict
 ```
+Windows (PowerShell), on one line:
+
+```powershell
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate --config examples/branching/branching.kdl --strict
+```
+
+## Files
+
+| File / directory | What it is |
+|------------------|------------|
+| `branching.kdl` | the stream workflow with all three fan-out splits |
+| `branching_publish.rs` | the `pcs-service` example that feeds the NATS subject |
+| `wasm/` | the `branching-wasm` processor component (cdylib, wasm32-wasip2) |
+| `plugin/` | the `branching-plugin` native plugin (cdylib) |

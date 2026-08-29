@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Tracing &amp; metrics — PCS{% endblock %}
-{% block description %}PCS emits a three-level span tree behind the tracing feature flag, and pcs-service exposes a Prometheus /metrics endpoint carrying nineteen series. The spans, the config keys, OTLP span export, and what is still missing.{% endblock %}
+{% block description %}PCS emits a three-level span tree behind the tracing feature flag, and pcs-service exposes a Prometheus /metrics endpoint carrying nineteen series. The spans, the config keys, OTLP span export, and what is not there.{% endblock %}
 {% block og_title %}Tracing &amp; metrics — PCS{% endblock %}
 {% block og_description %}One feature flag decides whether anything is emitted at all. Exactly what comes out, and what does not.{% endblock %}
 
@@ -12,7 +12,11 @@
 
 <p class="page-lede">
     PCS emits structured <code>tracing</code> events, gated behind one feature flag.
-    <code>pcs-core</code> emits; <code>pcs-service</code> exports.
+    <code>pcs-core</code> emits; <code>pcs-service</code> exports. This page is
+    reference: the spans, the config keys, the series and their writers. The two
+    sections "Where instrumentation comes from" and "The spans and events" are
+    explanation, for readers who want the shape of the tree before the exact
+    keys.
 </p>
 
 <dl class="page-facts">
@@ -25,6 +29,8 @@
 </dl>
 
 <h2 id="where">Where instrumentation comes from</h2>
+
+<p><strong>Explanation.</strong> The two exits a running process has, and the one value that crosses between them.</p>
 
 <p>
     Two things leave a running PCS process. <code>tracing</code> events and spans go to
@@ -67,7 +73,7 @@
             <text class="t-lbl t-ctl" x="12" y="107">pcs-core</text>
 
             <rect class="row" x="8" y="120" width="170" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="133">retry &mdash; task_attempt</text>
+            <text class="t-sm" x="16" y="133">retry: task_attempt</text>
             <rect class="row" x="8" y="142" width="170" height="18" rx="3"/>
             <text class="t-sm" x="16" y="155">windows::system warn</text>
         </g>
@@ -77,7 +83,7 @@
             <rect class="hd hd-ctl" x="0" y="180" width="186" height="22" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="194" width="186" height="8"/>
             <text class="t-lbl t-ctl" x="12" y="195">pcs-service</text>
-            <text class="t-sm t-end" x="178" y="195">62 events</text>
+            <text class="t-sm t-end" x="178" y="195">spans + events</text>
 
             <rect class="row" x="8" y="208" width="170" height="18" rx="3"/>
             <text class="t-sm" x="16" y="221">service::standalone</text>
@@ -160,7 +166,7 @@
             <text class="t-lbl t-ctl" x="418" y="299">GET /metrics</text>
 
             <rect class="row" x="414" y="312" width="232" height="18" rx="3"/>
-            <text class="t-sm t-ctl" x="422" y="325">12 service series</text>
+            <text class="t-sm t-ctl" x="422" y="325">13 service series</text>
             <rect class="row" x="414" y="334" width="232" height="18" rx="3"/>
             <text class="t-sm t-ctl" x="422" y="347">6 pcs_processor_* series</text>
             <text class="t-sm" x="418" y="369">text/plain; version=0.0.4</text>
@@ -197,6 +203,8 @@
 </div>
 
 <h2 id="feature">The tracing feature</h2>
+
+<p><strong>Reference.</strong> The compile-time switch, and the two fallbacks it leaves behind.</p>
 
 <p>
     Both crates declare it, and it is off by default in <code>pcs-core</code>
@@ -253,6 +261,8 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
 
 <h2 id="events">The spans and events, module by module</h2>
 
+<p><strong>Explanation.</strong> The shape of the tree, then the exact names and fields.</p>
+
 <p>
     Nine span names, plus flat events across fourteen targets.
     <code>pipeline.run</code>, <code>pipeline.stage</code> and
@@ -292,7 +302,7 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         <tr>
             <td><code>pcs_service::service::standalone</code></td>
             <td>debug spans, info, warn, error</td>
-            <td>One <code>workflow.batch</code> span per iteration with <code>workflow</code>, <code>iteration</code> and <code>rows</code>, one <code>source.drain</code> per source with <code>workflow</code>, <code>source</code>, <code>component</code> and <code>rows</code>, one <code>runtime.run</code> per processor with <code>workflow</code>, <code>processor</code>, <code>rows_in</code> and <code>rows_out</code>, and one <code>sink.write</code> per sink with <code>workflow</code>, <code>sink</code>, <code>component</code> and <code>rows</code>, in topological order. Every iteration event names the batch span as its parent, so the whole iteration is one trace. The busiest module, 15 event sites.</td>
+            <td>One <code>workflow.batch</code> span per iteration with <code>workflow</code>, <code>iteration</code> and <code>rows</code>, one <code>source.drain</code> per source with <code>workflow</code>, <code>source</code>, <code>component</code> and <code>rows</code>, one <code>runtime.run</code> per processor with <code>workflow</code>, <code>processor</code>, <code>rows_in</code> and <code>rows_out</code>, and one <code>sink.write</code> per sink with <code>workflow</code>, <code>sink</code>, <code>component</code> and <code>rows</code>, in topological order. Every iteration event names the batch span as its parent, so the whole iteration is one trace. The busiest module.</td>
         </tr>
         <tr>
             <td><code>pcs_service::service::stream</code></td>
@@ -316,7 +326,7 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
         </tr>
         <tr>
             <td><code>pcs_service::wasm::host_impl</code></td>
-            <td>trace&ndash;error</td>
+            <td>trace to error</td>
             <td>The processor's own <code>host-io::log</code> lines, re-emitted at the level the processor asked for and tagged <code>pipeline</code> and <code>target</code>. They land inside that batch's <code>processor.batch</code> span, because the runtime re-enters it on the blocking thread the guest call runs on. A <code>host-io::metric</code> call records the <code>pcs_processor_metric</code> histogram, labelled with the metric name, and also emits a <code>trace</code> event with <code>metric</code> and <code>value</code>.</td>
         </tr>
         <tr>
@@ -455,6 +465,8 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
 
 <h2 id="subscriber">Installing a subscriber</h2>
 
+<p><strong>Reference.</strong> What a library embedder must do, and what the binary does instead.</p>
+
 <p>
     PCS never installs a subscriber for you when you use it as a library. Without one,
     every event is discarded and you see nothing. The minimum is
@@ -463,7 +475,7 @@ service = ["pcs-core/io", "distributed", "parquet-checkpoint", "tracing", "dep:p
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>TOML</span><em>path dependencies &mdash; these crates are not published</em></div>
+    <div class="code-cap"><span>TOML</span><em>path dependencies: these crates are not published</em></div>
     <pre><code class="language-toml">[dependencies]
 pcs-core = { path = "../pcs-core", features = ["tracing"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }</code></pre>
@@ -486,7 +498,7 @@ async fn main() {
 
 <p>
     The service binary does this for you. <code>pcs-service serve</code> calls
-    <code>init_logging</code> as step 3, before anything else can emit, and treats a
+    <code>init_logging</code> before anything else can emit, and treats a
     second call as an error because the global subscriber is already installed. It stacks
     four layers: the <code>EnvFilter</code>, the <code>fmt</code> layer,
     <code>SpanMetricsLayer</code> for the stage histogram, and an OTLP layer when
@@ -509,6 +521,8 @@ telemetry.shutdown().await;</code></pre>
 </div>
 
 <h2 id="config">Level, format and span export from the config file</h2>
+
+<p><strong>Reference.</strong> The four keys, the filter they build, and the orders of precedence.</p>
 
 <p>
     The <code>observability</code> node has four keys: two for the log stream and two
@@ -590,7 +604,23 @@ RUST_LOG="off,pcs_service::wasm::host_impl=trace" \
   pcs-service serve --config standalone_wasm.kdl</code></pre>
 </div>
 
+<div class="code">
+    <div class="code-cap"><span>PowerShell</span><em>the same three, in env-var form</em></div>
+    <pre><code class="language-powershell"># PCS_LOG_LEVEL beats the config file
+$env:PCS_LOG_LEVEL = "debug"
+pcs-service serve --config standalone.kdl
+
+# Span export without touching the config file
+pcs-service serve --config standalone.kdl --otlp-endpoint http://127.0.0.1:4318
+
+# RUST_LOG beats everything: only the standalone runner, everything else quiet
+$env:RUST_LOG = "warn,pcs_service::service::standalone=info"
+pcs-service serve --config standalone.kdl</code></pre>
+</div>
+
 <h2 id="metrics">The Prometheus endpoint</h2>
+
+<p><strong>Reference.</strong> The nineteen series, who writes each one, and the attribution split.</p>
 
 <p>
     The service binary builds a <code>prometheus::Registry</code>, hands it to
@@ -614,14 +644,21 @@ RUST_LOG="off,pcs_service::wasm::host_impl=trace" \
 # pcs_ready{otel_scope_name="pcs"} 1
 # pcs_uptime_seconds{otel_scope_name="pcs"} 5.0141387
 
-curl -s localhost:8080/status | jq .standalone
+curl -s localhost:8080/status | jq '.standalone[0]'
 # {
+#   "workflow_id": "orders",
 #   "iterations": 7,
 #   "rows_processed": 7000,
 #   "source_batches_drained": 7,
 #   "sink_batches_written": 7,
 #   "iteration_errors": 0
 # }</code></pre>
+</div>
+
+<div class="code">
+    <div class="code-cap"><span>PowerShell</span><em>same scrape, same shape</em></div>
+    <pre><code class="language-powershell">curl.exe -s localhost:8080/metrics | Select-String '^pcs_'
+curl.exe -s localhost:8080/status | ConvertFrom-Json | Select-Object -ExpandProperty standalone</code></pre>
 </div>
 
 <p>
@@ -683,7 +720,7 @@ curl -s localhost:8080/status | jq .standalone
     <code>/health</code> is the one to alert on: it is backed by the watchdog counter, so
     it goes stale if the main loop wedges. <code>/ready</code> and <code>/status</code>
     both mean less than they look; see
-    <a href="#gaps">what is still missing</a>.
+    <a href="#gaps">what is not there</a>.
 </p>
 
 <p>
@@ -693,11 +730,9 @@ curl -s localhost:8080/status | jq .standalone
     <a href="{{ get_url(path='@/service/observability.md') }}">Observability</a>.
 </p>
 
-<h2 id="gaps">What is still missing</h2>
+<h2 id="gaps">What is not there</h2>
 
-<p>
-    Five things an operator may expect and will not find, and one that appears twice.
-</p>
+<p><strong>Reference.</strong> Six things an operator may expect and will not find.</p>
 
 <ul>
     <li>

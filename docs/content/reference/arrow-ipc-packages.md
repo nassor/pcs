@@ -39,6 +39,9 @@ from the Maven repository this site serves.
 
 ## Install
 
+Every install command below runs the same on Linux, macOS and Windows
+(PowerShell).
+
 Go. The import path's last element is `pcs-sdk-go`; the codec is the `arrowipc`
 subpackage:
 
@@ -136,9 +139,30 @@ None of the five codecs writes a flatbuffer, so each one refuses four things:
 - **No validity writes.** A non-nullable field carries an all-ones validity
   bitmap from arrow-rs, and an in-place value write never has to touch it.
 
-Everything a processor does not touch is returned byte-identical: the
-framing words, both flatbuffers per segment, and the trailing `__alive`
-bitmap.
+## Conformance corpus
+
+`packages/arrow-ipc-conformance/` pins all five codecs to one answer about
+which streams are valid. The `manifest.json` lists the cases; each `vectors/*.pcs`
+holds one binary stream. A case is `accept` or `reject`: an accept case carries
+the components, row count and column values a codec must read back, a reject
+case a `reason`. The reason is the contract, because error text is local to
+each language; a codec maps each reason to whatever substring its own message
+uses. Every SDK suite runs the corpus, so a sixth implementation has an
+acceptance suite the day it starts.
+
+The corpus is generated from a real `Dataset::write_ipc` stream, each malformed
+vector derived by editing those bytes in place, so no vector is a hand-forged
+flatbuffer that could drift from what arrow-rs emits. Regenerate it after any
+wire format or `Order` schema change:
+
+```bash,name=Regenerate the conformance corpus
+cargo run -p pcs-service --features conformance --example conformance_vectors -- emit
+```
+
+Two reference rules are host-side, not codec rules, so the corpus deliberately
+has no vector for either: the `__alive` cross-check on a component's row count,
+and 8-byte buffer alignment, which is a property the writer guarantees rather
+than a rule a reader enforces.
 
 ## Compatibility
 

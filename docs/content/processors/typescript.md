@@ -28,6 +28,7 @@ declares `engines: ^22.20 || ^24.12 || >=25`.
 npm install --save-dev @bytecodealliance/jco@1.30.0 typescript@5.9.3 @types/node@24.10.1
 npx jco types ../../../../crates/pcs-processor/wit --world-name pcs-pipeline -o types/
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 The processor itself imports `@nassor/pcs-sdk`, which the stage's
 `package.json` links; the next section is that file. `jco types` writes the
@@ -287,8 +288,16 @@ Everything in the SDK except the WIT import lives in `core.ts`, so a test binds 
 stub host and drives a processor end to end under Node with no component in the
 picture. The SDK's suite and the codec's now live with one package:
 
+Linux/macOS:
+
 ```bash,name=Run the SDK test suite
 cd packages/pcs-sdk-ts && npm ci && npm run typecheck && npm run build && npm test
+```
+
+Windows (PowerShell):
+
+```powershell
+cd packages\pcs-sdk-ts; npm ci; npm run typecheck; npm run build; npm test
 ```
 
 The stage itself only type-checks:
@@ -296,6 +305,7 @@ The stage itself only type-checks:
 ```bash,name=Type check the stage
 npm run typecheck
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 ```bash,name=Componentize the stage then validate it
 npx jco componentize score.ts \
@@ -307,6 +317,13 @@ npx jco componentize score.ts \
 
 wasm-tools validate --features component-model score-ts.wasm
 wasm-tools component wit score-ts.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+npx jco componentize score.ts --wit ..\..\..\..\crates\pcs-processor\wit --world-name pcs-pipeline --disable http --disable fetch-event -o score-ts.wasm
+wasm-tools validate --features component-model score-ts.wasm
+wasm-tools component wit score-ts.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output

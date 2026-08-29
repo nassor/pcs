@@ -1,186 +1,84 @@
 # Distributed Order Fulfillment
 
-A self-contained example demonstrating most of PCS's distributed processing
-features: field-granular DAG scheduling, parallel and sequential systems,
-world resources, checkpointing, Raft consensus, and structured tracing across
-three nodes.
+A 3-node PCS Raft cluster demonstrating the distributed processing features:
+field-granular DAG scheduling, parallel and sequential systems, world
+resources, checkpointing, Raft consensus, and structured tracing.
 
-The three PCS nodes form a Raft cluster for membership and leadership. The work
-pool — master batches, row-range claims and checkpoints — lives in a TiKV the
-Compose file deploys alongside them, so every node points at the same
-`--pd-endpoints` and the same `--key-prefix`.
+The three PCS nodes form a Raft cluster for membership and leadership. The
+work pool, meaning the master batches, row-range claims and checkpoints,
+lives in a TiKV the Compose file deploys alongside them, so every node points
+at the same `--pd-endpoints` and the same `--key-prefix`.
 
----
+Node 1 bootstraps the Raft cluster and runs the order generator, which every
+`--generator-interval` seconds produces 300 to 500 synthetic `Order` rows and
+registers them as a master batch. All three nodes run a `DistributedRunner`
+that claims, processes, checkpoints and acks batches. Claims are atomic
+compare-and-swap transitions on TiKV keys, so exactly one node processes each
+row range, and the claim-to-ack cycle is what gives at-least-once delivery.
 
-## Architecture
+Each batch runs a four-stage pipeline over `Order` rows:
 
-### 1 — Cluster Topology
+| Stage | Systems | Access |
+|-------|---------|--------|
+| 0 | `ValidateOrderSystem`, `DetectFraudSystem`, `ConvertCurrencySystem` | parallel (`ParallelSystem`), disjoint field writes |
+| 1 | `CheckInventorySystem` | sequential (`System`, exclusive world access) |
+| 2 | `ApproveOrderSystem`, `ComputeTaxSystem` | parallel, disjoint field writes |
+| 3 | `GenerateInvoiceSystem` | sequential, appends `Invoice` rows |
 
-```mermaid
-graph TB
-    subgraph node1["Node 1 (Bootstrap + Generator)"]
-        GEN["Order Generator\n(every 10 s)"]
-        W1["DistributedRunner"]
-        GEN -->|register_master_batch| TIKV
-    end
+The field-level conflict analyser groups the parallel stages; the sequential
+stages need exclusive access. A checkpoint is saved after stage 2
+(`CheckpointStrategy::EveryNStages(2)`), and `GenerateInvoiceSystem` retries
+with a fixed 3-attempt backoff. `Invoice` rows are appended to the in-memory
+dataset; nothing writes them to disk in this example.
 
-    subgraph node2["Node 2 (Follower)"]
-        W2["DistributedRunner"]
-    end
+## Prerequisites
 
-    subgraph node3["Node 3 (Follower)"]
-        W3["DistributedRunner"]
-    end
+- Rust 1.95 or newer
+- `protoc` on `PATH`, because this compiles a `pcs-service` example target
+  (see `AGENTS.md` for install commands)
+- A Docker daemon
+- A reachable TiKV. `tiup playground --mode tikv-slim` starts one with PD on
+  `127.0.0.1:2379`
 
-    TIKV[("TiKV\n(work pool)")]
+## Run with Docker Compose
 
-    R1[("Raft\nnode 1")] <-->|Raft TCP 9001| R2[("Raft\nnode 2")]
-    R1 <-->|Raft TCP 9001| R3[("Raft\nnode 3")]
-    R2 <-->|Raft TCP 9002| R3
+Compose builds the example and starts PD, TiKV and all three nodes. Every
+command here runs the same on Linux, macOS and Windows (PowerShell).
 
-    TIKV --> W1
-    TIKV --> W2
-    TIKV --> W3
-
-    W1 -->|invoices| OUT1["/data/output/node1"]
-    W2 -->|invoices| OUT2["/data/output/node2"]
-    W3 -->|invoices| OUT3["/data/output/node3"]
+```text
+docker compose -f examples/distributed_fulfillment/docker-compose.yml up --build
 ```
 
-- **Node 1** bootstraps the Raft cluster and runs an embedded generator task.
-- All 3 nodes run a `DistributedRunner` that claims, processes, checkpoints, and
-  acks batches. Claims are atomic compare-and-swap transitions on TiKV keys, so
-  exactly one node processes each row range.
-- The PCS raft carries membership and leadership; nothing is proposed into its
-  log.
+Watch the logs in real time:
 
----
-
-### 2 — Pipeline DAG (4 Stages)
-
-```mermaid
-graph LR
-    subgraph Stage0["Stage 0 — parallel"]
-        VO["ValidateOrder\n(→ validation_status)"]
-        DF["DetectFraud\n(→ fraud_score)"]
-        CC["ConvertCurrency\n(→ amount_usd)"]
-    end
-
-    subgraph Stage1["Stage 1 — sequential"]
-        CI["CheckInventory\n(→ inventory_status)"]
-    end
-
-    subgraph Stage2["Stage 2 — parallel"]
-        AO["ApproveOrder\n(→ processing_status)"]
-        CT["ComputeTax\n(→ tax_rate, tax_amount)"]
-    end
-
-    subgraph Stage3["Stage 3 — sequential"]
-        GI["GenerateInvoice\n(append Invoice rows)"]
-    end
-
-    Stage0 --> Stage1 --> Stage2 --> Stage3
-
-    style Stage0 fill:#e8f4f8
-    style Stage2 fill:#e8f4f8
+```text
+docker compose -f examples/distributed_fulfillment/docker-compose.yml logs -f --tail=50 node1 node2 node3
 ```
 
-Systems in Stage 0 and Stage 2 write **disjoint fields** — PCS's
-field-level conflict analyser schedules them in the same stage and runs them
-concurrently (`ParallelSystem`). Stage 1 and Stage 3 systems need exclusive
-world access (`System` with `&mut Pipeline`).
+The generator runs only on the leader, so watch for its `generator: registered
+batch` lines (with `node_id`, `batch_id` and `rows` fields) to confirm work is
+flowing, then a `cluster has leader` line once the Raft cluster elects a
+leader. Stop everything with:
 
----
-
-### 3 — Data Flow
-
-```mermaid
-sequenceDiagram
-    participant G as Generator (node1)
-    participant R as TiKV work pool
-    participant N as Any Node Runner
-    participant W as Pipeline Factory
-    participant P as Pipeline (4 stages)
-    participant O as Output Dir
-
-    loop every 10 s
-        G->>G: generate 300–500 Order rows
-        G->>R: register_master_batch(batch_id, ipc_bytes)
-        R-->>G: batch + row ranges written
-    end
-
-    N->>R: claim_next_batch(instance_id)
-    R-->>N: BatchClaim { batch_id, row_range }
-    Note over N: FulfillmentStore intercepts claim<br/>reads the batch IPC back from the store
-    N->>W: world_factory()
-    W-->>N: Pipeline (Order rows + resources)
-    N->>P: pipeline.run(world)
-    P->>P: Stage 0: validate, fraud, fx-convert
-    P->>P: Stage 1: check inventory
-    Note over P: checkpoint after stage 2
-    P->>P: Stage 2: approve, compute tax
-    P->>P: Stage 3: generate invoices
-    P-->>N: Pipeline with Invoice rows
-    N->>O: write invoices_{batch_id}.json
-    N->>R: ack_claim(claim_id)
+```text
+docker compose -f examples/distributed_fulfillment/docker-compose.yml down
 ```
 
----
+## Run locally
 
-### 4 — Component Schema
+Build the example binary:
 
-```mermaid
-erDiagram
-    Order {
-        Utf8   id
-        Utf8   customer_id
-        Utf8   product_id
-        Int64  quantity
-        Float64 amount_original
-        Utf8   currency
-        Float64 amount_usd
-        Utf8   region
-        Float64 fraud_score
-        Float64 tax_rate
-        Float64 tax_amount
-        Utf8   validation_status
-        Utf8   inventory_status
-        Utf8   processing_status
-    }
-
-    Invoice {
-        Utf8    order_id
-        Float64 subtotal
-        Float64 tax_rate
-        Float64 tax_amount
-        Float64 total
-        Utf8    issued_at
-        Utf8    status
-    }
-
-    Order ||--o| Invoice : "GenerateInvoice"
+```text
+cargo build -p pcs-service --example distributed_fulfillment --features service-cluster,tikv-store
 ```
 
----
+Then start a TiKV (`tiup playground --mode tikv-slim` gives PD on
+`127.0.0.1:2379`) and run three nodes, one per terminal. Node 1 bootstraps
+the cluster and runs the generator.
 
-## Running Locally
+Terminal 1, Linux and macOS:
 
-### Prerequisites
-
-- Rust 1.95+
-- 3 terminals
-- A reachable TiKV. `tiup playground --mode tikv-slim` gives you PD on
-  `127.0.0.1:2379`.
-
-### Build
-
-```bash
-cargo build --example distributed_fulfillment --features service-cluster,tikv-store
-```
-
-### Terminal 1 — Bootstrap node + generator
-
-```bash
+```text
 RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --node-id 1 --bootstrap \
   --listen 127.0.0.1:9001 \
@@ -191,9 +89,9 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --generator-interval 10
 ```
 
-### Terminal 2
+Terminal 2:
 
-```bash
+```text
 RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --node-id 2 \
   --listen 127.0.0.1:9002 \
@@ -203,9 +101,9 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
 ```
 
-### Terminal 3
+Terminal 3:
 
-```bash
+```text
 RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --node-id 3 \
   --listen 127.0.0.1:9003 \
@@ -215,49 +113,39 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
 ```
 
----
+Windows (PowerShell) runs the same flags, one node per terminal:
 
-## Running with Docker Compose
-
-```bash
-# Build + start all 3 nodes
-docker compose -f examples/distributed_fulfillment/docker-compose.yml up --build
-
-# Watch logs in real-time
-docker compose -f examples/distributed_fulfillment/docker-compose.yml \
-  logs -f --tail=50 node1 node2 node3
-
-# Stop
-docker compose -f examples/distributed_fulfillment/docker-compose.yml down
+```powershell
+$env:RUST_LOG = "trace"
+.\target\debug\examples\distributed_fulfillment --node-id 1 --bootstrap --listen 127.0.0.1:9001 --data-dir C:\fulfillment\node1 --output-dir C:\fulfillment\output\node1 --peers 127.0.0.1:9002,127.0.0.1:9003 --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment --generator-interval 10
 ```
 
----
+## Observable behaviour
 
-## Observable Behaviour
+`--log-json` (or `RUST_LOG` at trace level) makes the structured fields
+visible. The lines below come straight from the example's `tracing` calls.
 
-| What you see | What it means |
-|---|---|
-| `generator: registered batch N (M rows)` | Node 1 is leader, new work available |
-| `generator: skipping batch (not leader …)` | Node 1 lost leadership; another node is leading |
-| `claimed batch N` | A node won the race for this batch |
-| `stage 0–3 logs` | Pipeline executing on the claiming node |
-| `acked batch N` | Batch fully processed; won't be retried |
-| `checkpoint at stage 2` | Intermediate state saved; safe to resume after crash |
+| Log line | What it means |
+|----------|---------------|
+| `generator: registered batch` | the leader produced and registered a new master batch |
+| `generator: skipping batch (not leader or cluster error)` | this node is not the leader, so it produced no batch |
+| `cluster has leader` | the Raft cluster elected a leader and committed |
+| per-system lines with `node_id`, `stage`, `system` | the pipeline executing on the claiming node |
 
----
+Every node processes the batches it claims and checkpoints after stage 2, so
+a node that dies mid-batch resumes from its last checkpoint rather than
+restarting the row range.
 
-## Feature Highlights
+## Files
 
-| Feature | Where |
-|---|---|
-| Field-granular DAG scheduling | `systems.rs` → `build_pipeline()` |
-| `ParallelSystem` (concurrent stage) | `ValidateOrderSystem`, `DetectFraudSystem`, `ConvertCurrencySystem`, `ApproveOrderSystem`, `ComputeTaxSystem` |
-| `System` (sequential, `&mut Pipeline`) | `CheckInventorySystem`, `GenerateInvoiceSystem` |
-| Pipeline resources (non-columnar) | `resources.rs` → `FxRateTable`, `TaxRateTable`, `InventoryCatalog`, `NodeId` |
-| Retry config | `GenerateInvoiceSystem::config()` → `RetryMode::Fixed { retries: 3 }` |
-| `world.append::<Invoice>()` | `GenerateInvoiceSystem::run()` — Invoice rows created at runtime |
-| Raft consensus (membership, leadership) | `ArrowRaftDriver` via `distributed-raft` feature |
-| Shared work pool | `TikvSharedStore` via `tikv-store` feature |
-| Checkpoint every N stages | `CheckpointStrategy::EveryNStages(2)` in `RunnerConfig` |
-| At-least-once semantics | `DistributedRunner` claim → ack cycle |
-| Structured tracing | Every system emits `tracing::info!` with `node_id`, `batch_id`, `stage` |
+| File / directory | What it is |
+|------------------|------------|
+| `main.rs` | the example binary: CLI, Raft node, `DistributedRunner` |
+| `systems.rs` | the four-stage pipeline and its seven systems |
+| `resources.rs` | the non-columnar resources: `FxRateTable`, `TaxRateTable`, `InventoryCatalog`, `NodeId` |
+| `components.rs` | the `Order` and `Invoice` component definitions |
+| `store.rs` | `FulfillmentStore`, the checkpoint and partition store wrapper |
+| `generator.rs` | the synthetic `Order` batch generator |
+| `docker-compose.yml` | PD, TiKV and the three nodes |
+| `Dockerfile` | the release build that Compose uses |
+| `config/` | per-node YAML templates of the same settings |

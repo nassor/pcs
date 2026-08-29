@@ -53,7 +53,7 @@ Each segment's Schema carries custom metadata:
 
 A segment with no `__pcs_component` key is fatal on the host side. So is a stream
 where any component's row count exceeds the `__alive` length (a component may
-hold *fewer* rows — a windowing processor's reduced result component), or one
+hold *fewer* rows, a windowing processor's reduced result component), or one
 with more than one `__alive` segment.
 
 ## Arrow IPC message framing
@@ -113,7 +113,7 @@ value, which is where the gaps in this table come from.
 | `RecordBatch` | `length` | 0 | i64 row count |
 | `RecordBatch` | `nodes` | 1 | vector of inline `FieldNode { i64 length, i64 null_count }`, 16 B each |
 | `RecordBatch` | `buffers` | 2 | vector of inline `Buffer { i64 offset, i64 length }`, 16 B each |
-| `RecordBatch` | `compression` | 3 | uoffset; **must be absent** — reject the batch if present |
+| `RecordBatch` | `compression` | 3 | uoffset; **must be absent**; reject the batch if present |
 | `KeyValue` | `key` / `value` | 0 / 1 | string / string |
 
 `type_type` values a PCS processor needs: **2 = Int, 3 = FloatingPoint, 5 = Utf8,
@@ -206,6 +206,23 @@ immediately finished, with no batches. The host parses it with
 `StreamReader::schema()` and uses it to build the template dataset that sources
 and sinks are validated against. Same generated-constant treatment as the
 fingerprint.
+
+## The conformance corpus
+
+A hand implementation has an acceptance suite the day it starts:
+`packages/arrow-ipc-conformance/` lists, in `manifest.json`, one binary stream
+per `vectors/*.pcs` case and what each must do. The five SDK codecs all run it,
+so one answer covers which streams are valid. Regenerate it after any wire
+format or `Order` schema change:
+
+```bash,name=Regenerate the conformance corpus
+cargo run -p pcs-service --features conformance --example conformance_vectors -- emit
+```
+
+The corpus is processor-side: it deliberately has no vector for the two rules
+the host enforces, the `__alive` row-count cross-check and 8-byte buffer
+alignment. It is covered with the codecs on
+[the SDK packages page](@/reference/arrow-ipc-packages.md).
 
 ## Error mapping
 

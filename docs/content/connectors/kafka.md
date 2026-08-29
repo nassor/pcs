@@ -170,6 +170,8 @@ Plaintext only. The crate enables librdkafka's `cmake-build` and nothing else, n
 
 `examples/configs/kafka.kdl` is a commented config covering both halves:
 
+Runs the same on Linux, macOS and Windows (PowerShell):
+
 <div class="code">
 <div class="code-cap"><span>Bash</span><em>validating examples/configs/kafka.kdl with the connector-kafka feature</em></div>
 

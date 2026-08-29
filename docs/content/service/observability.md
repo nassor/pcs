@@ -118,20 +118,31 @@ flight never stops them answering.
 | `GET /metrics` | Prometheus exposition, version 0.0.4 | Always 200. Fed by the OpenTelemetry Prometheus exporter. |
 | `GET /status` | `node_id`, `node_name`, `mode`, `uptime_seconds`, `build.version`, plus `standalone` or `cluster` | Always 200. The block that does not match the mode is `null`. |
 
-In standalone mode the `standalone` block carries `iterations`,
-`rows_processed`, `source_batches_drained`, `sink_batches_written` and
-`iteration_errors`. No `ClusterProbe` is wired into `serve`, so `"cluster"`
-reports `null` even when the node is clustered; the Raft gauges are on
-`/metrics`. What a healthy process answers:
+In standalone mode the `standalone` block is an array, one entry per declared
+workflow, each carrying `workflow_id`, `iterations`, `rows_processed`,
+`source_batches_drained`, `sink_batches_written`, `iteration_errors`,
+`total_busy_micros` and `max_item_micros`. No `ClusterProbe` is wired into
+`serve`, so `"cluster"` reports `null` even when the node is clustered; the Raft
+gauges are on `/metrics`. What a healthy process answers:
 
 ```bash,name=Probing the three endpoints
 curl -s http://localhost:8080/ready
 {"status":"ready"}
 
-curl -s http://localhost:8080/status | jq '.standalone.iteration_errors'
+curl -s http://localhost:8080/status | jq '.standalone[0].iteration_errors'
 0
 
 curl -s http://localhost:8080/metrics | grep '^pcs_rows_processed_total'
+```
+
+Windows (PowerShell):
+
+```powershell
+curl.exe -s http://localhost:8080/ready
+curl.exe -s http://localhost:8080/status | ConvertFrom-Json |
+  Select-Object -ExpandProperty standalone |
+  Select-Object -First 1 -ExpandProperty iteration_errors
+curl.exe -s http://localhost:8080/metrics | Select-String '^pcs_rows_processed_total'
 ```
 
 `http disabled=#true` turns the whole control plane off, the JSON API and the
@@ -140,10 +151,10 @@ dashboard with it. The nineteen Prometheus series and their writers are in
 
 ## What `/ready` means
 
-`/ready` flips once `ServiceBuilder::build` has returned and the HTTP task is
-spawned, so a process answering 200 has a loaded component matching every link
-and a listening control plane. It does not wait for the first successful
-iteration: read `iterations` on `/status` for that.
+`/ready` flips once the runner is spawned, after `ServiceBuilder::build` has
+returned and the HTTP task is running. A process answering 200 has a loaded
+component matching every link and a listening control plane. It does not wait
+for the first successful iteration: read `iterations` on `/status` for that.
 
 ## Graceful shutdown
 
@@ -159,6 +170,16 @@ drain.
 
 On Windows there is no true `SIGTERM` equivalent, so only Ctrl-C drains. A
 service manager that stops the process any other way gets none.
+
+## Span export and the logging contract
+
+When `observability.otlp_endpoint` is set, `init_logging` builds an OTLP/HTTP
+span exporter, appends `/v1/traces` to the collector root, installs the tracer
+provider and returns a `TelemetryGuard`. The returned guard is load-bearing:
+dropping it does not flush, because `set_tracer_provider` keeps a clone in a
+process-lifetime static. The caller **must** `telemetry.shutdown().await`
+before exit, which `serve` does after the runner stops and before the last log
+line. Export covers spans only: metrics stay pull-only on `/metrics`.
 
 ## In-process capture
 
@@ -242,6 +263,13 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/api/snapshot
 200
 ```
 
+Windows (PowerShell):
+
+```powershell
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/snapshot).StatusCode
+200
+```
+
 ## The JSON API
 
 | Route | Body |
@@ -293,13 +321,22 @@ collector's ids.
 counter or a histogram, and the raw value for a gauge. A counter that went
 backwards reports 0. `points` is thinned to at most 120 entries.
 
+## Attribution and the double count
+
 Nine series carry a node id: `pcs_rows_processed_total` and
 `pcs_source_batches_drained_total` under `source`,
 `pcs_sink_batches_written_total` under `sink`, and the six `pcs_processor_*`
 series under `processor`. Each appears twice, once with `attrs: []` for the
-process-wide total and once under the id of the node that wrote it, so adding
-the two counts every row twice. Attributes are sorted by key, which makes the
-branch-attributed `pcs_processor_rows_out_total` read
+process-wide total and once under the id of the node that wrote it. The
+unattributed value is the sum across every node of that kind, so adding the two
+forms counts every row twice: select the empty attribute value, `source=""`,
+`processor=""` or `sink=""`, for the process-wide number. The two
+`pcs_workflow_*` counters carry the same additive split under `workflow`.
+
+The one attributed-only series is `pcs_window_watermark_seconds`, recorded only
+under `processor`: a watermark belongs to one node's merged inbound stream, and
+a process-wide sum over watermarks would be meaningless. Attributes are sorted
+by key, which makes the branch-attributed `pcs_processor_rows_out_total` read
 `[["branch", "<name>"], ["processor", "<id>"]]`.
 
 `span_stats` carries p50, p95 and max per stage and per system, derived from the
@@ -307,11 +344,21 @@ retained spans because `pcs_stage_duration_seconds` carries no attributes. It is
 empty for a workflow of only WASM components and native plugins: their
 `pipeline.stage` and `system.execute` spans never reach the host.
 
+The full series to writer table lives in [Tracing](@/tracing.md).
+
 Fetch one and read it yourself:
 
 ```bash,name=Read the snapshot by hand
 curl -s 'http://localhost:8080/api/snapshot?window_secs=60' \
   | jq '{buffers, edges: [.edges[] | {from, to, rate_per_sec}]}'
+```
+
+Windows (PowerShell):
+
+```powershell
+$snap = curl.exe -s 'http://localhost:8080/api/snapshot?window_secs=60' | ConvertFrom-Json
+$snap.buffers
+$snap.edges | Select-Object from, to, rate_per_sec
 ```
 
 ## Scope

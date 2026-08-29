@@ -1,6 +1,6 @@
 +++
 title = "Windowing"
-description = "Event-time windows in service mode: the host validates the geometry and tracks the watermark, the processor keeps the open windows and emits the closed ones."
+description = "Run the windowing example: two NATS streams fan into two windowed processors, and two PostgreSQL tables fill with closed-window totals."
 template = "page.html"
 weight = 5
 +++
@@ -100,109 +100,18 @@ the same input produces the same totals.
     </figcaption>
 </div>
 
-## The config
+## What the example demonstrates
 
-A `window` block on a `wasm` or `plugin` node declares the geometry.
+`examples/windowing/windowing.kdl` runs the whole shape in one workflow. Two
+core NATS subjects fan into two processors carrying the same logic, one a
+component and one a plugin, so their two tables should agree row for row.
 
-```kdl,name=A window block declares the geometry
-wasm "windowed" module="pipelines/windowed.wasm" {
-    window kind="tumbling" size_ms=30000 offset_ms=0 time_field="timestamp_ms" allowed_lateness_ms=5000 {
-        key_field "symbol"
-    }
-}
-```
-
-Three kinds, each with its own geometry keys:
-
-| `kind` | Keys | The slice it cuts |
-|---|---|---|
-| `tumbling` | `size_ms`, `offset_ms` | contiguous and non-overlapping, so a row belongs to exactly one |
-| `sliding` | `size_ms`, `slide_ms`, `offset_ms` | one window starting every `slide_ms`, so a row belongs to several |
-| `session` | `gap_ms` | one window per key, ended by `gap_ms` of event-time silence on that key |
-
-`time_field` names the event-time column, in `Int64` milliseconds or an Arrow
-timestamp type, and every component delivered to the node must carry it or the
-workflow is refused at load time. `key_field` is the grouping key list: one child
-per key, or several arguments on one child. Omit it for a global aggregate.
-
-The host injects the block into the node's config as `window.kind`,
-`window.size_ms`, `window.slide_ms`, `window.gap_ms`, `window.offset_ms`,
-`window.time_field`, `window.key_fields` (comma separated) and
-`window.allowed_lateness_ms`. A key set by hand wins over the injected value.
-
-The block needs the `windows` feature, which the default bundle carries. Cluster
-mode rejects it: a cluster node has no inbound links to draw a watermark from.
-
-```bash,name=Validate a window block
-pcs-service validate --config service.kdl
-
-OK: workflow graph validated (components and schemas agree end to end)
-```
-
-[The dashboard](@/service/dashboard.md#what-windowing-looks-like) shows what a
-windowed node looks like live.
-
-## The watermark
-
-The watermark is the host's estimate of stream completeness: the maximum
-`time_field` value across the rows delivered to the node, monotonic over the
-whole run. Every processor call advances it first, and the host publishes it as
-`pcs_window_watermark_seconds` under `processor="<id>"`.
-
-- **A window closes late, not on a clock.** No rows means no watermark
-  movement, so an idle stream holds its last window open indefinitely.
-- **A row behind the watermark is late.** `allowed_lateness_ms` is how far
-  behind a row is still counted. Past that budget its window has already been
-  emitted, and dropping it is the processor's call.
-
-Read the current value off the metric:
-
-```bash,name=Read a node watermark
-curl -s http://localhost:8080/metrics | grep '^pcs_window_watermark_seconds'
-```
-
-## Who does what
-
-The host never aggregates. It owns the declaration and the clock; the processor
-owns the data.
-
-| The host | The processor |
-|---|---|
-| validates the geometry and refuses an unsound one at load time | assigns each row to its window from the injected geometry |
-| checks that every component delivered to the node carries `time_field` | keeps open windows in its checkpoint state, so they survive a batch |
-| advances and reports the node's watermark | decides when a window is final and emits its rows |
-| injects the geometry into the node's `config` as `window.*` keys | reads those keys back through `get-config` |
-
-One KDL block therefore drives the aggregation, the watermark series and the
-dashboard's window chip at once.
-
-## Several streams into one window
-
-A processor node accepts any number of inbound links, and the runner merges their
-rows into one dataset before the call, so the processor never learns which link a
-row came from. `run_mode kind="stream"` pulls live sources round-robin, one batch
-per item, so the cross-source merge happens where the open windows already live:
-in the processor's state, across calls.
-
-## Native pipelines
-
-A native `Pipeline` windows without any of this. `pcs-core`'s `windows` feature
-carries `WindowSpec`, `WindowedSystemBuilder`, watermark tracking and the
-`WindowAccumulator` component that holds open windows, and the distributed runner
-persists that accumulator through its `CheckpointStore`. That is the route for
-cluster mode.
-
-An in-process runtime registered with `ServiceBuilder::with_runtime` also reads
-the live watermark from the `WindowWatermark` resource on the batch dataset. A
-component and a plugin cannot: resources do not cross the Arrow IPC boundary.
-Hence config keys for the geometry and a metric for the watermark.
-
-## The runnable example
-
-`examples/windowing/windowing.kdl` runs the whole shape in one workflow. Two core
-NATS subjects fan into two processors carrying the same logic, one a component and
-one a plugin, so their two tables should agree row for row. It needs a clone of
-the repository, Docker, and both processors built.
+| Stage | Node | What happens |
+|-------|------|--------------|
+| Sources | `sales_a`, `sales_b` | two core NATS subjects, pulled round-robin, one batch per item |
+| WASM processor | `window_wasm` | merges both streams' batches into 30s tumbling windows, emits closed windows |
+| Plugin | `window_plugin` | the identical logic as a native plugin |
+| Sinks | `wasm_totals`, `plugin_totals` | one PostgreSQL table per processor |
 
 <div class="dgm animate-in">
     <div class="dgm-scroll"><svg viewBox="0 0 660 270" role="img" aria-labelledby="win-title win-desc">
@@ -283,7 +192,7 @@ the repository, Docker, and both processors built.
 </div>
 
 Both processors declare the same block and emit one `WindowTotal` row per closed
-`(window_id, symbol)` group.
+`(window_id, symbol)` group:
 
 ```kdl,name=The block both processors declare
 window kind="tumbling" size_ms=30000 time_field="timestamp_ms" allowed_lateness_ms=5000 {
@@ -291,17 +200,31 @@ window kind="tumbling" size_ms=30000 time_field="timestamp_ms" allowed_lateness_
 }
 ```
 
-### Build the processors
+Every key of a window block, and the load-time rules behind it, are in
+[the workflow structure](@/service/configuration.md#branching-and-windowing). The
+host injects the block into the processor's `config` as `window.*` keys, tracks
+the node's watermark (`pcs_window_watermark_seconds`), and the dashboard shows
+the chip and the live watermark: [what windowing looks
+like](@/service/dashboard.md#what-windowing-looks-like).
 
-From the repository root:
+## Prerequisites
+
+- A clone of the repository, from the root of which every command runs.
+- Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`.
+- Docker for NATS and PostgreSQL.
+- The default feature bundle plus `plugin`: the commands below pass
+  `--features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin`.
+
+## 1. Build the processors
 
 ```bash,name=Build both processors
 cargo build --release -p windowing-wasm --target wasm32-wasip2
 cargo build -p windowing-plugin
 ```
 
-The plugin artifact name is platform specific. The config defaults to the Linux
-name, so only macOS and Windows need `PCS_PLUGIN_LIB`:
+Runs the same on Linux, macOS and Windows (PowerShell). The plugin artifact name
+is platform specific. The config defaults to the Linux name, so only macOS and
+Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
@@ -309,61 +232,112 @@ name, so only macOS and Windows need `PCS_PLUGIN_LIB`:
 | macOS | `target/debug/libwindowing_plugin.dylib` | `target/debug/libwindowing_plugin.dylib` |
 | Windows | `target/debug/windowing_plugin.dll` | `target/debug/windowing_plugin.dll` |
 
-Both `window` blocks are checked at load time, so validate first, with
-`PCS_PLUGIN_LIB` set on macOS and Windows:
+## 2. Validate the config
+
+Both `window` blocks are checked at load time. On macOS and Windows set
+`PCS_PLUGIN_LIB` as in the table above:
+
+Linux:
 
 ```bash,name=Validate the windowing config
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- validate \
   --config examples/windowing/windowing.kdl --strict
 ```
 
-### Run it
+macOS:
 
-Start the containers, then the service, then the publisher.
+```bash,name=Validate with the dylib name
+PCS_PLUGIN_LIB=target/debug/libwindowing_plugin.dylib \
+cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- validate \
+  --config examples/windowing/windowing.kdl --strict
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:PCS_PLUGIN_LIB = "target/debug/windowing_plugin.dll"
+cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- validate --config examples/windowing/windowing.kdl --strict
+```
+
+Expected output ends with `OK: all declared types resolved in built-in
+registry`.
+
+## 3. Start the containers
 
 ```bash,name=Start the containers
 docker compose -f examples/windowing/docker-compose.yml up -d
 ```
 
-That brings up `nats:2.11-alpine` and `postgres:18-alpine` and runs `schema.sql`
-on first initialisation, creating the two tables. `PostgresSink` never issues
-`CREATE TABLE`, and PostgreSQL only runs init scripts against an empty data
-directory, so a volume created before `schema.sql` existed fails with
-`table ... does not exist`. Recreate it with `down -v` then `up -d`, or apply the
-SQL by hand:
+Runs the same on all three platforms. That brings up `nats:2.11-alpine` and
+`postgres:18-alpine` and runs `schema.sql` on first initialisation, creating the
+two tables. `PostgresSink` never issues `CREATE TABLE`, and PostgreSQL only runs
+init scripts against an empty data directory, so a volume created before
+`schema.sql` existed fails with `table ... does not exist`. Recreate it with
+`down -v` then `up -d`, or apply the SQL by hand:
+
+Linux/macOS:
 
 ```bash,name=Apply the schema by hand
 docker compose -f examples/windowing/docker-compose.yml exec -T postgres \
   psql -U postgres -d pcs < examples/windowing/schema.sql
 ```
 
+Windows (PowerShell):
+
+```powershell
+Get-Content examples/windowing/schema.sql | docker compose -f examples/windowing/docker-compose.yml exec -T postgres psql -U postgres -d pcs
+```
+
+## 4. Start the service
+
+Linux/macOS:
+
 ```bash,name=Start the service
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- serve \
   --config examples/windowing/windowing.kdl
 ```
 
-Then, in another terminal:
+Windows (PowerShell):
+
+```powershell
+$env:PCS_PLUGIN_LIB = "target/debug/windowing_plugin.dll"
+cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- serve --config examples/windowing/windowing.kdl
+```
+
+This config enables the inspector, so the startup banner prints
+`dashboard at http://0.0.0.0:8080/ui` and the tables stay empty until the
+publisher runs. Leave this terminal running.
+
+## 5. Run the publisher
+
+In another terminal:
 
 ```bash,name=Run the publisher
 cargo run -p pcs-service --example windowed_publish -- --rate 20 --ts-step-ms 2000
 ```
 
-On macOS and Windows add `PCS_PLUGIN_LIB` to the serve command. This config
-enables the inspector, so the dashboard is on <http://127.0.0.1:8080/ui> with a
-window chip and a live watermark on both processor boxes.
+Runs the same on all three platforms. The publisher's flags: `--count` (0 runs
+until Ctrl-C, the default), `--rate` messages per second (default 20),
+`--ts-step-ms` simulated milliseconds per message (default 2000), `--url`
+(default `nats://localhost:4222`), `--subject-a` / `--subject-b` (defaults
+`windowing.sales.a` / `windowing.sales.b`), `--seed`.
 
-The publisher's flags: `--count` (0 runs until Ctrl-C, the default), `--rate`
-messages per second (default 20), `--ts-step-ms` simulated milliseconds per
-message (default 2000), `--url` (default `nats://localhost:4222`),
-`--subject-a` / `--subject-b` (defaults `windowing.sales.a` /
-`windowing.sales.b`), `--seed`.
-
-### What each table holds
+## 6. Read the window totals
 
 The publisher sends `timestamp_ms` (simulated event time, advancing
 `--ts-step-ms` per message), `symbol` and `amount`. At the defaults the simulated
 clock runs 40 seconds per wall second, so a 30-second window closes roughly
-every 0.75 wall seconds.
+every 0.75 wall seconds and the tables fill continuously.
+
+```bash,name=Read the window totals
+docker compose -f examples/windowing/docker-compose.yml exec -T postgres \
+  psql -U postgres -d pcs -c "SELECT * FROM public.wasm_window_totals ORDER BY window_id, symbol;"
+```
+
+Runs the same on all three platforms. Rows for every `window_id` except the
+newest is the correct result: a window closes only once the watermark passes its
+end, and the watermark only moves with the data, so the last window before the
+publisher stops stays open.
 
 | Table | Holds |
 |-------|-------|
@@ -373,13 +347,23 @@ every 0.75 wall seconds.
 Both carry `window_id` (the window index, so the window starts at
 `window_id * 30000` ms), `symbol`, `count` and `sum`. The sinks upsert on
 `(window_id, symbol)`, so a late re-fire updates a row instead of duplicating it.
+The two tables agree row for row: identical inputs, identical windowing, two
+runtimes.
 
-```sql,name=Read the window totals
-SELECT * FROM public.wasm_window_totals ORDER BY window_id, symbol;
-```
+Open http://127.0.0.1:8080/ui while it runs to watch the window chips and the
+live watermarks. Stop the publisher and the service with Ctrl-C when you are
+done, then `docker compose -f examples/windowing/docker-compose.yml down -v`.
 
-Rows for every `window_id` except the newest is the correct result: a window
-closes only once the watermark passes its end.
+## Files
+
+| Path | What it is |
+|------|-----------|
+| `examples/windowing/windowing.kdl` | the workflow: two sources, two windowed processors, two sinks |
+| `examples/windowing/wasm/` | `windowing-wasm`, the windowed WebAssembly processor (component) |
+| `examples/windowing/plugin/` | `windowing-plugin`, the windowed native processor (cdylib) |
+| `examples/windowing/windowed_publish.rs` | the publisher, a `pcs-service` example |
+| `examples/windowing/docker-compose.yml` | NATS and PostgreSQL, with `schema.sql` on first init |
+| `examples/windowing/schema.sql` | the two `window_totals` tables |
 
 **Next:** [Operating pcs-service](@/operations/running-pcs.md), the same binary
 under a supervisor.

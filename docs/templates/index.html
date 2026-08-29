@@ -8,18 +8,20 @@
 {% block content %}
 
 <section class="hero">
-    <div class="hero-eyebrow"><b>Apache Arrow</b> &middot; WebAssembly components &middot; Rust &middot; Go &middot; Python &middot; TypeScript</div>
+    <div class="hero-eyebrow"><b>Apache Arrow</b> &middot; WebAssembly components &middot; Rust &middot; Go &middot; Python &middot; TypeScript &middot; Kotlin &middot; C#</div>
 
     <h1>Batch pipelines that<br>work out <span class="hl">their own order</span></h1>
 
     <p class="hero-lede">
-        Write transforms in Rust, Go, Python, or TypeScript. Say which columns each one
-        reads and writes. <strong>PCS derives the execution plan</strong>, runs independent
-        work concurrently, and loads the whole pipeline as a WebAssembly component.
+        PCS is a columnar batch processing engine for Rust, built on Apache Arrow.
+        You write transforms in Rust, Go, Python, TypeScript, Kotlin, or C# and say which
+        columns each one reads and writes. <strong>PCS derives the execution plan</strong>,
+        runs independent work concurrently, and loads the whole pipeline as a
+        WebAssembly component.
     </p>
 
     <div class="hero-actions">
-        <a class="btn" href="{{ get_url(path='@/native/tutorial.md') }}">Build a native pipeline</a>
+        <a class="btn" href="{{ get_url(path='@/quickstart/installation.md') }}">Install and run in 15 minutes</a>
         <a class="btn btn-ghost" href="{{ get_url(path='@/processors/_index.md') }}">Write a WebAssembly processor</a>
     </div>
 
@@ -45,8 +47,8 @@
 <h2 id="two-ways">Two ways to run a pipeline</h2>
 
 <p>
-    The pipeline code is the same either way. The choice is about deployment: whether the
-    transform ships inside your binary or as a file the host loads.
+    The pipeline code is the same either way. The choice is deployment: the transform
+    ships inside your binary or as a file the host loads.
 </p>
 
 <div class="next-steps-grid">
@@ -114,7 +116,7 @@
 
         <!-- stage 1: two systems, disjoint writes -->
         <g class="anim anim-3">
-            <text class="t-sm t-ctl" x="212" y="30">STAGE 1 &mdash; nothing orders these two</text>
+            <text class="t-sm t-ctl" x="212" y="30">STAGE 1: nothing orders these two</text>
             <rect class="blk blk-ctl" x="212" y="42" width="178" height="62" rx="8"/>
             <text class="t-lbl" x="226" y="64">ValidateSystem</text>
             <text class="t-sm t-ctl" x="226" y="80">reads  amount</text>
@@ -192,7 +194,7 @@
     <div class="card">
         <div class="feature-icon boundary" aria-hidden="true">&#9671;</div>
         <h3>Checkpoints are a memcpy</h3>
-        <p>Arrow IPC writes contiguous buffers, so crash recovery decodes <strong>19&times; faster</strong> than a row-oriented equivalent at 1M rows.</p>
+        <p>Arrow IPC writes contiguous buffers, so crash recovery decodes <strong>6&times; faster</strong> than a row-oriented equivalent at 1M rows.</p>
     </div>
 </div>
 
@@ -206,7 +208,7 @@
     <div class="positioning-col positioning-is">
         <div class="positioning-label">Reach for PCS when</div>
         <ul>
-            <li>Work arrives as <strong>batches of 100k&ndash;100M rows</strong>, or as a <strong>stream of individual items</strong></li>
+            <li>Work arrives as <strong>batches of 100k to 100M rows</strong>, or as a <strong>stream of individual items</strong></li>
             <li>The transform is <strong>imperative Rust</strong> that SQL expresses awkwardly</li>
             <li>Schemas are <strong>wide</strong>: tens to hundreds of columns, and each step reads a few</li>
             <li>You need <strong>recovery time</strong> to be a design constraint, not an afterthought</li>
@@ -254,7 +256,7 @@
     </a>
     <a href="{{ get_url(path='@/distributed.md') }}" class="concept-card">
         <div class="concept-num">05</div>
-        <h3>Distributed Runner</h3>
+        <h3>Distributed processing</h3>
         <p>The same Pipeline against claimed row ranges across nodes, checkpointed into TiKV.</p>
     </a>
     <a href="{{ get_url(path='@/processors/_index.md') }}" class="concept-card">
@@ -349,36 +351,34 @@
     </figcaption>
 </div>
 
-<h2 id="start">Start here</h2>
+<h2 id="next">Where to go next</h2>
 
 <p>
-    In a hurry, start with the two Quick Start pages:
-    <a href="{{ get_url(path='@/quickstart/installation.md') }}">Installation</a> puts the
-    binary on your PATH, and
-    <a href="{{ get_url(path='@/quickstart/running-it.md') }}">Running it!</a> takes a live
-    NATS stream through a Go processor and a C# processor into PostgreSQL.
+    The <a href="{{ get_url(path='@/quickstart/_index.md') }}">Quick Start</a> puts the
+    binary on your PATH and runs a real pipeline in 15 minutes. After that, pick a
+    direction.
 </p>
 
 <div class="next-steps-grid">
-    <a href="{{ get_url(path='@/service/_index.md') }}" class="next-card">
-        <span class="next-card-label">Deploy</span>
-        <h3>Service</h3>
-        <p>The config schema, the load-time validation gates, and the HTTP control plane.</p>
+    <a href="{{ get_url(path='@/quickstart/running-it.md') }}" class="next-card">
+        <span class="next-card-label">Quick Start</span>
+        <h3>Installation, then Running it!</h3>
+        <p>Install the binary, build a processor component, and watch it move rows with a minimal config.</p>
     </a>
-    <a href="{{ get_url(path='@/processors/_index.md') }}" class="next-card">
-        <span class="next-card-label">WASM Processors</span>
-        <h3>Ship a component</h3>
-        <p>The WIT contract, then a recipe per language: Rust, Go, Python, TypeScript.</p>
+    <a href="{{ get_url(path='@/dataset.md') }}" class="next-card">
+        <span class="next-card-label">Core concepts</span>
+        <h3>Dataset, Systems, Pipeline</h3>
+        <p>The columnar container, the transform contract, and the stage plan PCS derives. Then Scheduler, Sources &amp; Sinks, Distributed processing.</p>
     </a>
-    <a href="{{ get_url(path='@/native/tutorial.md') }}" class="next-card">
-        <span class="next-card-label">Native, 15 minutes</span>
-        <h3>Build your first pipeline</h3>
-        <p>One component, four systems, one resource, and the stage plan PCS derives instead of you writing it.</p>
+    <a href="{{ get_url(path='@/service/branching.md') }}" class="next-card">
+        <span class="next-card-label">Cookbooks</span>
+        <h3>Branching and windowing</h3>
+        <p>Fan a stream out to several branches, or aggregate it into tumbling and sliding windows.</p>
     </a>
-    <a href="{{ get_url(path='@/operations/running-pcs.md') }}" class="next-card">
-        <span class="next-card-label">Operate</span>
-        <h3>Operating pcs-service</h3>
-        <p>Standalone and clustered deployment, tuning, failure modes, and recovery.</p>
+    <a href="{{ get_url(path='@/connectors/_index.md') }}" class="next-card">
+        <span class="next-card-label">Reference</span>
+        <h3>Connectors, transformers, wire format</h3>
+        <p>One page per connector and transformer, the host to processor wire format, and the SDK packages.</p>
     </a>
 </div>
 

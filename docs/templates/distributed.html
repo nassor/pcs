@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 
-{% block title %}Distributed Runner — PCS{% endblock %}
-{% block description %}How the same Pipeline runs on several nodes at once: each claims a row range under a lease, checkpoints Arrow IPC bytes into TiKV, and acks. Leases expire, so processing is at-least-once.{% endblock %}
-{% block og_title %}Distributed Runner — PCS{% endblock %}
+{% block title %}Distributed processing — PCS{% endblock %}
+{% block description %}Distributed processing runs the same Pipeline on several nodes at once: each claims a row range under a lease, checkpoints Arrow IPC bytes into TiKV, and acks. Leases expire, so processing is at-least-once.{% endblock %}
+{% block og_title %}Distributed processing — PCS{% endblock %}
 {% block og_description %}One pipeline, many nodes, one lease per row range. At-least-once, backed by TiKV.{% endblock %}
 
 {% block content %}
 
 <div class="page-kicker">Concept 05</div>
-<h1>Distributed Runner</h1>
+<h1>Distributed processing</h1>
 
 <p class="page-lede">
     The same <code>Pipeline</code>, run by several processes at once against different
@@ -58,7 +58,7 @@
 
         <text class="t-title" x="0" y="14">One claim, and the same claim after a crash</text>
 
-        <!-- ── happy path ─────────────────────────────────────────────── -->
+        <!-- happy path -->
         <g class="anim anim-1">
             <rect class="blk blk-ctl" x="0" y="30" width="150" height="88" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="30" width="150" height="22" rx="8"/>
@@ -109,13 +109,13 @@
             <path class="arw arw-ctl" d="M486 74 H502" marker-end="url(#dst-l-c)"/>
         </g>
 
-        <!-- ── the fork ───────────────────────────────────────────────── -->
+        <!-- the fork -->
         <g class="anim anim-3">
             <path class="arw arw-ctl" d="M243 118 V132 H75 V146" marker-end="url(#dst-l-c)"/>
             <text class="t-sm t-ctl" x="100" y="128">the node dies here</text>
         </g>
 
-        <!-- ── crash path ─────────────────────────────────────────────── -->
+        <!-- crash path -->
         <g class="anim anim-3">
             <rect class="blk blk-ctl" x="0" y="150" width="150" height="88" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="150" width="150" height="22" rx="8"/>
@@ -255,8 +255,8 @@
 
 <p>
     A claim is a compare-and-swap on one row-range key, so the store arbitrates by itself.
-    No work is routed through the Raft leader and no node hands a batch to another. What the
-    Raft node contributes is membership and an elected leader, reported by the three
+    No work is routed through the Raft leader and no node hands a batch to another. The Raft
+    node contributes membership and an elected leader, reported by the three
     <code>pcs_raft_*</code> gauges.
 </p>
 
@@ -342,7 +342,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
         .register_master_batch(0, Order::name().to_string(), 1, ipc_bytes, total_rows)
         .await?;
 
-    // A template. Its own dataset, sources and sinks are never used — each
+    // A template. Its own dataset, sources and sinks are never used: each
     // claim runs against whatever `world_factory` hands back.
     let template = Pipeline::builder("order-processor")
         .with::&lt;Order&gt;()
@@ -402,7 +402,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
 
         <text class="t-title" x="0" y="14">Local raft log, shared TiKV</text>
 
-        <!-- ── node 1 ─────────────────────────────────────────────────── -->
+        <!-- node 1 -->
         <g class="anim anim-1">
             <rect class="blk blk-ctl" x="0" y="32" width="250" height="86" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="32" width="250" height="22" rx="8"/>
@@ -416,7 +416,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <text class="t-sm" x="16" y="110">membership and leadership only</text>
         </g>
 
-        <!-- ── node 2 ─────────────────────────────────────────────────── -->
+        <!-- node 2 -->
         <g class="anim anim-2">
             <rect class="blk blk-ctl" x="404" y="32" width="250" height="86" rx="8"/>
             <rect class="hd hd-ctl" x="404" y="32" width="250" height="22" rx="8"/>
@@ -443,7 +443,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <path class="ln" d="M0 172 H654"/>
         </g>
 
-        <!-- ── the shared store ───────────────────────────────────────── -->
+        <!-- the shared store -->
         <g class="anim anim-3">
             <rect class="blk blk-data" x="0" y="188" width="654" height="164" rx="8"/>
             <rect class="hd hd-data" x="0" y="188" width="654" height="22" rx="8"/>
@@ -500,7 +500,7 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
     <thead><tr><th>Constant</th><th>Value</th><th>Payload</th></tr></thead>
     <tbody>
         <tr>
-            <td>&mdash;</td>
+            <td>none</td>
             <td><code>0</code></td>
             <td>The whole partition <code>Dataset</code>, written by the runner after the run.</td>
         </tr>

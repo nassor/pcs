@@ -24,23 +24,31 @@ rows bridge across the channel unchanged. The bridge is the channel name:
 `link` crosses workflows. The dashboard draws one card per workflow and a
 `channel bridges` card listing `standard` with its live rate.
 
+## Prerequisites
+
+- Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
+- `protoc` on `PATH`, because the `multi_workflow_publish` example compiles a
+  `pcs-service` example target (see `AGENTS.md` for install commands)
+- A Docker daemon, for the NATS and PostgreSQL containers
+
 ## Build the processors
 
 The router is this example's own crate; the windowed half reuses the
 windowing example's component unchanged.
 
-```bash
+```text
 cargo build --release -p multi-workflow-router-wasm --target wasm32-wasip2
 cargo build --release -p windowing-wasm --target wasm32-wasip2
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 ## Run it
 
 Start NATS and PostgreSQL, then the service, then the publisher.
 
-### Containers
+1. Start the containers:
 
-```bash
+```text
 docker compose -f examples/multi_workflow/docker-compose.yml up -d
 ```
 
@@ -52,26 +60,36 @@ project's compose file), the sinks fail with `table ... does not exist`.
 Recreate the volume (`docker compose -f examples/multi_workflow/docker-compose.yml
 down -v`, then `up -d` again) or apply the SQL by hand:
 
-```bash
-docker compose -f examples/multi_workflow/docker-compose.yml exec -T postgres \
-  psql -U postgres -d pcs < examples/multi_workflow/schema.sql
+```text
+docker compose -f examples/multi_workflow/docker-compose.yml exec -T postgres psql -U postgres -d pcs < examples/multi_workflow/schema.sql
+```
+Windows (PowerShell):
+
+```powershell
+Get-Content examples/multi_workflow/schema.sql | docker compose -f examples/multi_workflow/docker-compose.yml exec -T postgres psql -U postgres -d pcs
 ```
 
 Stop everything with `docker compose -f examples/multi_workflow/docker-compose.yml
 down -v`.
 
-### The service
+2. Start the service:
 
-```bash
+```text
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm -- serve \
   --config examples/multi_workflow/multi_workflow.kdl
 ```
+Windows (PowerShell), on one line:
 
-Then, in another terminal:
+```powershell
+cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm -- serve --config examples/multi_workflow/multi_workflow.kdl
+```
 
-```bash
+3. Publish, in another terminal:
+
+```text
 cargo run -p pcs-service --example multi_workflow_publish -- --rate 20 --ts-step-ms 2000
 ```
+Runs the same on all three platforms.
 
 ## What each table holds
 
@@ -96,10 +114,8 @@ the lateness budget updates a row instead of duplicating it. The last window
 seen before the publisher stops stays open: a window only closes once the
 watermark passes its end, and the watermark only moves with the data.
 
-```sql
-SELECT count(*) FROM public.rush_sales;
-SELECT count(*) FROM public.rush_sales WHERE amount < 100.0;  -- always 0
-SELECT * FROM public.window_totals ORDER BY window_id, symbol;
+```text
+docker compose -f examples/multi_workflow/docker-compose.yml exec -T postgres psql -U postgres -d pcs -c 'SELECT count(*) FROM public.rush_sales; SELECT count(*) FROM public.rush_sales WHERE amount < 100.0; SELECT * FROM public.window_totals ORDER BY window_id, symbol;'
 ```
 
 ## What the dashboard shows
@@ -121,7 +137,22 @@ live watermark in UTC.
 
 Validate the config first, if you like:
 
-```bash
+```text
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm -- validate \
   --config examples/multi_workflow/multi_workflow.kdl --strict
 ```
+Windows (PowerShell), on one line:
+
+```powershell
+cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm -- validate --config examples/multi_workflow/multi_workflow.kdl --strict
+```
+
+## Files
+
+| File / directory | What it is |
+|------------------|------------|
+| `multi_workflow.kdl` | the `route` and `settle` workflows, bridged by the `standard` channel |
+| `multi_workflow_publish.rs` | the `pcs-service` example that feeds both NATS subjects |
+| `schema.sql` | the `rush_sales` and `window_totals` tables |
+| `docker-compose.yml` | NATS 2.11 and PostgreSQL 18 |
+| `wasm/` | the `multi-workflow-router-wasm` processor component (cdylib, wasm32-wasip2) |

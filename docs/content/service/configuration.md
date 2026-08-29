@@ -1,6 +1,6 @@
 +++
 title = "Configuration"
-description = "Every key in the service config, which features add which nodes, and the four load-time gates that refuse to start."
+description = "Every key in the service config, which features add which nodes, and the load-time gates that refuse to start."
 template = "page.html"
 weight = 1
 +++
@@ -8,12 +8,19 @@ weight = 1
 # Configuration
 
 One KDL document describes the whole process. `${VAR}` placeholders are
-substituted from the environment before the parse. An unset `${VAR}` is an
-error; `${VAR:-default}` falls back.
+substituted before the parse: `${VAR}` is replaced with the value of the env
+var `VAR`, and `${VAR:-default}` falls back to `default` when `VAR` is unset.
+A bare `${VAR}` that is unset is an error.
+
+A top-level `variables` block declares names of its own. A declared name wins
+over a same-named process env var, and the environment stays the fallback for
+undeclared names, so the file can reference its own declarations with the same
+`${name}` syntax.
 
 ## The file structure
 
-Seven top-level keys. `node` and `workflow` are required; the rest have defaults.
+Eight top-level keys. `node` and `workflow` are required; the rest have
+defaults.
 
 | Key | Holds | Default |
 |---|---|---|
@@ -23,13 +30,15 @@ Seven top-level keys. `node` and `workflow` are required; the rest have defaults
 | `workflow` | the graph: transformers, sources, processors, sinks, links | required |
 | `store` | the persistent store: a `store "tikv"` block | none, required in cluster mode |
 | `http` | the control-plane address, or `disabled` | `bind="0.0.0.0:8080"` |
-| `observability` | log format and level, OTLP export, the inspector | pretty at `info` |
+| `observability` | log format and level, OTLP export, the inspector | pretty at `info`, capture on |
+| `variables` | names usable as `${name}` anywhere in the file | none |
 
 ```kdl,name=The top level of a service config
 mode "standalone"
 
 // id is a u64 and stable across restarts. data_dir must be non-empty; only the
-// cluster runner writes there.
+// cluster runner writes there. id and bootstrap accept a quoted string that
+// parses as the value, so env substitution stays valid KDL.
 node id=1 name="pcs-1" data_dir="/var/lib/pcs/node-1"
 
 // continuous | one_shot | interval | stream
@@ -38,6 +47,11 @@ run_mode kind="continuous"
 // The leading argument is the workflow id. Every node lives inside this block.
 workflow "orders" name="Orders" {
     // transformer, source, wasm, plugin, sink and link nodes
+}
+
+// Names the file can reference. Wins over a same-named env var.
+variables {
+    OUT_DIR "/data/out"
 }
 
 http bind="0.0.0.0:8080" disabled=#false
@@ -51,7 +65,8 @@ exactly one. Fill one in next.
 ## The workflow structure
 
 Six node kinds live inside `workflow`. The leading argument of each is its id,
-unique across the whole workflow.
+unique across the whole process. Every node id, workflow id and branch name
+matches `^[A-Za-z0-9][A-Za-z0-9_-]*$` and is at most 64 bytes.
 
 | Node | Declares | Links |
 |---|---|---|
@@ -101,15 +116,46 @@ workflow "orders" name="Orders" {
 }
 ```
 
-Six graph rules, all enforced before anything runs:
+A `wasm` or `plugin` node with no `module` or `library` is a processor whose
+runtime is registered programmatically under that node's id; see
+[the service page](@/service/_index.md#your-own-sources-sinks-transformers-and-runtime).
+Building such a node with nothing registered for its id is a build-time error
+naming the node.
 
-- Every id is unique across transformers, sources, processors and sinks.
-- A `link` names two declared ids, and no `from`/`to` pair repeats.
+### The load-time graph rules
+
+`WorkflowSpec::validate` enforces, in order, one refusal per violation:
+
+- The workflow declares at least one source, processor or sink node.
+- Every id (workflow and node) matches the charset and length bound above.
+- No id is declared twice, across transformers, sources, processors and sinks.
+- Every `source.transformer` and `sink.transformer` names a declared
+  `transformer` id.
+- Every `link.from` and `link.to` names a declared source, processor or sink id,
+  and no link names a node twice (`from == to`). A transformer id is not a
+  graph node.
+- No `(from, to)` pair is declared twice.
 - Nothing links into a source; nothing links out of a sink.
 - The graph is acyclic.
-- Every source has an outbound link, every sink an inbound one.
-- Both ends of a link agree on their components, and on each component's Arrow
-  fields field for field.
+- Every source has an outbound link; every sink has an inbound one.
+- Cluster mode declares exactly one processor and no source, sink or link, and
+  no `window` block.
+- `run_mode kind="stream"` declares at least one source.
+- Outside stream mode, no source is live: a `tcp` source always is, and a
+  `NatsSource` or `KafkaSource` is live unless its config sets `stop_at_end
+  #true` (`KafkaSource` also accepts `compacted #true`, which always reaches
+  EOF).
+- Every `retry` block is valid.
+- Every link `branch` matches the id charset and is at most 64 bytes.
+- A labelled link starts at a processor.
+- A node labels every outbound link or none.
+- Every `window` block is geometrically sane, names a non-empty `time_field`,
+  and has a non-negative `allowed_lateness_ms`.
+
+Across workflows, `ServiceConfig::validate` adds: workflow ids unique; node ids
+unique across all workflows (the metric attribution keys are bare node ids, so
+an overlap would double count); every `ChannelSource` name paired with exactly
+one `ChannelSink` of the same name and vice versa.
 
 Prove the file before you deploy it:
 
@@ -154,8 +200,9 @@ it.
 
 ### A plugin instead of a component
 
-A `plugin` node loads a shared library with `dlopen`. The key is `library`
-rather than `module`; a `link` treats both node kinds the same way.
+A `plugin` node loads a shared library with `dlopen` on Unix and `LoadLibrary`
+on Windows. The key is `library` rather than `module`; a `link` treats both node
+kinds the same way.
 
 ```kdl,name=A plugin node loads a shared library
 plugin "audit" library="/var/lib/pcs/plugins/liborders.so" {
@@ -172,7 +219,24 @@ node bind, then follow [Native plugins](@/native/plugins.md).
 A `link` takes a `branch` name, and the upstream processor picks which branches
 each batch reaches: [Branching](@/service/branching.md). A `wasm` or `plugin`
 node takes a `window` block declaring event-time geometry, and the host tracks
-that node's watermark: [Windowing](@/service/windowing.md).
+that node's watermark: [Windowing](@/service/windowing.md). The block's keys:
+
+| Key | Applies to | Meaning |
+|---|---|---|
+| `kind` | all | `"tumbling"`, `"sliding"` or `"session"` |
+| `size_ms` | tumbling, sliding | window length in milliseconds |
+| `slide_ms` | sliding | how often a new window starts |
+| `offset_ms` | tumbling, sliding | alignment offset, default 0 |
+| `gap_ms` | session | event-time silence that ends a session |
+| `time_field` | all, required | the event-time column, `Int64` milliseconds or an Arrow timestamp type |
+| `key_field` | all, optional | the grouping key list: one child per key, or several arguments on one child. Omit for a global aggregate |
+| `allowed_lateness_ms` | all | how far past the watermark a row is still counted, default 0 |
+
+A geometry key that does not belong to the `kind` is a parse error, as is an
+unknown `kind`. The host injects the block into the node's `config` as
+`window.*` keys, which the processor reads back through `get-config`. The block
+needs the `windows` feature, which the default bundle carries; cluster mode
+rejects it.
 
 ### Retrying connector operations
 
@@ -182,11 +246,6 @@ reaches the runner: 4 attempts, a 100 ms base delay, 2.0x growth, a 30 s cap and
 wrapper everywhere except `run_mode kind="stream"`, where the stream runner's own
 re-poll already is the retry loop and owns the source's error policy. EOF from a
 source is not an error and is not retried.
-
-The asymmetry follows from what a lost call costs. A `write_batch` the runner
-cannot re-drive is lost rows, so a sink is always wrapped. A stream source that
-fails is polled again 10 ms later, so wrapping it would stack one backoff on
-another.
 
 An optional `retry` child on a `source` or `sink` overrides the policy for that
 node. `max_attempts=1` disables retrying.
@@ -237,9 +296,10 @@ needs `stream`. [Stream mode](@/service/_index.md#stream-mode) has the rest.
 http bind="0.0.0.0:8080" disabled=#false
 
 // log_format is "pretty" or "json". trace_sample_ratio is parent-based
-// trace-id-ratio sampling, 0.0 to 1.0.
+// trace-id-ratio sampling, 0.0 to 1.0; outside that range startup fails.
 observability log_format="pretty" log_level="info" trace_sample_ratio=1.0 {
-    // OTLP/HTTP collector root; omit to disable span export.
+    // OTLP/HTTP collector root; omit to disable span export. The exporter
+    // appends /v1/traces.
     // otlp_endpoint "http://127.0.0.1:4318"
 
     // In-process capture, its JSON API and the dashboard. Every key has a
@@ -256,10 +316,15 @@ observability log_format="pretty" log_level="info" trace_sample_ratio=1.0 {
 }
 ```
 
-`http bind` must parse as a socket address. `disabled=#true` turns the control
-plane off entirely, the JSON API and the dashboard with it. `--log-level` and
-`--log-format` override this block on the command line. Start the service, then
-confirm the address answers:
+`log_level` is any `EnvFilter` directive string, not just a level name:
+`"debug"` and `"warn,pcs_service::service::standalone=debug"` both parse. The
+default `"info"` builds the filter `pcs=info,tower_http=info,warn`, and a set
+`RUST_LOG` wins outright over it.
+
+`http bind` must parse as a socket address unless `disabled=#true`, which turns
+the control plane off entirely, the JSON API and the dashboard with it.
+`--log-level` and `--log-format` override this block on the command line. Start
+the service, then confirm the address answers:
 
 ```bash,name=Confirm the control plane is listening
 curl -s http://localhost:8080/ready
@@ -271,9 +336,7 @@ curl -s http://localhost:8080/ready
 `source.drain`, `runtime.run`, `sink.write` and `processor.batch` are all `debug`
 spans. The dashboard's Traces tab then shows traces rooted at `pipeline.run`, and
 `log_level="debug"` is the escape hatch that restores the whole per-item
-waterfall. It costs roughly 4.6 µs per item at `info` against 7.4 µs at `debug`,
-so `debug` is for reading one workflow, not for running on. Levels per span name
-are in [Observability](@/service/observability.md#span-levels).
+waterfall. Levels per span name are in [Observability](@/service/observability.md#span-levels).
 
 ## The store block
 
@@ -294,11 +357,14 @@ store "tikv" {
 
 What it holds depends on the mode. Standalone and stream runs persist source
 cursors and processor priors, so a restart resumes instead of replaying from the
-start. Cluster mode adds the partitions, the claims and the checkpoints, which
-is why `mode "cluster"` refuses to start without this block.
+start. Stream mode always writes them back as items flow; interval and one-shot
+runs only when `batch_resume #true`. Cluster mode adds the partitions, the
+claims and the checkpoints, which is why `mode "cluster"` refuses to start
+without this block.
 
 `key_prefix` is the whole isolation boundary. Two deployments sharing one TiKV
-stay apart by choosing different prefixes.
+stay apart by choosing different prefixes. The PD endpoints must be non-empty
+`host:port` pairs, and `lease_ttl_ms` must be at least 10000.
 
 ## The cluster header
 
@@ -320,7 +386,8 @@ peer id=3 addr="10.0.0.3:9000"
 ```
 
 These timings drive elections, not claims. The claim lease is
-`store "tikv" { lease_ttl_ms }`, and it is the only lease knob.
+`store "tikv" { lease_ttl_ms }`, and it is the only lease knob. Peers must be
+unique, at least one, and include `node.id`.
 
 The workflow that follows carries exactly one `wasm` or `plugin` node and no
 `source`, `sink` or `link`. `validate` reports `mode: cluster` once the header is
@@ -328,15 +395,16 @@ right; [the distributed runner](@/distributed.md) covers the rest.
 
 ## Which features add which nodes
 
-The default bundle covers `service`, `wasm`, five connectors and five
-transformers, so every node above binds out of the box. For a narrower binary:
+The default bundle covers `service`, `wasm`, `windows`, seven connectors and all
+five transformers, so every node above binds out of the box. For a narrower
+binary:
 
 - `service` registers no source, sink or format by itself. Each `connector-*`
   feature adds one connector, each `transformer-*` one byte format, and all of
   them imply `service` plus `inspector`.
 - `service-cluster` is `service` plus `distributed-raft`. `mode "cluster"` needs
   it and `tikv-store` together.
-- Neither implies `wasm`.
+- Neither implies `wasm`; `plugin` is its own feature.
 
 <div class="note note-warn">
 <span class="note-label">Sharp edge</span>
@@ -359,6 +427,10 @@ cargo build --release -p pcs-service --bin pcs-service \
   --no-default-features \
   --features mimalloc,service-cluster,tikv-store,connector-file,transformer-csv,wasm
 ```
+
+Runs the same on Linux, macOS and Windows (PowerShell):
+
+    cargo build --release -p pcs-service --bin pcs-service
 
 Then run `validate` with the binary you built: a node kind its features do not
 carry fails the parse, and a `type` they do not carry is named in a warning.
@@ -394,9 +466,10 @@ rather than bytes and take no `transformer`. See
 `watch` property: nothing in the service builds a `System` from a type name, so
 those keys are parse errors.
 
-`WorkflowSpec`, `TransformerSpec`, `SourceSpec`, `SinkSpec`, `WasmSpec` and
-`PluginSpec` reject unknown keys, so a typo inside `workflow` fails the parse.
-`ServiceConfig` and `ObservabilityConfig` do not: an unrecognised key at the top
+`WorkflowSpec`, `TransformerSpec`, `SourceSpec`, `SinkSpec`, `WasmSpec`,
+`PluginSpec`, `RetryConfig` and the `window` block reject unknown keys, so a
+typo inside `workflow` fails the parse. `ServiceConfig`, `NodeConfig`,
+`ObservabilityConfig` and `HttpConfig` do not: an unrecognised key at the top
 level or under `observability` is accepted and ignored.
 
 ## What it refuses to start on

@@ -35,6 +35,7 @@ own branch, and there is no released version to pin:
 cargo install wit-bindgen-cli --git https://github.com/Kotlin/wit-bindgen --branch kotlin
 cargo install wasm-tools --locked --version 1.246.2
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 That puts `wit-bindgen` v0.57.1 on `PATH`. The last build step also needs
 `wasi_snapshot_preview1.reactor.wasm` from the wasmtime v48.0.1 release assets.
@@ -112,6 +113,8 @@ Five build steps, after the two local publications an in-repo build needs.
 `--kotlin-imports` names the package the generator will look for your
 implementation in:
 
+Linux/macOS:
+
 ```bash,name=Publish the SDK then generate bindings and build
 for p in pcs-sdk-kt pcs-sdk-kt-ksp; do
   (cd ../../../../packages/$p && gradle publishToMavenLocal)
@@ -123,6 +126,20 @@ wasm-tools component embed ../../../../crates/pcs-processor/wit <core>.wasm -o <
 wasm-tools component new <embedded>.wasm \
   --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.reactor.wasm \
   -o fee-kt.wasm
+```
+
+Windows (PowerShell):
+
+```powershell
+foreach ($p in @("pcs-sdk-kt", "pcs-sdk-kt-ksp")) {
+  Push-Location ..\..\..\..\packages\$p
+  gradle publishToMavenLocal
+  Pop-Location
+}
+wit-bindgen kotlin --kotlin-imports 'impl.*' ..\..\..\..\crates\pcs-processor\wit --out-dir src/wasmWasiMain/kotlin/bindings
+gradle compileProductionExecutableKotlinWasmWasiOptimize
+wasm-tools component embed ..\..\..\..\crates\pcs-processor\wit <core>.wasm -o <embedded>.wasm
+wasm-tools component new <embedded>.wasm --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.reactor.wasm -o fee-kt.wasm
 ```
 
 The two publications run in that order, because each one resolves the previous
@@ -293,13 +310,27 @@ The SDK runtime is one `commonMain` source set, so the source that runs inside
 the component is byte for byte the source `jvmTest` exercises against real wire
 bytes and a recording fake host. The codec sits in that same source set:
 
+Linux/macOS:
+
 ```bash,name=Run the SDK test suite
 cd packages/pcs-sdk-kt && gradle jvmTest
+```
+
+Windows (PowerShell):
+
+```powershell
+cd packages\pcs-sdk-kt; gradle jvmTest
 ```
 
 ```bash,name=Validate the finished component
 wasm-tools validate --features component-model fee-kt.wasm
 wasm-tools component wit fee-kt.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model fee-kt.wasm
+wasm-tools component wit fee-kt.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output

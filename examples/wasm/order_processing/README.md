@@ -1,134 +1,98 @@
-# `order-processing-wasm` — WASM port of `scheduler_etl`
+# Order Processing: a WASM processor pipeline
 
-This is the WebAssembly Component Model port of the `scheduler_etl` example
-from `examples/native/scheduler_etl.rs`. It exercises the
-`pcs-processor` SDK and the `export_pipeline!` macro end-to-end against a real
-pipeline with field-granular DAG scheduling.
+A realistic processor component built for `wasm32-wasip2`, exercising the
+`pcs-processor` SDK and the `export_pipeline!` macro end to end with
+field-granular DAG scheduling running inside the sandbox. The host hands the
+processor one Arrow IPC payload per batch and gets one back; everything
+between, meaning the DAG build, stage execution and retry handling, is native
+Rust running inside the component.
 
-## What it demonstrates
+The processor runs a two-stage pipeline over a `Transaction` component:
 
-A 2-stage pipeline over a `Transaction` component:
+| Stage | Systems | Writes |
+|-------|---------|--------|
+| 0 | `ValidateSystem`, `EnrichSystem` | `valid`; `usd_amount`. Disjoint field writes, so the stage runs them in parallel |
+| 1 | `ReportSystem` | reads `valid`, `usd_amount` and others; must follow stage 0 |
 
-```
-Stage 0:  [ValidateSystem,        — reads "amount", writes "valid"
-           EnrichSystem]          — reads "amount"/"currency", writes "usd_amount"
-                                  — disjoint writes → same stage (parallel-safe)
+There is no ingest system: `Transaction` rows arrive in the host's `run-batch`
+Arrow IPC payload from a configured source. FX rates come from the `config`
+child of the host's `wasm` node, read back through the `host-io` `get-config`
+import and parsed with `pcs_config_parse`; each missing key falls back to
+`FxRates::DEFAULT`.
 
-Stage 1:  [ReportSystem]          — reads "valid" + "usd_amount" + others
-                                  — must follow stage 0
-```
+## Prerequisites
 
-Field-granular DAG scheduling is preserved across the WASM boundary because
-the entire DAG planner runs **inside** the processor. The host hands the processor one
-Arrow IPC payload per batch and gets one back; everything between (DAG build,
-stage execution, retry handling) is native Rust running inside the sandbox.
-
-## How it differs from the native example
-
-The native `scheduler_etl` has four systems (Ingest, Validate, Enrich,
-Report). The WASM port has three — `IngestSystem` is removed because in the
-processor model **the data flows in via the host's `run-batch` Arrow IPC payload**,
-not via a hardcoded Rust list. The host loads `Transaction` rows from a
-configured source (Parquet/CSV/NDJSON) and ships them across the boundary.
-
-`FxRates` is also handled differently. In the native example it's a
-`Dataset` resource added via `Pipeline::builder().with_resource(...)`. In the
-WASM port it's a struct field on `EnrichSystem`. The reason is that
-`Dataset::write_ipc` only serializes registered components and the alive
-bitmap — it does **not** serialize the resource map. A fresh dataset
-reconstructed from IPC has zero resources, so any `get_resource::<FxRates>()`
-inside `run_on` would fail. Folding configuration into the system struct
-sidesteps that limitation entirely. The same reasoning applies to the
-native example's `Report` resource — the WASM port prints summary lines via
-`println!` (routed to the host's tracing layer through `wasi:cli/stdout`)
-instead of writing a host-side resource.
-
-FX rates come from the `config` child of the host's `wasm` node. `build()` reads
-the `fx_eur` / `fx_gbp` / `fx_jpy` / `fx_cad` keys via `pcs_config_parse::<f64>`
-— the accessor `export_pipeline!` emits into this crate, backed by the
-`pcs:pipeline/host-io` `get-config` import — and falls back to
-`FxRates::DEFAULT` per missing key.
+- Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
+- `wasm-tools` for the optional component checks
 
 ## Build
 
-From the workspace root:
+From the workspace root. The commands in this README run the same on Linux,
+macOS and Windows (PowerShell):
 
-```bash
-cargo build --release \
-  -p order-processing-wasm \
-  --target wasm32-wasip2
+```text
+cargo build --release -p order-processing-wasm --target wasm32-wasip2
 ```
 
-This produces:
+No componentizer runs: `rustc` links the `wasm32-wasip2` cdylib into a
+Component Model component itself, so plain `cargo build` writes the finished
+component to `target/wasm32-wasip2/release/order_processing_wasm.wasm`.
 
-```
-target/wasm32-wasip2/release/order_processing_wasm.wasm
-```
+Validate the component (optional):
 
-(No componentizer: `rustc` links a `wasm32-wasip2` cdylib into a Component Model
-component itself, so plain `cargo build` produces the finished component. Same
-output path shape as the smoketest.)
-
-Validate the component:
-
-```bash
-wasm-tools validate --features component-model \
-  target/wasm32-wasip2/release/order_processing_wasm.wasm
+```text
+wasm-tools validate --features component-model target/wasm32-wasip2/release/order_processing_wasm.wasm
 ```
 
-Inspect the exported world to confirm `pcs:pipeline/pipeline@0.3.0` is
-exported:
+Inspect the exported world (optional):
 
-```bash
-wasm-tools component wit \
-  target/wasm32-wasip2/release/order_processing_wasm.wasm
+```text
+wasm-tools component wit target/wasm32-wasip2/release/order_processing_wasm.wasm
 ```
 
-## Run via `pcs-service`
+## Run through pcs-service
 
-`examples/configs/standalone_wasm.kdl` runs this component
-against a five-row CSV fixture. Its paths are relative to the repository root:
+`examples/configs/standalone_wasm.kdl` runs this component against a five-row
+CSV fixture. Its paths are relative to the repository root.
 
-```bash
-cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- validate \
-  --config examples/configs/standalone_wasm.kdl --strict
+Validate the config:
 
-cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve \
-  --config examples/configs/standalone_wasm.kdl
+```text
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- validate --config examples/configs/standalone_wasm.kdl --strict
+```
+
+Run the pipeline:
+
+```text
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve --config examples/configs/standalone_wasm.kdl
 ```
 
 `run_mode` is `one_shot`, so `serve` processes
 `examples/configs/fixtures/order_processing_input.csv` once and writes
-`/tmp/pcs-order-processing-out.csv` with `valid` and `usd_amount` filled in. The
-fixture seeds both columns with `false` and `0.0`: the csv transformer turns an
-empty field into a NULL, the `Transaction` schema is non-nullable, and one blank
-cell fails the whole batch.
+`/tmp/pcs-order-processing-out.csv` with `valid` and `usd_amount` filled in.
+The fixture seeds both columns with `false` and `0.0`: the CSV transformer
+turns an empty field into a NULL, the `Transaction` schema is non-nullable,
+and one blank cell fails the whole batch.
 
-## Source layout
+## How failures surface
 
-```
-examples/wasm/order_processing/
-├── Cargo.toml            # cdylib, wit-bindgen as a wasm32-only dependency
-├── README.md             # this file
-└── src/
-    └── lib.rs            # wit_bindgen::generate! bindings module, Transaction
-                          # component, 3 systems, build() fn, and
-                          # export_pipeline!(build), all gated on wasm32
-```
+The `export_pipeline!` macro converts pipeline failures into the WIT
+`run-error` variant. `retryable` releases the claim so the host retries;
+`permanent` acks the claim and surfaces the error.
 
-## Errors and traps
+| `PcsError` from `Pipeline::run_on` | WIT `run-error` | Host action |
+|-------------------------------------|-----------------|-------------|
+| `RetryExhausted`, `SystemExecution` | `retryable(string)` | release claim, retry |
+| `ComponentNotFound`, `ResourceNotFound`, `EntityNotFound`, `Configuration`, `Scheduler`, `Store`, `Generic` | `permanent(string)` | ack claim, surface |
 
-The `export_pipeline!` macro in `pcs-processor` converts pipeline failures into
-the WIT `run-error` variant per the frozen contract:
+System authors should return `PcsError::SystemExecution(...)` for recoverable
+failures rather than calling `.unwrap()` or `panic!()`. A panic becomes a wasm
+trap, which the host catches as `permanent`, and the operator loses the batch
+instead of getting a retry.
 
-| `PcsError` from `Pipeline::run_on`  | WIT `run-error`         | Host action            |
-|-------------------------------------|-------------------------|------------------------|
-| `RetryExhausted`, `SystemExecution` | `retryable(string)`     | Release claim, retry   |
-| Everything else                     | `permanent(string)`     | Ack claim, surface     |
+## Files
 
-System authors should construct `PcsError::SystemExecution(...)` for
-recoverable failures rather than calling `.unwrap()` or `panic!()`. Panics
-become wasm traps and the host catches them as `permanent` via a
-trap-specific override — the operator loses the batch instead of getting a
-retry. Idiomatic processor pipelines avoid panics in `System::run` for this
-reason.
+| File | What it is |
+|------|------------|
+| `Cargo.toml` | cdylib, `wit-bindgen` as a wasm32-only dependency |
+| `src/lib.rs` | the `wit_bindgen::generate!` bindings, the `Transaction` component, the three systems, `build()` and `export_pipeline!(build)`, all gated on wasm32 |

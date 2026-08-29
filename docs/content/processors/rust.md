@@ -20,6 +20,7 @@ Every block below is from `examples/wasm/order_processing/`, which CI builds.
 rustup target add wasm32-wasip2
 cargo install wasm-tools --locked --version 1.246.2
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 No componentizer. `rustc` links a `wasm32-wasip2` cdylib into a Component Model
 component itself, so `cargo build` is the whole toolchain.
@@ -351,6 +352,7 @@ system incrementing it, and a host that threads `checkpoint` back in as
 ```bash,name=Build the component
 cargo build --release -p order-processing-wasm --target wasm32-wasip2
 ```
+Runs the same on Linux, macOS and Windows (PowerShell).
 
 <div class="note">
 <span class="note-label">No generated files, no adapter</span>
@@ -360,11 +362,9 @@ tree and nothing has to exist on disk before `cargo fmt --all -- --check`. The
 artifact under `target/wasm32-wasip2/release/` is the finished component: no
 preview1 core module and no adapter step.
 
-`.cargo/config.toml` adds `-C target-feature=+simd128` for the target, and
-wasmtime enables the SIMD proposal by default. Loop shape decides whether you
-collect it: iterating a column's contiguous `.values()` slice is what LLVM
-widens to `f64x2`. The bounds-checked `value(i)` row accessor compiles to scalar
-code. A batch that only moves bytes through Arrow IPC gains nothing either way.
+`.cargo/config.toml` adds `-C target-feature=+simd128` for the target, so the
+built component carries `simd128` in its target features. wasmtime enables the
+SIMD proposal by default.
 
 </div>
 
@@ -376,6 +376,12 @@ wasm-tools validate --features component-model \
 
 wasm-tools component wit \
   target/wasm32-wasip2/release/order_processing_wasm.wasm | grep 'pcs:pipeline'
+```
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model target/wasm32-wasip2/release/order_processing_wasm.wasm
+wasm-tools component wit target/wasm32-wasip2/release/order_processing_wasm.wasm | Select-String 'pcs:pipeline'
 ```
 
 ```text,name=Expected wasm-tools output
@@ -394,6 +400,12 @@ cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- valid
 
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve \
   --config examples/configs/standalone_wasm.kdl
+```
+Windows (PowerShell):
+
+```powershell
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- validate --config examples/configs/standalone_wasm.kdl --strict
+cargo run -p pcs-service --features connector-file,transformer-csv,wasm -- serve --config examples/configs/standalone_wasm.kdl
 ```
 
 `validate` parses the config, compiles the component, checks the WIT world, and

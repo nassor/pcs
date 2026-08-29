@@ -1,6 +1,6 @@
 +++
 title = "Service"
-description = "The pcs-service binary: one config file, two run modes, four commands, and a workflow that runs until you stop it."
+description = "The pcs-service binary: one config file, two run modes, and a workflow that runs until you stop it."
 template = "section.html"
 sort_by = "weight"
 
@@ -16,7 +16,7 @@ time.
 <dt>In one line</dt>
 <dd>A KDL config plus a <code>.wasm</code> component becomes a <strong>long-running process with health checks</strong></dd>
 <dt>You need</dt>
-<dd>The default feature bundle, which covers the wasm runtime, five connectors and five transformers</dd>
+<dd>The default feature bundle, which covers the wasm runtime, seven connectors and five transformers</dd>
 <dt>Read this if</dt>
 <dd>You have a pipeline that works and now need it to run unattended, behind a readiness probe, on a schedule</dd>
 </dl>
@@ -53,7 +53,7 @@ trait object, so a processor never learns which one is running it.
 | **Store** | Optional. A `store "tikv"` block persists source cursors and processor priors. | Required. `store "tikv"` holds partitions, claims and checkpoints. |
 | **Ingest** | Each `source` node drains into the nodes its links feed, every iteration. | `PartitionSource`: 512-row ranges are claimed, not read. A `source`, `sink` or `link` node is rejected. |
 | **Pacing** | `run_mode`: `continuous`, `one_shot`, `interval`, or `stream`. | As fast as claims arrive, until cancelled. |
-| **On restart** | Re-reads its sources from the beginning. | Resumes from the checkpoint recorded under its lease. |
+| **On restart** | From the beginning, or from the persisted cursor when a `store "tikv"` block is configured. | Resumes from the checkpoint recorded under its lease. |
 | **Uses `node.data_dir`** | No. Required to be non-empty, never written. | Yes, for the raft log alone: `raft-log.redb`, `bootstrap.lock`, `node-id`. |
 
 A standalone iteration checks for cancellation, then walks every declared node
@@ -64,25 +64,35 @@ the end of the pass, then `run_mode` paces the next one.
 
 Errors do not stop the loop. A source failure stops draining that source for
 this iteration; a processor failure skips that processor's fan-out, so nothing
-downstream of it is fed and every sink is **still** written. All of them log and
-increment `iteration_errors`, which `/status` reports.
+downstream of it is fed. All of them log and increment `iteration_errors`, which
+`/status` reports.
 
 A WASM processor node runs on a blocking thread rather than the async worker,
 and only Arrow IPC bytes cross onto that thread and back. A processor may also
 deliver to some of its downstream links instead of all of them:
 [Branching](@/service/branching.md).
 
-The loop is running when the counters move:
+The loop is running when the counters move. `/status` carries one block per
+declared workflow, so read the first one:
 
 ```bash,name=Watch the iteration counters move
 curl -s http://localhost:8080/status \
-  | jq '.standalone | {iterations, rows_processed, iteration_errors}'
+  | jq '.standalone[0] | {iterations, rows_processed, iteration_errors}'
 
 {
   "iterations": 41,
   "rows_processed": 148213,
   "iteration_errors": 0
 }
+```
+
+Windows (PowerShell):
+
+```powershell
+curl.exe -s http://localhost:8080/status |
+  ConvertFrom-Json |
+  Select-Object -ExpandProperty standalone |
+  Select-Object -First 1 iterations, rows_processed, iteration_errors
 ```
 
 <div class="note">
@@ -181,7 +191,7 @@ let built = register_builtin_factories(ServiceBuilder::new())
     .build(&config)?;
 
 // `None` opts out of publishing live stats to /status.
-let stats = run_standalone(built, &config, CancellationToken::new(), None).await?;
+let stats = run_standalone(built, &config, CancellationToken::new(), None, None).await?;
 ```
 
 For a native Rust processor, declare its `wasm` node with no `module` and hand

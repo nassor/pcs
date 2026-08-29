@@ -273,9 +273,11 @@ canonical definition.
 
 Two commands, and neither needs the host:
 
-```bash,name=The two commands that prove the world
+Windows (PowerShell):
+
+```powershell
 wasm-tools validate --features component-model my-processor.wasm
-wasm-tools component wit my-processor.wasm | grep 'pcs:pipeline'
+wasm-tools component wit my-processor.wasm | Select-String 'pcs:pipeline'
 ```
 
 The second must print both halves of the world:

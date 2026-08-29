@@ -169,7 +169,7 @@ depends on it. The <code>connector-postgresql</code> feature on the host adds
 ## Worked example
 
 <div class="code">
-<div class="code-cap"><span>Bash</span><em>the example exits 0 without a DSN rather than failing</em></div>
+<div class="code-cap"><span>Linux/macOS</span><em>the example exits 0 without a DSN rather than failing</em></div>
 
 ```bash
 PCS_PG_DSN=postgres://localhost/pcs \
@@ -177,6 +177,13 @@ PCS_PG_DSN=postgres://localhost/pcs \
 ```
 
 </div>
+
+Windows (PowerShell):
+
+```powershell
+$env:PCS_PG_DSN = "postgres://localhost/pcs"
+cargo run -p pcs-connector-postgresql --example postgres_roundtrip
+```
 
 `examples/configs/postgresql.kdl` is a commented config covering both halves.
 It sets `run_mode kind="interval"`, because this source reaches EOF once it is caught up.

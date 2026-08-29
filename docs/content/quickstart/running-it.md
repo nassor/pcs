@@ -1,6 +1,6 @@
 +++
 title = "Running it!"
-description = "A live NATS stream through a Go processor and a C# processor into PostgreSQL: one pcs-service process, one config file, two linked WebAssembly processors in one workflow, one Arrow schema, one dashboard."
+description = "Build a Rust WebAssembly processor, run it through pcs-service with a minimal file-based config, and read the result. About 15 minutes, no Docker needed."
 template = "page.html"
 weight = 2
 +++
@@ -9,19 +9,214 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>NATS in, two WebAssembly processors in two languages, <strong>PostgreSQL out</strong></dd>
+<dd>CSV in, one <strong>WebAssembly processor</strong>, CSV out, and a live <code>/health</code> endpoint</dd>
 <dt>You need</dt>
 <dd>Everything from the Installation page, and a checkout of the repository</dd>
 <dt>Read this if</dt>
-<dd>You want to watch a real workflow move rows before reading any reference page</dd>
+<dd>You want to see a real workflow move rows before reading any reference page</dd>
 </dl>
 
-The stack lives in `examples/quickstart/`. A publisher writes card
-authorisations as NDJSON onto a NATS subject. One service reads that subject,
-validates each authorisation with a Go processor, prices and tiers it with a C#
-processor in the same process, and upserts the result into PostgreSQL.
-
 Install first if you have not: [Installation](@/quickstart/installation.md).
+
+You build one processor component, the Rust port of the
+`scheduler_etl` example, and run it under `pcs-service` with a config you
+write yourself. A CSV file of five transactions goes in, the processor
+validates each row and converts it to USD, and a CSV file comes out. The
+whole route needs no Docker, no Go and no .NET; those join in the
+[Docker Compose quickstart](@/quickstart/running-it.md#next-the-docker-compose-quickstart)
+at the end.
+
+## Step 1: build the processor component
+
+```bash,name=Runs the same on Linux, macOS and Windows (PowerShell)
+cargo build --release -p order-processing-wasm --target wasm32-wasip2
+```
+
+`rustc` links a `wasm32-wasip2` cdylib into a Component Model component
+itself, so plain `cargo build` is the whole toolchain. The finished component
+lands at `target/wasm32-wasip2/release/order_processing_wasm.wasm`.
+
+Check that it exports the PCS world:
+
+```bash,name=Runs the same on Linux, macOS and Windows (PowerShell)
+wasm-tools validate --features component-model target/wasm32-wasip2/release/order_processing_wasm.wasm
+```
+
+Prints nothing and exits 0. The component exports two functions,
+`describe()` and `run-batch`, which is the whole
+[WIT contract](@/processors/wit-contract.md).
+
+## Step 2: write a minimal config
+
+Create `my-first-pcs.kdl` in the repository root. Every key comes from
+`examples/configs/standalone_wasm.kdl` and `examples/configs/standalone.kdl`,
+which use the same shape:
+
+```kdl,name=my-first-pcs.kdl
+mode "standalone"
+
+node id=1 name="first-pipeline" data_dir="${PCS_DATA_DIR:-/tmp/pcs-first}"
+
+run_mode kind="interval" interval_ms=5000
+
+workflow "orders" {
+    transformer "csv_fmt" format="csv" {
+        options has_headers=#true
+    }
+
+    source "csv_orders" type="FileSource" component="Transaction" transformer="csv_fmt" {
+        config {
+            path "examples/configs/fixtures/order_processing_input.csv"
+            schema_fields "id" type="UInt64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#false
+            schema_fields "currency" type="Utf8" nullable=#false
+            schema_fields "valid" type="Boolean" nullable=#false
+            schema_fields "usd_amount" type="Float64" nullable=#false
+        }
+    }
+
+    wasm "process_orders" module="target/wasm32-wasip2/release/order_processing_wasm.wasm" {
+        config fx_eur="1.08" fx_gbp="1.27" fx_jpy="0.0067" fx_cad="0.74"
+    }
+
+    sink "csv_out" type="FileSink" component="Transaction" transformer="csv_fmt" {
+        config {
+            path "/tmp/pcs-first-out.csv"
+            truncate #true
+            schema_fields "id" type="UInt64" nullable=#false
+            schema_fields "amount" type="Float64" nullable=#false
+            schema_fields "currency" type="Utf8" nullable=#false
+            schema_fields "valid" type="Boolean" nullable=#false
+            schema_fields "usd_amount" type="Float64" nullable=#false
+        }
+    }
+
+    link from="csv_orders" to="process_orders"
+    link from="process_orders" to="csv_out"
+}
+
+http bind="127.0.0.1:8080"
+
+observability log_format="pretty" log_level="info"
+```
+
+What each part does:
+
+- `mode "standalone"` runs one process with no distributed coordination.
+- `run_mode kind="interval" interval_ms=5000` re-runs the workflow every five
+  seconds, so the service stays alive between iterations. `kind="one_shot"`
+  would exit after the first iteration instead.
+- One `workflow` node declares the whole graph. The `transformer "csv_fmt"`
+  node names the byte format; both the source and the sink reference it by id.
+- The `source` is a `FileSource` reading `order_processing_input.csv`, decoded
+  into the five fields of the `Transaction` component.
+- The `wasm` node names the component you built. The `config` block holds the
+  FX rates the processor reads through the `host-io` `get-config` import.
+- The `sink` is a `FileSink`; `truncate #true` replaces the output file on
+  every start instead of appending to it.
+- Each `link` is one edge of the graph: source to processor, processor to sink.
+- `http bind="127.0.0.1:8080"` turns on the control plane, and
+  `observability` sets the log format and level.
+
+The paths are relative to the directory you run from, so run everything from
+the repository root. The output directory must exist before `FileSink` opens
+the file. On Linux and macOS `/tmp` always does; on Windows the path
+`/tmp/pcs-first-out.csv` resolves to `C:\tmp\pcs-first-out.csv` on the current
+drive, so create it first:
+
+Linux/macOS: nothing to do.
+
+Windows (PowerShell):
+
+```powershell
+New-Item -ItemType Directory -Force C:\tmp
+```
+
+## Step 3: validate the config
+
+```bash,name=Runs the same on Linux, macOS and Windows (PowerShell)
+pcs-service validate -c my-first-pcs.kdl
+```
+
+`validate` reads the config, compiles the component, calls `describe()`, and
+walks every `link` checking that both ends agree on the schema. It prints
+`OK: workflow graph validated (components and schemas agree end to end)` and
+exits 0. A processor that reports a different component list or schema
+fingerprint fails here rather than at the first batch.
+
+## Step 4: run it
+
+```bash,name=Runs the same on Linux, macOS and Windows (PowerShell)
+pcs-service serve -c my-first-pcs.kdl
+```
+
+The service starts, drains the CSV into the dataset, hands the batch to the
+processor, and writes the result. Five seconds later it drains again, finds
+the file source at EOF, and idles. Leave it running.
+
+## Step 5: observe the service
+
+In a second terminal, ask the control plane:
+
+Linux/macOS:
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+Windows (PowerShell):
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/health
+```
+
+Expected output, a JSON document with a live `liveness_counter` that ticks up
+once per second:
+
+```json
+{"status":"alive","uptime_seconds":7,"liveness_counter":7}
+```
+
+`/status` carries the workflow counters:
+
+```json
+{"node_id":1,"node_name":"first-pipeline","mode":"standalone","uptime_seconds":7,"build":{"version":"0.1.0"},"cluster":null,"standalone":[{"workflow_id":"orders","iterations":1,"rows_processed":5,"source_batches_drained":1,"sink_batches_written":1,"iteration_errors":0,"total_busy_micros":0,"max_item_micros":0}]}
+```
+
+`/ready` returns `{"status":"ready"}`, and `/metrics` serves the Prometheus
+exposition. All four endpoints are described under
+[Service](@/service/_index.md).
+
+## Step 6: read the result
+
+The sink wrote `pcs-first-out.csv` (on Windows, `C:\tmp\pcs-first-out.csv`).
+Open it. The input fixture has five rows:
+
+```text
+id,amount,currency,valid,usd_amount
+1,120.0,EUR,false,0.0
+2,4300.0,USD,false,0.0
+3,75.5,GBP,false,0.0
+4,-50.0,EUR,false,0.0
+5,900000.0,JPY,false,0.0
+```
+
+In the output, the processor has filled both empty columns: `valid` is `true`
+where the amount is positive, and `usd_amount` is the amount converted at the
+configured rates (EUR 1.08, GBP 1.27, JPY 0.0067, USD 1.0). Row 4 has a
+negative amount, so its `valid` stays `false`.
+
+Stop the service with Ctrl-C. `serve` shuts down between iterations, so an
+interrupt never lands mid-batch.
+
+## Next: the Docker Compose quickstart
+
+The route above moves a static file. The full Quick Start in
+[`examples/quickstart/`](https://github.com/nassor/pcs/tree/main/examples/quickstart)
+moves live data: a publisher writes card authorisations to a NATS subject, one
+`pcs-service` process runs two linked WebAssembly processors in two languages
+against the same in-memory dataset, and upserts the result into PostgreSQL,
+with a live dashboard on port 8080.
 
 <div class="dgm animate-in">
     <div class="dgm-scroll"><svg viewBox="0 0 660 212" role="img" aria-labelledby="qs-title qs-desc">
@@ -33,8 +228,8 @@ Install first if you have not: [Installation](@/quickstart/installation.md).
             processors against the same in-memory dataset. The Go processor
             validate-go.wasm writes the valid column, then the C# processor
             settle-cs.wasm writes the fee and review_tier columns. The service
-            upserts all eleven columns into the PostgreSQL table public.settlements
-            and serves one dashboard on port 8080.
+            upserts all twelve columns into the PostgreSQL table
+            public.settlements and serves one dashboard on port 8080.
         </desc>
         <g class="anim anim-1">
             <rect class="blk blk-data" x="0" y="56" width="136" height="68" rx="8"/>
@@ -90,231 +285,7 @@ Install first if you have not: [Installation](@/quickstart/installation.md).
     </figcaption>
 </div>
 
-## Build the two components
-
-```bash,name=Build the two components
-cargo xtask quickstart
-```
-
-The task regenerates the shared `Order` schema, builds the Go processor with
-`componentize-go`, builds the C# processor with `dotnet build -c Release`, collects
-both into `examples/quickstart/build/`, and validates each with `wasm-tools`
-against the `pcs:pipeline/pipeline@0.3.0` export. It exits with a distinct code
-per missing tool.
-
-The Go processor is `examples/polyglot/stages/go-validate`, reused unmodified: it
-reads `amount` and writes `valid = amount > min_amount`. The C# processor,
-`examples/quickstart/stages/csharp-settle`, is written for this tutorial: it
-reads `valid` and `amount` and writes `fee` and `review_tier`.
-
-## Start NATS and PostgreSQL
-
-```bash,name=Start NATS and PostgreSQL
-docker compose -f examples/quickstart/docker-compose.yml up -d
-```
-
-`schema.sql` is mounted into the container's initialisation directory and runs
-once, on first bring-up of an empty data directory. It has to: `PostgresSink`
-never issues `CREATE TABLE` and matches columns by name against the live table.
-
-## The service
-
-`examples/quickstart/quickstart.kdl`, the parts that decide behaviour:
-
-```kdl,name=The parts of quickstart.kdl that decide behaviour
-mode "standalone"
-
-node id=1 name="quickstart" data_dir="${PCS_DATA_DIR:-/tmp/pcs-quickstart}"
-
-run_mode kind="stream"
-
-workflow "quickstart" {
-    transformer "ndjson_fmt" format="ndjson"
-
-    source "authorizations-raw" type="NatsSource" component="Order" transformer="ndjson_fmt" {
-        config {
-            batch_size 500
-            poll_timeout_ms 500
-
-            connection {
-                servers "${PCS_NATS_URL:-nats://localhost:4222}"
-                name "quickstart"
-            }
-
-            mode kind="core" subject="authorizations.raw"
-
-            // All eleven Order fields, in schema order.
-            schema_fields "id" type="int64" nullable=#false
-        }
-    }
-
-    wasm "validate" module="examples/quickstart/build/validate-go.wasm" {
-        config min_amount="0.50"
-    }
-
-    wasm "settle" module="examples/quickstart/build/settle-cs.wasm" {
-        config fee_bps="290" fee_fixed="0.30" hold_above="1000"
-    }
-
-    sink "settlements" type="PostgresSink" component="Order" {
-        config {
-            name "settlements"
-            table "public.settlements"
-            write_mode "upsert"
-            conflict_columns "id"
-            dedupe_order_column "id"
-
-            connection {
-                dsn "${PCS_PG_DSN:-postgres://postgres:pcs@127.0.0.1:5432/pcs}"
-                application_name "pcs-quickstart"
-                sslmode "disable"
-            }
-
-            // The same eleven fields.
-            schema_fields "id" type="int64" nullable=#false
-        }
-    }
-
-    link from="authorizations-raw" to="validate"
-    link from="validate" to="settle"
-    link from="settle" to="settlements"
-}
-
-http bind="127.0.0.1:8080"
-
-observability log_level="info" {
-    inspector enabled=#true ui=#true
-}
-```
-
-`kind="stream"` is the runner. A core NATS subscription never reports EOF, so
-the interval runner would spin on a source that is never done. The stream runner
-drives a live source item by item, and requires exactly one declared source,
-which this config has.
-
-One `workflow` node declares the whole graph: the byte format, the source, both
-processors, the sink, and one `link` per edge. `ServiceBuilder::build` assembles
-one `BuiltNode` per declared node in topological order, so `validate` runs before
-`settle`, both against the same in-memory `Dataset`. The Go processor writes
-`valid`, then the C# processor reads it and writes `fee` and `review_tier`.
-Nothing is re-encoded between them, and no transport sits between them either.
-
-Both processors must declare the same components and report the same Arrow schema
-fingerprint. `validate_workflow_graph` runs inside `build`, before it returns, and
-rejects a link whose two ends disagree on either, naming the link.
-
-Each `config` node belongs to the `wasm` node holding it, and reaches that
-processor as strings through the WIT
-`host-io::get-config` import, which the processor parses itself. `min_amount`
-is the line below which an authorisation is a card-testing probe, not a
-purchase. `fee_bps` and `fee_fixed` are the fee in basis points of the amount
-plus a flat component, and a valid authorisation above `hold_above` is held for
-manual review instead of settled.
-
-Both the source and the sink declare all eleven `Order` fields in
-`schema_fields`, non-nullable, in schema order. The full list is in the file. The
-source needs them because a processor mutates the Arrow buffer in place and
-cannot add columns, so every field either processor touches has to be present from
-the first decode. `PostgresSink::check_schema` needs them because it requires the
-incoming batch to match `schema_fields` field for field, in order: it projects
-nothing, and a batch with a different column count is rejected rather than
-partially written. `schema.sql` has the same eleven columns, and the four fields
-neither processor writes, `usd_amount`, `risk_score`, `flagged` and `settlement`,
-land as the zero values the publisher sent.
-
-`write_mode "upsert"` on `id` makes a replayed batch idempotent, so re-running
-the publisher does not duplicate rows. `dedupe_order_column` is required when one
-batch can repeat a conflict key: without it PostgreSQL raises `ON CONFLICT DO
-UPDATE command cannot affect row a second time`.
-
-## Check the config, then start it
-
-```bash,name=Check the config first
-pcs-service validate -c examples/quickstart/quickstart.kdl
-```
-
-`validate` reads the config, compiles both components, calls each `describe()`
-and walks every `link`. A stale `component`, or a processor that disagrees on the
-schema fingerprint, fails here rather than at the first batch. No `--features` flag:
-NATS, PostgreSQL, ndjson and the wasm runtime are all in the default bundle.
-
-```bash,name=Start the service
-pcs-service serve -c examples/quickstart/quickstart.kdl &
-```
-
-## Publish some authorisations
-
-```bash,name=Publish five thousand authorisations
-cargo run -p pcs-service --example quickstart_publish --features connector-nats -- \
-  --count 5000 --rate 500
-```
-
-Five thousand authorisations at 500 a second. Amounts come from a seeded
-three-bucket mixture spanning 0.01 to 5000.00, which straddles both processors'
-thresholds, so every branch of both fires. `--url`, `--subject` and `--seed` are
-the other flags; the seed is a fixed constant, so a re-run reproduces the same
-rows and the same table contents.
-
-`--count 0` publishes until Ctrl-C instead of stopping at a fixed total, for
-watching the dashboard against a live stream rather than a completed run.
-
-## Watch it
-
-The service serves one dashboard: <http://127.0.0.1:8080/ui>
-
-The Pipelines tab draws one box per declared node in four depth columns:
-`authorizations-raw`, `validate`, `settle`, `settlements`. A box is titled by its
-declared `name` when the config gives one and by its id otherwise, which is what
-these four show, and its second line is the connector `type` or the runtime kind.
-Every box carries its own live numbers, read from the series attributed to its id,
-and clicking a processor box opens its version, its statefulness and the artifact
-file it loaded. Edge dashes speed up as throughput rises. The Logs tab tails both
-processors' `host-io::log` lines. The Traces tab shows one trace per item under
-the stream runner, with a bar per `runtime.run` and one for `sink.write`; the wait
-for input precedes the item, so no source drain bar appears.
-[Live dashboard](@/service/dashboard.md) covers all three.
-
-## Read the result
-
-```bash,name=Read the settlements out of PostgreSQL
-docker compose -f examples/quickstart/docker-compose.yml exec -T postgres \
-  psql -U postgres -d pcs -c \
-  'select review_tier, count(*), round(sum(fee)::numeric, 2) as fees
-     from settlements group by review_tier order by review_tier;'
-```
-
-`review_tier` is the settlement decision:
-
-| Value | Meaning |
-|---|---|
-| `0` | settled |
-| `1` | held for manual review, amount above `hold_above` |
-| `2` | rejected, the Go processor found the amount below `min_amount` |
-
-## Why a tier code and not a settlement string
-
-`Order` has a `settlement` text column, and the C# processor does not write it.
-Both processors mutate the incoming Arrow IPC buffer in place and hand the same
-bytes back, which is what a processor can do without shipping an Arrow writer.
-In-place mutation can overwrite a fixed-width value and nothing else.
-`settlement` is `Utf8`, a variable-width column whose offsets buffer would have
-to move, and the `Pcs.Sdk` codec rejects that write rather than corrupting
-the stream. `review_tier` is `Int64`, so it is writable, and the table stores the
-tier.
-
-## What this does and does not promise
-
-The service runs under the streaming standalone runner, which is
-**at-most-once**. It acknowledges nothing and keeps no checkpoints, so a service
-killed mid-batch loses that batch. The state blob each processor returns is
-handed back as the next item's `prior`. Neither config here declares a `store`
-block, so that blob lives in loop memory and is gone on restart.
-
-At-least-once is `DistributedRunner`'s territory, covered under
-[Distributed Runner](@/distributed.md).
-
-## Tear down
-
-```bash,name=Tear the containers down
-docker compose -f examples/quickstart/docker-compose.yml down -v
-```
+It needs Docker (NATS 2.11 and PostgreSQL 18), the Go and C# toolchains from
+the Installation page, and about ten minutes. The commands, the `quickstart.kdl`
+config, and the expected `review_tier` breakdown are all in
+[`examples/quickstart/README.md`](https://github.com/nassor/pcs/blob/main/examples/quickstart/README.md).

@@ -25,11 +25,20 @@ You need `wasm-tools` once, regardless of language:
 cargo install wasm-tools --locked --version 1.246.2
 ```
 
+Runs the same on Linux, macOS and Windows (PowerShell).
+
 All six recipes end with these two commands:
 
 ```bash,name=The two commands every recipe ends with
 wasm-tools validate --features component-model <component>.wasm
 wasm-tools component wit <component>.wasm | grep 'pcs:pipeline'
+```
+
+Windows (PowerShell):
+
+```powershell
+wasm-tools validate --features component-model <component>.wasm
+wasm-tools component wit <component>.wasm | Select-String 'pcs:pipeline'
 ```
 
 The second command must print a world importing `pcs:pipeline/host-io@0.3.0`

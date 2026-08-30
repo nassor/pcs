@@ -35,18 +35,18 @@ The same two commands work on every platform, from the repository root:
 
 ```text
 cargo build --release -p windowing-wasm --target wasm32-wasip2
-cargo build -p windowing-plugin
+cargo build --release -p windowing-plugin
 ```
 
 The plugin artifact name is platform specific. The config's default library
-path (`target/debug/libwindowing_plugin.so`) is the Linux name, so only macOS
+path (`target/release/libwindowing_plugin.so`) is the Linux name, so only macOS
 and Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
-| Linux | `target/debug/libwindowing_plugin.so` | not needed (config default) |
-| macOS | `target/debug/libwindowing_plugin.dylib` | `target/debug/libwindowing_plugin.dylib` |
-| Windows | `target/debug/windowing_plugin.dll` | `target/debug/windowing_plugin.dll` |
+| Linux | target/release/libwindowing_plugin.so | not needed (config default) |
+| macOS | target/release/libwindowing_plugin.dylib | target/release/libwindowing_plugin.dylib |
+| Windows | target/release/windowing_plugin.dll | target/release/windowing_plugin.dll |
 
 ## Run it
 
@@ -93,9 +93,9 @@ table above:
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- serve --config examples/windowing/windowing.kdl
 ```
 
-macOS: the same, with `PCS_PLUGIN_LIB=target/debug/libwindowing_plugin.dylib`
+macOS: the same, with `PCS_PLUGIN_LIB=target/release/libwindowing_plugin.dylib`
 set on the command. Windows (PowerShell): the same, with
-`$env:PCS_PLUGIN_LIB = "target/debug/windowing_plugin.dll"`.
+`$env:PCS_PLUGIN_LIB = "target/release/windowing_plugin.dll"`.
 
 3. Publish, in another terminal:
 

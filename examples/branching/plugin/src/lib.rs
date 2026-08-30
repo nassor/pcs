@@ -19,7 +19,7 @@
 //! # Build
 //!
 //! ```bash
-//! cargo build -p branching-plugin
+//! cargo build --release -p branching-plugin
 //! ```
 //!
 //! The artifact name is platform specific: `libbranching_plugin.so` on Linux,

@@ -219,7 +219,7 @@ are in [the workflow structure](@/service/configuration.md#the-load-time-graph-r
 
 ```bash,name=Build both processors
 cargo build --release -p branching-wasm --target wasm32-wasip2
-cargo build -p branching-plugin
+cargo build --release -p branching-plugin
 ```
 
 Runs the same on Linux, macOS and Windows (PowerShell). The plugin artifact name
@@ -228,9 +228,9 @@ Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
-| Linux | `target/debug/libbranching_plugin.so` | not needed (config default) |
-| macOS | `target/debug/libbranching_plugin.dylib` | `target/debug/libbranching_plugin.dylib` |
-| Windows | `target/debug/branching_plugin.dll` | `target/debug/branching_plugin.dll` |
+| Linux | `target/release/libbranching_plugin.so` | not needed (config default) |
+| macOS | `target/release/libbranching_plugin.dylib` | `target/release/libbranching_plugin.dylib` |
+| Windows | `target/release/branching_plugin.dll` | `target/release/branching_plugin.dll` |
 
 ## 2. Validate the config
 
@@ -247,7 +247,7 @@ cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -
 macOS:
 
 ```bash,name=Validate with the dylib name
-PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
+PCS_PLUGIN_LIB=target/release/libbranching_plugin.dylib \
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate \
   --config examples/branching/branching.kdl --strict
 ```
@@ -255,7 +255,7 @@ cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -
 Windows (PowerShell):
 
 ```powershell
-$env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
+$env:PCS_PLUGIN_LIB = "target/release/branching_plugin.dll"
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- validate --config examples/branching/branching.kdl --strict
 ```
 
@@ -293,7 +293,7 @@ macOS:
 mkdir -p /tmp/pcs-branching
 
 PCS_OUT_DIR=/tmp/pcs-branching \
-PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
+PCS_PLUGIN_LIB=target/release/libbranching_plugin.dylib \
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve \
   --config examples/branching/branching.kdl
 ```
@@ -304,7 +304,7 @@ Windows (PowerShell):
 mkdir C:\pcs-branching
 
 $env:PCS_OUT_DIR = "C:/pcs-branching"
-$env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
+$env:PCS_PLUGIN_LIB = "target/release/branching_plugin.dll"
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve --config examples/branching/branching.kdl
 ```
 

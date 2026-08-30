@@ -219,7 +219,7 @@ like](@/service/dashboard.md#what-windowing-looks-like).
 
 ```bash,name=Build both processors
 cargo build --release -p windowing-wasm --target wasm32-wasip2
-cargo build -p windowing-plugin
+cargo build --release -p windowing-plugin
 ```
 
 Runs the same on Linux, macOS and Windows (PowerShell). The plugin artifact name
@@ -228,9 +228,9 @@ Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
-| Linux | `target/debug/libwindowing_plugin.so` | not needed (config default) |
-| macOS | `target/debug/libwindowing_plugin.dylib` | `target/debug/libwindowing_plugin.dylib` |
-| Windows | `target/debug/windowing_plugin.dll` | `target/debug/windowing_plugin.dll` |
+| Linux | `target/release/libwindowing_plugin.so` | not needed (config default) |
+| macOS | `target/release/libwindowing_plugin.dylib` | `target/release/libwindowing_plugin.dylib` |
+| Windows | `target/release/windowing_plugin.dll` | `target/release/windowing_plugin.dll` |
 
 ## 2. Validate the config
 
@@ -247,7 +247,7 @@ cargo run -p pcs-service --features connector-nats,connector-postgresql,transfor
 macOS:
 
 ```bash,name=Validate with the dylib name
-PCS_PLUGIN_LIB=target/debug/libwindowing_plugin.dylib \
+PCS_PLUGIN_LIB=target/release/libwindowing_plugin.dylib \
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- validate \
   --config examples/windowing/windowing.kdl --strict
 ```
@@ -255,7 +255,7 @@ cargo run -p pcs-service --features connector-nats,connector-postgresql,transfor
 Windows (PowerShell):
 
 ```powershell
-$env:PCS_PLUGIN_LIB = "target/debug/windowing_plugin.dll"
+$env:PCS_PLUGIN_LIB = "target/release/windowing_plugin.dll"
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- validate --config examples/windowing/windowing.kdl --strict
 ```
 
@@ -300,7 +300,7 @@ cargo run -p pcs-service --features connector-nats,connector-postgresql,transfor
 Windows (PowerShell):
 
 ```powershell
-$env:PCS_PLUGIN_LIB = "target/debug/windowing_plugin.dll"
+$env:PCS_PLUGIN_LIB = "target/release/windowing_plugin.dll"
 cargo run -p pcs-service --features connector-nats,connector-postgresql,transformer-ndjson,wasm,plugin -- serve --config examples/windowing/windowing.kdl
 ```
 

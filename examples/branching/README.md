@@ -35,18 +35,18 @@ The same two commands work on every platform, from the repository root:
 
 ```text
 cargo build --release -p branching-wasm --target wasm32-wasip2
-cargo build -p branching-plugin
+cargo build --release -p branching-plugin
 ```
 
 The plugin artifact name is platform specific. The config's default library
-path (`target/debug/libbranching_plugin.so`) is the Linux name, so only macOS
+path (`target/release/libbranching_plugin.so`) is the Linux name, so only macOS
 and Windows need `PCS_PLUGIN_LIB`:
 
 | Platform | Plugin artifact | `PCS_PLUGIN_LIB` |
 |----------|-----------------|------------------|
-| Linux | `target/debug/libbranching_plugin.so` | not needed (config default) |
-| macOS | `target/debug/libbranching_plugin.dylib` | `target/debug/libbranching_plugin.dylib` |
-| Windows | `target/debug/branching_plugin.dll` | `target/debug/branching_plugin.dll` |
+| Linux | `target/release/libbranching_plugin.so` | not needed (config default) |
+| macOS | `target/release/libbranching_plugin.dylib` | `target/release/libbranching_plugin.dylib` |
+| Windows | `target/release/branching_plugin.dll` | `target/release/branching_plugin.dll` |
 
 ## Run it
 
@@ -79,7 +79,7 @@ macOS:
 ```text
 mkdir -p /tmp/pcs-branching
 PCS_OUT_DIR=/tmp/pcs-branching \
-PCS_PLUGIN_LIB=target/debug/libbranching_plugin.dylib \
+PCS_PLUGIN_LIB=target/release/libbranching_plugin.dylib \
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve \
   --config examples/branching/branching.kdl
 ```
@@ -89,7 +89,7 @@ Windows (PowerShell):
 ```powershell
 mkdir C:\pcs-branching
 $env:PCS_OUT_DIR = "C:/pcs-branching"
-$env:PCS_PLUGIN_LIB = "target/debug/branching_plugin.dll"
+$env:PCS_PLUGIN_LIB = "target/release/branching_plugin.dll"
 cargo run -p pcs-service --features connector-file,transformer-csv,wasm,plugin -- serve --config examples/branching/branching.kdl
 ```
 

@@ -17,7 +17,7 @@
 //
 // Build the two processors first, from the repository root:
 //   cargo build --release -p windowing-wasm --target wasm32-wasip2
-//   cargo build -p windowing-plugin
+//   cargo build --release -p windowing-plugin
 //
 // Start NATS and PostgreSQL (docker compose -f examples/windowing/docker-compose.yml up -d),
 // then run the service and the publisher:
@@ -25,7 +25,7 @@
 //     --config examples/windowing/windowing.kdl
 //   cargo run -p pcs-service --example windowed_publish -- --rate 20 --ts-step-ms 2000
 //
-// On Windows set PCS_PLUGIN_LIB=target/debug/windowing_plugin.dll too: the
+// On Windows set PCS_PLUGIN_LIB=target/release/windowing_plugin.dll too: the
 // plugin cdylib is windowing_plugin.dll there, not libwindowing_plugin.so.
 
 mode "standalone"
@@ -97,7 +97,7 @@ workflow "windowing" {
         }
     }
 
-    plugin "window_plugin" library="${PCS_PLUGIN_LIB:-target/debug/libwindowing_plugin.so}" {
+    plugin "window_plugin" library="${PCS_PLUGIN_LIB:-target/release/libwindowing_plugin.so}" {
         window kind="tumbling" size_ms=30000 time_field="timestamp_ms" allowed_lateness_ms=5000 {
             key_field "symbol"
         }

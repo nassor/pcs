@@ -11,7 +11,7 @@
 //! # Build
 //!
 //! ```bash
-//! cargo build -p windowing-plugin
+//! cargo build --release -p windowing-plugin
 //! ```
 //!
 //! The artifact name is platform specific: `libwindowing_plugin.so` on Linux,

@@ -58,9 +58,14 @@ fn data_dir(name: &str) -> String {
 }
 
 /// The platform-correct native plugin library path, relative to the
-/// repository root (every command runs from there).
-fn plugin_lib(name: &str) -> String {
-    format!("target/debug/{DLL_PREFIX}{name}{DLL_SUFFIX}")
+/// repository root (every command runs from there). Demo plugins are built in
+/// release like their wasm twins; the smoketest fixture stays debug because
+/// the plugin tests resolve it from the test binary's own profile dir.
+fn plugin_lib(name: &str, release: bool) -> String {
+    format!(
+        "target/{}/{DLL_PREFIX}{name}{DLL_SUFFIX}",
+        if release { "release" } else { "debug" }
+    )
 }
 
 /// Build one processor component for `wasm32-wasip2`.
@@ -72,6 +77,12 @@ fn cargo_wasm(ctx: &Ctx, pkg: &str) -> Result<()> {
 
 /// Build one native plugin cdylib.
 fn cargo_plugin(ctx: &Ctx, pkg: &str) -> Result<()> {
+    ctx.cargo()?.args(["build", "--release", "-p", pkg]).run()
+}
+
+/// Build one native plugin cdylib in the dev profile (test fixtures and the
+/// standalone_plugin demo resolve their artifact from `target/debug`).
+fn cargo_plugin_debug(ctx: &Ctx, pkg: &str) -> Result<()> {
     ctx.cargo()?.args(["build", "-p", pkg]).run()
 }
 
@@ -90,7 +101,7 @@ fn build_windowing(ctx: &Ctx) -> Result<()> {
 }
 
 fn build_pcs_plugin_smoketest(ctx: &Ctx) -> Result<()> {
-    cargo_plugin(ctx, "pcs-plugin-smoketest")
+    cargo_plugin_debug(ctx, "pcs-plugin-smoketest")
 }
 
 fn build_quickstart(_ctx: &Ctx) -> Result<()> {
@@ -118,7 +129,9 @@ pub const EXAMPLES: &[Example] = &[
         features: &["plugin"],
         build: build_pcs_plugin_smoketest,
         variables: &[
-            ("PCS_PLUGIN_LIB", |_| plugin_lib("pcs_plugin_smoketest")),
+            ("PCS_PLUGIN_LIB", |_| {
+                plugin_lib("pcs_plugin_smoketest", false)
+            }),
             ("PCS_DATA_DIR", |_| data_dir("standalone_plugin")),
         ],
         one_shot: true,
@@ -129,7 +142,7 @@ pub const EXAMPLES: &[Example] = &[
         features: &["plugin"],
         build: build_branching,
         variables: &[
-            ("PCS_PLUGIN_LIB", |_| plugin_lib("branching_plugin")),
+            ("PCS_PLUGIN_LIB", |_| plugin_lib("branching_plugin", true)),
             ("PCS_OUT_DIR", |_| data_dir("branching")),
             ("PCS_DATA_DIR", |_| data_dir("branching")),
         ],
@@ -141,7 +154,7 @@ pub const EXAMPLES: &[Example] = &[
         features: &["plugin"],
         build: build_windowing,
         variables: &[
-            ("PCS_PLUGIN_LIB", |_| plugin_lib("windowing_plugin")),
+            ("PCS_PLUGIN_LIB", |_| plugin_lib("windowing_plugin", true)),
             ("PCS_DATA_DIR", |_| data_dir("windowing")),
         ],
         one_shot: false,

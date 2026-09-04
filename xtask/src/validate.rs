@@ -23,12 +23,13 @@
 //! 3. Write a temp copy with the entry's `variables` block and run
 //!    `pcs-service validate --config <copy>`.
 //!
-//! The connector templates under `examples/configs/` (`kafka.kdl`,
-//! `nats.kdl`, `s3.kdl`, `postgresql.kdl`, `http.kdl`, `tcp.kdl`,
-//! `cluster.kdl`, `tikv.kdl`) are not in the registry: they reference
-//! `pipelines/*.wasm` placeholders that do not exist in the repository, so
-//! `validate`'s build gate cannot load them. The registry is where a real
-//! module path would add one.
+//! The templates under `examples/configs/` (`kafka.kdl`, `nats.kdl`,
+//! `s3.kdl`, `postgresql.kdl`, `http.kdl`, `tcp.kdl`, `cluster.kdl`,
+//! `redb.kdl`) are not in the registry: each either names a
+//! `pipelines/*.wasm` placeholder that does not exist in the repository, so
+//! `validate`'s build gate cannot load it, or expects an endpoint or store
+//! path that only exists on the operator's machine. The registry is where a
+//! real module path would add one.
 //!
 //! Exit codes:
 //!

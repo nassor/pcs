@@ -1,45 +1,102 @@
-//! On-wire frame body codec and the length-prefixed frame helpers.
+//! On-wire message types and the length-prefixed frame codec.
 //!
-//! One message kind travels over this transport: a raft protocol message,
-//! carried as raw prost-encoded `eraftpb::Message` bytes (the raft
-//! `prost-codec` wire format) behind a one-byte tag inside a length-prefixed
-//! frame.
-//!
-//! The tag exists so the format stays extensible. It is **append-only**:
-//! [`TAG_RAFT_MESSAGE`] must keep its value, and a future message kind takes
-//! the next free tag, so rolling upgrades stay compatible.
+//! Holds the append-only [`RpcEnvelope`] / [`RpcResponse`] pair exchanged by
+//! every RPC, the snapshot chunk messages, and the [`read_frame`] /
+//! [`write_frame`] helpers both directions share.
 
 use std::io;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+#[cfg(feature = "distributed-raft")]
+use openraft::{
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    },
+    type_config::alias::{SnapshotMetaOf, VoteOf},
+};
+#[cfg(feature = "distributed-raft")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "distributed-raft")]
+use crate::distributed::consensus::types::{ConsensusCommand, ConsensusResponse, PcsTypeConfig};
 
 use super::MAX_FRAME_BYTES;
 
-/// Tag byte for a raft message frame body.
-const TAG_RAFT_MESSAGE: u8 = 0;
-
-/// Encode prost-encoded raft message bytes as a tagged frame body.
-pub(super) fn encode_raft_message(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + bytes.len());
-    out.push(TAG_RAFT_MESSAGE);
-    out.extend_from_slice(bytes);
-    out
+/// Typed envelope for all RPCs sent over the TCP transport.
+///
+/// **Append-only**: do not reorder or remove variants. The `serde_json` discriminant
+/// is the variant name string, so adding new variants at the end is always safe.
+#[cfg(feature = "distributed-raft")]
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum RpcEnvelope {
+    /// `AppendEntries` RPC.
+    AppendEntries(AppendEntriesRequest<PcsTypeConfig>),
+    /// `Vote` / `RequestVote` RPC.
+    Vote(VoteRequest<PcsTypeConfig>),
+    /// One chunk of a snapshot transfer.
+    SnapshotChunk(SnapshotChunkMsg),
+    /// Signals the last chunk and carries the snapshot metadata.
+    SnapshotFinal(SnapshotFinalMsg),
+    /// A follower forwards a proposal to the leader.
+    ///
+    /// Sits at the end of the enum to keep wire-format compatibility with older nodes.
+    ProposalForward { command: ConsensusCommand },
 }
 
-/// Strip the tag byte from a frame body, returning the prost-encoded raft
-/// message bytes.
-///
-/// # Errors
-///
-/// Returns an error for an empty body or an unrecognised tag.
-pub(super) fn decode_raft_message(body: &[u8]) -> io::Result<&[u8]> {
-    let Some((tag, rest)) = body.split_first() else {
-        return Err(io::Error::other("empty transport frame"));
-    };
-    match *tag {
-        TAG_RAFT_MESSAGE => Ok(rest),
-        other => Err(io::Error::other(format!("unknown transport tag {other}"))),
-    }
+/// A single data chunk within a snapshot transfer.
+#[cfg(feature = "distributed-raft")]
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SnapshotChunkMsg {
+    /// Unique transfer ID shared across all chunks of one snapshot send.
+    pub transfer_id: u64,
+    /// Byte offset within the full snapshot payload.
+    pub offset: u64,
+    /// Raw bytes of this chunk.
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// Final (or only) chunk of a snapshot transfer; includes metadata.
+#[cfg(feature = "distributed-raft")]
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SnapshotFinalMsg {
+    /// Unique transfer ID shared across all chunks of one snapshot send.
+    pub transfer_id: u64,
+    /// Byte offset of the last chunk's start.
+    pub offset: u64,
+    /// Raw bytes of the last chunk (may be empty).
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    /// Leader vote, forwarded to [`Raft::install_full_snapshot`].
+    pub vote: VoteOf<PcsTypeConfig>,
+    /// Snapshot metadata.
+    pub meta: SnapshotMetaOf<PcsTypeConfig>,
+}
+
+/// Response envelope returned from the server for each incoming RPC.
+#[cfg(feature = "distributed-raft")]
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum RpcResponse {
+    /// Response to an `AppendEntries` RPC.
+    AppendEntries(AppendEntriesResponse<PcsTypeConfig>),
+    /// Response to a `Vote` RPC.
+    Vote(VoteResponse<PcsTypeConfig>),
+    /// Acknowledgement for an intermediate snapshot chunk.
+    SnapshotChunkAck { transfer_id: u64 },
+    /// Final response after the snapshot was installed.
+    SnapshotDone(SnapshotResponse<PcsTypeConfig>),
+    /// Error string returned by the server.
+    Error(String),
+    /// Result of a forwarded proposal. Uses `Option` fields instead of
+    /// `Result` to keep serde_json serialization clean.
+    ///
+    /// Exactly one of `ok` and `err` is `Some`.
+    ProposalResult {
+        ok: Option<ConsensusResponse>,
+        err: Option<String>,
+    },
 }
 
 /// Read one length-prefixed frame from `stream`.
@@ -51,9 +108,8 @@ pub(super) fn decode_raft_message(body: &[u8]) -> io::Result<&[u8]> {
 ///   - `ErrorKind::InvalidData` when the frame length exceeds [`MAX_FRAME_BYTES`].
 ///   - `ErrorKind::UnexpectedEof` on a truncated frame (EOF inside payload).
 ///   - Other kinds forwarded from the underlying stream.
+#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
 pub(super) async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    use tokio::io::AsyncReadExt;
-
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -68,15 +124,25 @@ pub(super) async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<
         ));
     }
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
+    stream.read_exact(&mut payload).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame payload")
+        } else {
+            e
+        }
+    })?;
     Ok(Some(payload))
 }
 
-/// Write one length-prefixed frame to `stream`.
+#[cfg_attr(not(feature = "distributed-raft"), allow(dead_code))]
 pub(super) async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let len = data.len() as u32;
+    if data.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {} > {MAX_FRAME_BYTES}", data.len()),
+        ));
+    }
+    let len = u32::try_from(data.len()).map_err(|_| io::Error::other("frame too large"))?;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(data).await?;
     stream.flush().await
@@ -85,28 +151,144 @@ pub(super) async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    use super::super::tests::{free_addr, spawn_echo_server};
 
     #[test]
-    fn test_raft_message_body_round_trip() {
-        let body = encode_raft_message(&[0xAA, 0xBB, 0xCC]);
-        assert_eq!(body[0], TAG_RAFT_MESSAGE);
-        assert_eq!(decode_raft_message(&body).unwrap(), &[0xAA, 0xBB, 0xCC]);
+    fn test_serde_command_round_trip_via_json() {
+        use crate::distributed::consensus::types::ConsensusCommand;
+        let cmd = ConsensusCommand::AckClaim {
+            claim_id: uuid::Uuid::now_v7(),
+            instance_id: uuid::Uuid::now_v7(),
+        };
+        let json = serde_json::to_vec(&cmd).unwrap();
+        let decoded: ConsensusCommand = serde_json::from_slice(&json).unwrap();
+        assert!(matches!(decoded, ConsensusCommand::AckClaim { .. }));
     }
 
-    #[test]
-    fn test_empty_raft_message_body_round_trips() {
-        let body = encode_raft_message(&[]);
-        assert_eq!(body, vec![TAG_RAFT_MESSAGE]);
-        assert!(decode_raft_message(&body).unwrap().is_empty());
-    }
+    /// Oversized frame returns InvalidData, not silently truncates.
+    #[tokio::test]
+    async fn test_read_frame_oversized_returns_error() {
+        use tokio::io::AsyncWriteExt;
+        let addr = free_addr();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Send a length larger than MAX_FRAME_BYTES.
+                let oversized_len = (MAX_FRAME_BYTES + 1) as u32;
+                let _ = stream.write_all(&oversized_len.to_be_bytes()).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-    #[test]
-    fn test_decode_rejects_empty_and_unknown_tags() {
-        assert!(decode_raft_message(&[]).is_err());
-        let err = decode_raft_message(&[0xFF, 0x00]).unwrap_err();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let result = read_frame(&mut stream).await;
         assert!(
-            err.to_string().contains("unknown transport tag 255"),
-            "an unknown tag must name itself: {err}"
+            matches!(&result, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+            "oversized frame must return InvalidData, got: {result:?}"
+        );
+    }
+
+    /// Truncated frame payload returns UnexpectedEof.
+    #[tokio::test]
+    async fn test_read_frame_truncated_returns_unexpected_eof() {
+        use tokio::io::AsyncWriteExt;
+        let addr = free_addr();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Claim 10 bytes but only send 5.
+                let len: u32 = 10;
+                let _ = stream.write_all(&len.to_be_bytes()).await;
+                let _ = stream.write_all(b"hello").await;
+                // Dropping the stream causes EOF mid-payload.
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let result = read_frame(&mut stream).await;
+        assert!(
+            matches!(&result, Err(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "truncated frame must return UnexpectedEof, got: {result:?}"
+        );
+    }
+
+    /// write_frame rejects frames larger than MAX_FRAME_BYTES before writing.
+    #[tokio::test]
+    async fn test_write_frame_oversized_returns_error() {
+        let addr = free_addr();
+        spawn_echo_server(addr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // MAX_FRAME_BYTES + 1 bytes.
+        let big = vec![0u8; MAX_FRAME_BYTES + 1];
+        let result = write_frame(&mut stream, &big).await;
+        assert!(
+            matches!(&result, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+            "oversized write must return InvalidData, got: {result:?}"
+        );
+    }
+
+    /// clean EOF (peer closes without sending anything) returns Ok(None).
+    #[tokio::test]
+    async fn test_read_frame_clean_eof_returns_none() {
+        let addr = free_addr();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            if let Ok((_stream, _)) = listener.accept().await {
+                // Dropping the stream immediately sends a clean FIN.
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let result = read_frame(&mut stream).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "clean EOF must return Ok(None), got: {result:?}"
+        );
+    }
+
+    /// `handle_envelope` with `ProposalForward` returns `ProposalResult` through the
+    /// wire framing end to end, checking the serde round-trip.
+    #[cfg(feature = "distributed-raft")]
+    #[test]
+    fn test_proposal_forward_envelope_serde_round_trip() {
+        use uuid::Uuid;
+
+        let cmd = ConsensusCommand::AckClaim {
+            claim_id: Uuid::now_v7(),
+            instance_id: Uuid::now_v7(),
+        };
+        let envelope = RpcEnvelope::ProposalForward {
+            command: cmd.clone(),
+        };
+        let json = serde_json::to_vec(&envelope).unwrap();
+        let decoded: RpcEnvelope = serde_json::from_slice(&json).unwrap();
+        assert!(
+            matches!(decoded, RpcEnvelope::ProposalForward { .. }),
+            "should decode back to ProposalForward"
+        );
+
+        let resp = RpcResponse::ProposalResult {
+            ok: Some(ConsensusResponse::ClaimAcked),
+            err: None,
+        };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: RpcResponse = serde_json::from_slice(&json).unwrap();
+        assert!(
+            matches!(
+                decoded,
+                RpcResponse::ProposalResult {
+                    ok: Some(ConsensusResponse::ClaimAcked),
+                    ..
+                }
+            ),
+            "should decode back to ProposalResult with ok"
         );
     }
 }

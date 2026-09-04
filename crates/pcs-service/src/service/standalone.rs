@@ -15,11 +15,11 @@
 //! silently lost.
 //!
 //! Interval/one-shot state carry across iterations is opt-in: with
-//! `store "tikv" { batch_resume true }` the runner threads the processor
-//! state blob as `prior` on every iteration and persists it to TiKV, so a
-//! restarted service resumes from its last save point. Without the flag
-//! (the default) every iteration passes `None` as prior and discards the
-//! output state, exactly as a build without TiKV.
+//! `store "redb" { batch_resume true }` the runner threads the processor
+//! state blob as `prior` on every iteration and persists it to the local
+//! redb file, so a restarted service resumes from its last save point.
+//! Without the flag (the default) every iteration passes `None` as prior and
+//! discards the output state, exactly as a run with no `store` block.
 //!
 //! ## One trace per iteration, at `debug`
 //!
@@ -70,7 +70,7 @@ use pcs_core::runtime::PipelineRuntime;
 use super::builder::{BuiltNodeKind, BuiltService};
 use super::config::StoreConfig;
 use super::config::{RunMode, ServiceConfig, ServiceMode};
-use super::tikv_state::TikvStateClient;
+use super::redb_state::RedbStateClient;
 #[cfg(feature = "windows")]
 use super::windowing::WindowTracker;
 
@@ -252,7 +252,7 @@ pub async fn run_standalone(
     config: &ServiceConfig,
     cancel: CancellationToken,
     live_stats: Option<Arc<RwLock<StandaloneStats>>>,
-    tikv: Option<Arc<TikvStateClient>>,
+    state: Option<Arc<RedbStateClient>>,
 ) -> Result<StandaloneStats, PcsError> {
     let run_mode = match &config.mode {
         ServiceMode::Standalone { config: sc } => sc.run_mode.clone(),
@@ -266,7 +266,7 @@ pub async fn run_standalone(
     // Stream mode is a different loop shape entirely: one workflow invocation
     // per arriving batch, no inter-item pacing.
     if run_mode == RunMode::Stream {
-        return super::stream::run_stream(built, cancel, live_stats, tikv).await;
+        return super::stream::run_stream(built, cancel, live_stats, state).await;
     }
 
     let BuiltService {
@@ -340,19 +340,19 @@ pub async fn run_standalone(
     #[cfg(not(feature = "tracing"))]
     let _ = &workflow_id;
     // Interval/one-shot processor state carry, opt-in per store: with
-    // `store "tikv" { batch_resume true }` the runner threads the processor
+    // `store "redb" { batch_resume true }` the runner threads the processor
     // state blob as `prior` and persists it, so a restarted service resumes
     // from its last save point. Default (no store or no flag): per-call
-    // fresh-Store behaviour, byte-identical to a build without TiKV.
+    // fresh-Store behaviour.
     let batch_resume = matches!(
         &config.store,
-        Some(StoreConfig::Tikv {
+        Some(StoreConfig::Redb {
             batch_resume: true,
             ..
         })
     );
     let mut prior: Vec<Option<Vec<u8>>> = vec![None; n];
-    if batch_resume && let Some(client) = &tikv {
+    if batch_resume && let Some(client) = &state {
         for i in 0..n {
             if matches!(kinds[i], NodeRunKind::Processor) {
                 prior[i] = client.load_prior(&workflow_id, &ids[i]).await?;
@@ -601,12 +601,12 @@ pub async fn run_standalone(
                             node_stats[i].batches += 1;
                             // `out.state` is threaded and persisted only when
                             // interval/one-shot batch resume is opted in via
-                            // `store "tikv" { batch_resume true }`; otherwise
+                            // `store "redb" { batch_resume true }`; otherwise
                             // it is discarded, keeping today's per-call
                             // fresh-Store behaviour.
                             if batch_resume {
                                 prior[i] = out.state;
-                                if let Some(client) = &tikv {
+                                if let Some(client) = &state {
                                     let result = match &prior[i] {
                                         Some(blob) => {
                                             client.save_prior(&workflow_id, &ids[i], blob).await

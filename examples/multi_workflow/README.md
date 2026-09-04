@@ -27,8 +27,6 @@ rows bridge across the channel unchanged. The bridge is the channel name:
 ## Prerequisites
 
 - Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
-- `protoc` on `PATH`, because the `multi_workflow_publish` example compiles a
-  `pcs-service` example target (see `AGENTS.md` for install commands)
 - A Docker daemon, for the NATS and PostgreSQL containers
 
 ## Build the processors

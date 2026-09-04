@@ -5,23 +5,29 @@
 //! - [`RaftClusterHarness`]: N PCS Raft nodes with TCP links routed through
 //!   per-edge Toxiproxy proxies.
 //!
-//! The PCS raft carries membership and leadership only, so the harness has no
-//! application store and nothing to propose. Progress is observed through
+//! Every node carries the replicated application state machine, so a test can
+//! propose through [`RaftClusterHarness::propose_noop`] or drive a real
+//! [`RaftClusterHarness::store_for_node`]. Progress is observed through
 //! [`RaftClusterHarness::await_leader`], [`RaftClusterHarness::last_applied`]
 //! and [`RaftClusterHarness::max_term`]: a leader commits raft's own entry on
-//! taking office, so both the term and the applied index advance per election.
+//! taking office, so both the term and the applied index advance per election
+//! even with no client traffic.
 //!
 //! ```rust,ignore
 //! let harness = RaftClusterHarness::start(3).await.unwrap();
 //! let leader = harness.await_leader().await.unwrap();
+//! harness.propose_noop(leader).await.unwrap();
 //! harness.await_convergence(Duration::from_secs(10)).await.unwrap();
 //! ```
 
 #![cfg(feature = "distributed-raft")]
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use openraft::BasicNode;
 
 use pcs_service::distributed::consensus::driver::{
     ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle,
@@ -356,9 +362,8 @@ impl RaftClusterHarness {
     ///
     /// Only the container step soft-skips. Once the container is up, every
     /// later failure (port resolution, proxy creation, node startup) is a hard
-    /// panic, mirroring `tests/common/tikv.rs`: "containers up but the store
-    /// unreachable -> a real error". That is what keeps a green run from hiding
-    /// a broken harness.
+    /// panic: "containers up but the cluster unreachable -> a real error".
+    /// That is what keeps a green run from hiding a broken harness.
     pub async fn try_start(n: u32) -> Option<Self> {
         assert!(n >= 1, "need at least 1 node");
         let edge_count = (n as usize) * (n as usize - 1);
@@ -442,16 +447,20 @@ impl RaftClusterHarness {
                 listen_addr,
                 peers: peer_maps[i].clone(),
                 heartbeat_interval_ms: 50,
-                election_timeout_ms: 400,
-                snapshot_log_interval: 1000,
+                election_timeout_min_ms: 300,
+                election_timeout_max_ms: 500,
             };
-            let (handle, task) =
-                ArrowRaftDriver::start(config, dir.path().join("raft-log.redb")).await?;
-            handle.spawn_tcp_server(listen_addr);
-            // A reserved port can still be lost to another process between
-            // the reservation and this bind. Without this check the node is
-            // simply unreachable and the whole cluster fails later with an
-            // unexplained election timeout.
+            let (handle, task) = ArrowRaftDriver::start(
+                config,
+                dir.path().join("raft-log.redb"),
+                dir.path().join("cluster-app.redb"),
+            )
+            .await?;
+            // The bind is eager, so a port lost to another process between the
+            // reservation and here fails now rather than leaving the node
+            // unreachable and the cluster failing later with an unexplained
+            // election timeout.
+            handle.spawn_tcp_server(listen_addr).await?;
             await_listening(listen_addr).await.map_err(|e| {
                 anyhow::anyhow!("node {node_id} never accepted on {listen_addr}: {e}")
             })?;
@@ -463,8 +472,24 @@ impl RaftClusterHarness {
             });
         }
 
-        // Membership is static: each driver seeds its conf state from its
-        // configured peers on first boot, so no initialize call is needed.
+        // openraft membership is explicit: one node seeds the configuration
+        // for the whole cluster. A single-node harness is auto-initialized by
+        // the driver itself, because its peer map is empty.
+        if n > 1 {
+            let members: BTreeMap<u64, BasicNode> = listen_addrs
+                .iter()
+                .enumerate()
+                .map(|(idx, addr)| {
+                    (
+                        idx as u64 + 1,
+                        BasicNode {
+                            addr: addr.to_string(),
+                        },
+                    )
+                })
+                .collect();
+            nodes[0].handle.initialize(members).await?;
+        }
 
         Ok(Self {
             nodes,
@@ -478,7 +503,7 @@ impl RaftClusterHarness {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             for node in &self.nodes {
-                if let Some(leader_id) = node.handle.metrics().leader_id {
+                if let Some(leader_id) = node.handle.metrics().current_leader {
                     return Ok(leader_id);
                 }
             }
@@ -496,15 +521,15 @@ impl RaftClusterHarness {
     /// after 10 seconds.
     ///
     /// `await_leader` returns whichever node answers first in list order,
-    /// which an isolated leader can satisfy forever: with raft-rs defaults
-    /// (`check_quorum = false`) a leader cut off from its quorum never steps
-    /// down and keeps reporting itself. Excluding its stale self-report makes
-    /// post-isolation waits meaningful.
+    /// which an isolated leader can satisfy for a while: it steps down only
+    /// once its own leader lease expires, and keeps reporting itself until
+    /// then. Excluding its stale self-report makes post-isolation waits
+    /// meaningful.
     pub async fn await_leader_excluding(&self, excluded: u64) -> anyhow::Result<u64> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             for node in &self.nodes {
-                if let Some(leader_id) = node.handle.metrics().leader_id
+                if let Some(leader_id) = node.handle.metrics().current_leader
                     && leader_id != excluded
                 {
                     return Ok(leader_id);
@@ -572,13 +597,52 @@ impl RaftClusterHarness {
 
     /// Last-applied log index for a node (None if nothing applied yet).
     pub fn last_applied(&self, node_id: u64) -> Option<u64> {
-        let applied = self
-            .nodes
+        self.nodes
             .get((node_id - 1) as usize)?
             .handle
             .metrics()
-            .applied_index;
-        (applied > 0).then_some(applied)
+            .last_applied
+            .map(|lid| lid.index)
+    }
+
+    /// Propose a lightweight no-op via `Heartbeat` (no dedicated Noop variant).
+    pub async fn propose_noop(&self, leader_id: u64) -> anyhow::Result<()> {
+        use pcs_service::distributed::consensus::types::ConsensusCommand;
+
+        let idx = (leader_id - 1) as usize;
+        let cmd = ConsensusCommand::Heartbeat {
+            instance_id: uuid::Uuid::nil(),
+            at: 0,
+        };
+        self.nodes[idx]
+            .handle
+            .propose(cmd)
+            .await
+            .map_err(|e| anyhow::anyhow!("propose_noop: {e}"))?;
+        Ok(())
+    }
+
+    /// Return a `RedbSharedStore` wired to node `node_id` (1-indexed).
+    ///
+    /// Mutations route through the live Raft handle; read-only queries go
+    /// straight to the node's shared app-db. Chaos tests use it to hand a
+    /// `DistributedRunner` a cluster-connected store.
+    pub fn store_for_node(
+        &self,
+        node_id: u64,
+    ) -> pcs_service::distributed::consensus::store::RedbSharedStore {
+        let node = &self.nodes[(node_id - 1) as usize];
+        pcs_service::distributed::consensus::store::RedbSharedStore::multi_node(
+            std::sync::Arc::clone(node.handle.app_db()),
+            node.handle.clone(),
+        )
+    }
+
+    /// Count `Completed` claims on node `node_id` (1-indexed).
+    pub fn count_completed_claims(&self, node_id: u64) -> usize {
+        let node = &self.nodes[(node_id - 1) as usize];
+        let db = node.handle.app_db().lock().expect("app db mutex poisoned");
+        pcs_service::distributed::consensus::state_machine::count_completed_claims(&db)
     }
 
     /// Access the Toxiproxy client for injecting faults.
@@ -603,13 +667,13 @@ impl RaftClusterHarness {
             .map(|(i, node)| {
                 let m = node.handle.metrics();
                 format!(
-                    "node{}: {:?} term={} applied={} last_log={} leader={:?} listen={}",
+                    "node{}: {:?} term={} applied={} last_log={:?} leader={:?} listen={}",
                     i + 1,
                     m.state,
-                    m.term,
-                    m.applied_index,
+                    m.current_term,
+                    m.last_applied.map(|lid| lid.index).unwrap_or(0),
                     m.last_log_index,
-                    m.leader_id,
+                    m.current_leader,
                     node.listen_addr
                 )
             })
@@ -624,7 +688,7 @@ impl RaftClusterHarness {
     pub fn max_term(&self) -> u64 {
         self.nodes
             .iter()
-            .map(|n| n.handle.metrics().term)
+            .map(|n| n.handle.metrics().current_term)
             .max()
             .unwrap_or(0)
     }

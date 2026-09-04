@@ -257,7 +257,7 @@
     <a href="{{ get_url(path='@/distributed.md') }}" class="concept-card">
         <div class="concept-num">05</div>
         <h3>Distributed processing</h3>
-        <p>The same Pipeline against claimed row ranges across nodes, checkpointed into TiKV.</p>
+        <p>The same Pipeline against claimed row ranges across nodes, with claims and checkpoints replicated by raft.</p>
     </a>
     <a href="{{ get_url(path='@/processors/_index.md') }}" class="concept-card">
         <div class="concept-num">&plus;</div>
@@ -324,10 +324,10 @@
             <text class="t-sm" x="388" y="135">HTTP + metrics</text>
 
             <rect class="row-r" x="514" y="60" width="128" height="54" rx="4"/>
-            <text class="t-sm t-ctl" x="524" y="78">TiKV cluster</text>
-            <text class="t-sm" x="524" y="92">leases</text>
+            <text class="t-sm t-ctl" x="524" y="78">raft group</text>
+            <text class="t-sm" x="524" y="92">claims</text>
             <text class="t-sm" x="524" y="106">checkpoints</text>
-            <text class="t-sm" x="514" y="135">optional</text>
+            <text class="t-sm" x="514" y="135">cluster mode</text>
         </g>
 
         <defs>

@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 
-{% block title %}Distributed processing — PCS{% endblock %}
-{% block description %}Distributed processing runs the same Pipeline on several nodes at once: each claims a row range under a lease, checkpoints Arrow IPC bytes into TiKV, and acks. Leases expire, so processing is at-least-once.{% endblock %}
-{% block og_title %}Distributed processing — PCS{% endblock %}
-{% block og_description %}One pipeline, many nodes, one lease per row range. At-least-once, backed by TiKV.{% endblock %}
+{% block title %}Distributed processing | PCS{% endblock %}
+{% block description %}Distributed processing runs the same Pipeline on several nodes at once: each claims a row range under a lease, checkpoints Arrow IPC bytes through raft, and acks. Leases expire, so processing is at-least-once.{% endblock %}
+{% block og_title %}Distributed processing | PCS{% endblock %}
+{% block og_description %}One pipeline, many nodes, one lease per row range. At-least-once, replicated by raft.{% endblock %}
 
 {% block content %}
 
@@ -13,14 +13,15 @@
 <p class="page-lede">
     The same <code>Pipeline</code>, run by several processes at once against different
     slices of the same data. Coordination is a lease on a row range; durability is Arrow
-    IPC bytes in TiKV.
+    IPC bytes in a raft-replicated redb file.
 </p>
 
 <dl class="page-facts">
     <dt>In one line</dt>
     <dd>Many nodes, one pipeline, <strong>at-least-once</strong> per row range</dd>
     <dt>You need</dt>
-    <dd><code>pcs-service</code> with <code>tikv-store</code> and a reachable TiKV; add <code>distributed-raft</code> for a cluster</dd>
+    <dd><code>pcs-service</code> with <code>distributed</code>, which needs no external
+        service; add <code>distributed-raft</code> for a cluster</dd>
     <dt>Read this if</dt>
     <dd>One process is not enough, and you need work to survive a node dying halfway through a batch</dd>
 </dl>
@@ -51,7 +52,7 @@
             write one Arrow IPC checkpoint, then acknowledge the claim so the range is marked
             completed. Below it the same claim after the holding node dies during the run: no
             acknowledgement is sent, the lease eventually expires, any surviving runner
-            compare-and-swaps the row range back to pending, and another
+            proposes a sweep that flips the row range back to pending, and another
             node claims the identical rows under a new claim id. The rows are therefore
             processed twice, which is what at-least-once means in practice.
         </desc>
@@ -65,8 +66,8 @@
             <rect class="hd hd-ctl" x="0" y="44" width="150" height="8"/>
             <text class="t-lbl t-ctl" x="12" y="45">1 &middot; claim</text>
             <text class="t-sm" x="12" y="64">claim_next_batch()</text>
-            <text class="t-sm" x="12" y="78">one 512-row range</text>
-            <text class="t-sm" x="12" y="92">of a batch</text>
+            <text class="t-sm" x="12" y="78">the batch's first</text>
+            <text class="t-sm" x="12" y="92">uncovered rows</text>
             <text class="t-sm" x="12" y="106">lease: 90 s</text>
         </g>
 
@@ -180,8 +181,9 @@
         <span class="k-data"><i></i> rows and Arrow IPC bytes</span>
     </div>
     <figcaption class="dgm-cap">
-        A claim covers <b>one 512-row range</b>, so several nodes work the same batch at
-        once. The gap between <b>step 3 and step 4</b> is where duplicates
+        A claim covers every row of its batch that no live or completed claim already
+        holds, so a fresh batch goes to one node and several batches spread over several
+        nodes. The gap between <b>step 3 and step 4</b> is where duplicates
         come from: work that ran but never acked is handed to somebody else, so every system
         has to tolerate seeing the same rows twice.
     </figcaption>
@@ -219,8 +221,10 @@
 <h2 id="modes">Standalone and clustered</h2>
 
 <p>
-    Both modes use the same two traits, the same runner and the same TiKV store. Clustering
-    adds a PCS Raft node beside it, for membership and leadership only.
+    Both modes use the same two traits, the same runner and the same
+    <code>RedbSharedStore</code>. Standalone applies each mutation straight to its local
+    redb file. Clustering proposes the identical mutation through raft, so every node
+    applies it in the same order.
 </p>
 
 <table class="rule-table">
@@ -229,36 +233,56 @@
         <tr>
             <td><code>distributed</code></td>
             <td><code>PartitionSource</code>, <code>CheckpointStore</code>,
-                <code>DistributedRunner</code> and <code>CheckpointStrategy</code>. The
-                traits and the runner loop, with no store of their own.</td>
-        </tr>
-        <tr>
-            <td><code>tikv-store</code></td>
-            <td><code>TikvSharedStore</code>, which implements both traits over a raw TiKV
-                client, plus <code>TikvStateClient</code> for configs, source cursors and
-                processor priors. The only shared store PCS ships.</td>
+                <code>DistributedRunner</code>, <code>CheckpointStrategy</code> and
+                <code>RedbSharedStore::single_node</code>. It carries <code>redb</code>, so
+                one node needs no external service.</td>
         </tr>
         <tr>
             <td><code>distributed-raft</code></td>
-            <td>The PCS Raft node, on tikv/raft-rs: <code>RaftRedbLogStore</code> over a
-                log-only redb file, <code>ArrowRaftDriver</code>, and the TCP peer transport.</td>
+            <td>The PCS raft node, on <code>openraft</code>: <code>ArrowRedbLogStore</code>
+                over <code>raft-log.redb</code>, <code>ArrowRedbStateMachine</code> over
+                <code>cluster-app.redb</code>, <code>ArrowRaftDriver</code>, the TCP peer
+                transport, and <code>RedbSharedStore::multi_node</code>. Implies
+                <code>distributed</code>.</td>
         </tr>
         <tr>
             <td><code>service-cluster</code></td>
             <td><code>service</code> plus <code>distributed-raft</code>: what the
                 <code>pcs-service</code> binary needs to run <code>mode "cluster"</code>
-                from a config file. Build it with <code>tikv-store</code> as well: cluster
-                mode refuses to start without a <code>store "tikv"</code> block.</td>
+                from a config file. Add the connectors and the <code>wasm</code> or
+                <code>plugin</code> feature the config names, and nothing else: a cluster
+                node's state is the <code>cluster-app.redb</code> under
+                <code>node.data_dir</code>.</td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    A claim is a compare-and-swap on one row-range key, so the store arbitrates by itself.
-    No work is routed through the Raft leader and no node hands a batch to another. The Raft
-    node contributes membership and an elected leader, reported by the three
-    <code>pcs_raft_*</code> gauges.
+    A claim is a raft proposal, and the state machine rejects a range that overlaps a
+    claimed or completed one, so the log order arbitrates. Every mutation commits on the
+    leader; reads go to the local replica. The three <code>pcs_raft_*</code> gauges report
+    the commit index, the term and the leader id.
 </p>
+
+<p>
+    Standalone persistence is a different file with a different job. A
+    <code>store "redb"</code> block names one local, unreplicated redb file, and
+    <code>RedbStateClient</code> keeps three things in it: the raw config bytes the service
+    was started with, each processor's prior, and each source's cursor. It carries no
+    batches, no claims and no checkpoints, which is why cluster mode has no use for it and
+    refuses the block.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>KDL</span><em>standalone only; see examples/configs/redb.kdl</em></div>
+    <pre><code class="language-kdl">store "redb" {
+    // Required. Created on first use, together with its parent directory.
+    path "/var/lib/pcs/state.redb"
+    // Carry processor state across interval and one-shot iterations.
+    // Defaults to false.
+    batch_resume #true
+}</code></pre>
+</div>
 
 <h2 id="batches">Publishing work</h2>
 
@@ -281,61 +305,54 @@
 </div>
 
 <p>
-    Registration is what creates the work.
-    <code>register_master_batch</code> writes the batch record, then splits
-    <code>0..total_rows</code> into fixed 512-row ranges
-    (<code>TIKV_ROWS_PER_RANGE</code>) and writes each one as a pending key. A 900-row batch
-    becomes two ranges, so two nodes can run it at once. Parallelism is a function of how many
-    rows you register, not how many batches.
+    Registration is what creates the work. <code>register_master_batch</code> proposes one
+    <code>RegisterMasterBatch</code> command, and the state machine writes the record into
+    <code>arrow_master_batches</code> and marks the id in <code>arrow_pending_batches</code>.
+    Row ranges are not pre-cut: a claim carves the first uncovered span off the batch when
+    it is granted. Parallelism is therefore a function of how many batches you register.
 </p>
 
 <p>
-    <code>claim_next_batch</code> scans batch keys in id order, then row-range keys in row
-    order, and takes the first range still marked pending. Both key layouts use fixed-width
-    hex, so byte order equals numeric order and the scan needs no sort. Two nodes reaching the
-    same range race on one compare-and-swap; the loser skips to the next pending range rather
-    than retrying.
+    <code>claim_next_batch</code> walks <code>arrow_pending_batches</code>, then reads that
+    batch's claims out of the <code>arrow_claims_by_batch</code> index in row order and
+    returns the first span no claimed or completed range covers. Two nodes reaching the same
+    span both propose it; the state machine commits one and answers the other with an
+    overlap error, and the loser backs off and rescans, up to eight attempts.
 </p>
 
 <p>
-    Two caps apply. <code>MAX_LOG_ENTRY_BYTES</code> is <code>1024 * 1024</code>:
-    <code>register_master_batch</code> rejects an Arrow IPC payload that size or larger, and
-    so does the runner's own stage checkpoint. The window accumulator and the processor state
-    blob go through <code>CheckpointStore::max_checkpoint_bytes</code> instead, which the TiKV
-    store raises to 4&nbsp;MiB (<code>TIKV_MAX_CHECKPOINT_BYTES</code>).
+    One cap applies. <code>MAX_LOG_ENTRY_BYTES</code> is <code>1024 * 1024</code>, because a
+    payload travels inside a raft log entry. <code>register_master_batch</code> rejects an
+    Arrow IPC payload that size or larger, and the stage checkpoint, the window accumulator
+    and the processor state blob all read the same number off
+    <code>CheckpointStore::max_checkpoint_bytes</code>.
 </p>
 
 <h2 id="single">Running one node</h2>
 
 <p>
-    One process against one TiKV is a real deployment, not a toy, and it is the shortest
-    path to seeing the loop work. Nothing else changes when a second node joins: it connects
-    to the same TiKV under the same key prefix and starts claiming.
+    One process against one local redb file is a real deployment, not a toy, and it is the
+    shortest path to seeing the loop work. It needs no external service: the store is the
+    file you name.
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>Rust</span><em>features = "distributed", "tikv-store"</em></div>
-    <pre><code class="language-rust">use std::time::Duration;
+    <div class="code-cap"><span>Rust</span><em>features = "distributed"</em></div>
+    <pre><code class="language-rust">use std::path::Path;
 
 use pcs_service::PcsResult;
 use pcs_service::component::Component;
 use pcs_service::dataset::Dataset;
-use pcs_service::distributed::{TikvSharedStore, TikvStoreConfig};
+use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
 use pcs_service::pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() -&gt; PcsResult&lt;()&gt; {
-    // Every key this process writes sits under `key_prefix`. Two deployments
-    // sharing one TiKV stay apart by picking different prefixes.
-    let store = TikvSharedStore::connect(&amp;TikvStoreConfig {
-        pd_endpoints: vec!["127.0.0.1:2379".to_string()],
-        key_prefix: "pcs".to_string(),
-        timeout: Duration::from_secs(10),
-        lease_ttl_millis: 90_000,
-    })
-    .await?;
+    // One file holds the batches, the claims and the checkpoints. Two
+    // deployments stay apart by naming different files.
+    let store = RedbSharedStore::single_node(Path::new("/var/lib/pcs/shared.redb"))?;
 
     let (ipc_bytes, total_rows) = encode_orders_ipc()?;
     store
@@ -376,35 +393,50 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
     between batches without holding a lease.
 </p>
 
+<p>
+    Two examples run this loop end to end against a fresh redb file in the temporary
+    directory, so nothing has to be running beside them.
+</p>
+
+<div class="code">
+    <div class="code-cap"><span>Shell</span><em>runs the same on Linux, macOS and Windows (PowerShell)</em></div>
+    <pre><code class="language-bash">cargo run -p pcs-service --example distributed_scheduler --features distributed
+cargo run -p pcs-service --example distributed_windowed --features distributed,windows</code></pre>
+</div>
+
 <h2 id="state">Where state lives</h2>
 
 <p>
-    A cluster node writes one file of its own and shares everything else. The raft log is
-    local to each node and holds no application data. TiKV holds the work, the claims and the
-    checkpoints, and every node reads the same copy.
+    A cluster node's <code>data_dir</code> holds four files and nothing else.
+    <code>raft-log.redb</code> is this node's raft log. <code>cluster-app.redb</code> is the
+    replicated application state: every node applies the same committed entries in the same
+    order, so every node ends with the same copy. <code>bootstrap.lock</code> and
+    <code>node-id</code> are one line each.
 </p>
 
 <div class="dgm animate-in">
-    <div class="dgm-scroll"><svg viewBox="0 0 660 356" role="img" aria-labelledby="dst-state-title dst-state-desc">
-        <title id="dst-state-title">What each node keeps locally, and what the whole cluster shares</title>
+    <div class="dgm-scroll"><svg viewBox="0 0 660 364" role="img" aria-labelledby="dst-state-title dst-state-desc">
+        <title id="dst-state-title">The four files in a node's data directory, and the state machine they replicate</title>
         <desc id="dst-state-desc">
-            Each node keeps one redb file holding its raft log: its vote, its log entries and
-            its view of the membership. Those files are never merged; what travels between
-            nodes is raft messages, votes and heartbeats, and no application data rides along.
-            Everything the pipeline touches lives in one TiKV, keyed under the configured
-            prefix, and every node reads and writes the same copy. Five key spaces sit there:
-            the registered master batch as Arrow IPC, one record per 512-row range carrying
-            that range's claim state, checkpoints keyed by claim id and stage index and capped
-            at four mebibytes, source cursors and processor priors per workflow node, and the
-            KDL config a node was started with. Claim transitions are compare-and-swap, so the
-            store arbitrates without a coordinator.
+            Each node keeps its own raft log in raft-log.redb, holding its vote and its log
+            entries, and its own copy of the application state in cluster-app.redb. Two more
+            files sit beside them: bootstrap.lock, written when an operator bootstrapped the
+            cluster, and node-id, the identity this directory belongs to. What travels
+            between nodes is raft traffic: votes, heartbeats and log entries, and every entry
+            carries one application command, so the application data rides along with it.
+            Applying those entries leaves the same five tables on every node: the registered
+            master batch as Arrow IPC, the batch ids that still have rows to claim, one
+            record per claim carrying its row range, status and lease, checkpoints keyed by
+            claim id and stage index and capped at one mebibyte, and the last heartbeat each
+            instance recorded. A claim is one of those entries, so the log order decides who
+            wins a contested row range.
         </desc>
 
-        <text class="t-title" x="0" y="14">Local raft log, shared TiKV</text>
+        <text class="t-title" x="0" y="14">Four files per node, one replicated state machine</text>
 
         <!-- node 1 -->
         <g class="anim anim-1">
-            <rect class="blk blk-ctl" x="0" y="32" width="250" height="86" rx="8"/>
+            <rect class="blk blk-ctl" x="0" y="32" width="250" height="104" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="32" width="250" height="22" rx="8"/>
             <rect class="hd hd-ctl" x="0" y="46" width="250" height="8"/>
             <text class="t-lbl t-ctl" x="12" y="47">node 1 &middot; leader</text>
@@ -412,13 +444,17 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <rect class="row" x="8" y="62" width="234" height="20" rx="3"/>
             <text class="t-sm" x="16" y="76">raft-log.redb</text>
             <text class="t-sm t-ctl" x="180" y="76">local</text>
-            <text class="t-sm" x="16" y="96">vote &middot; log entries &middot; conf state</text>
-            <text class="t-sm" x="16" y="110">membership and leadership only</text>
+
+            <rect class="row" x="8" y="86" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="16" y="100">cluster-app.redb</text>
+            <text class="t-sm t-data" x="168" y="100">replicated</text>
+
+            <text class="t-sm" x="16" y="122">bootstrap.lock &middot; node-id</text>
         </g>
 
         <!-- node 2 -->
         <g class="anim anim-2">
-            <rect class="blk blk-ctl" x="404" y="32" width="250" height="86" rx="8"/>
+            <rect class="blk blk-ctl" x="404" y="32" width="250" height="104" rx="8"/>
             <rect class="hd hd-ctl" x="404" y="32" width="250" height="22" rx="8"/>
             <rect class="hd hd-ctl" x="404" y="46" width="250" height="8"/>
             <text class="t-lbl t-ctl" x="416" y="47">node 2 &middot; follower</text>
@@ -426,50 +462,56 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
             <rect class="row" x="412" y="62" width="234" height="20" rx="3"/>
             <text class="t-sm" x="420" y="76">raft-log.redb</text>
             <text class="t-sm t-ctl" x="584" y="76">local</text>
-            <text class="t-sm" x="420" y="96">same entries, same order</text>
-            <text class="t-sm" x="420" y="110">its own file, never shipped</text>
+
+            <rect class="row" x="412" y="86" width="234" height="20" rx="3"/>
+            <text class="t-sm" x="420" y="100">cluster-app.redb</text>
+            <text class="t-sm t-data" x="572" y="100">replicated</text>
+
+            <text class="t-sm" x="420" y="122">same entries, same order</text>
         </g>
 
         <g class="anim anim-2">
-            <path class="arw arw-ctl" d="M250 72 H400" marker-end="url(#dst-s-c)"/>
-            <text class="t-sm t-ctl" x="262" y="64">raft messages</text>
-            <text class="t-sm" x="262" y="92">votes &middot; heartbeats</text>
-            <text class="t-sm" x="262" y="108">no application data</text>
+            <path class="arw arw-ctl" d="M250 76 H400" marker-end="url(#dst-s-c)"/>
+            <text class="t-sm t-ctl" x="258" y="68">raft traffic</text>
+            <text class="t-sm" x="258" y="96">votes &middot; heartbeats</text>
+            <text class="t-sm" x="258" y="110">log entries</text>
         </g>
 
         <g class="anim anim-2">
-            <text class="t-sm t-ctl" x="0" y="140">between nodes: raft messages, nothing else</text>
-            <text class="t-sm t-data" x="0" y="156">through TiKV: everything the pipeline touches</text>
-            <path class="ln" d="M0 172 H654"/>
+            <text class="t-sm t-ctl" x="0" y="154">between nodes: votes, heartbeats and log entries</text>
+            <text class="t-sm t-data" x="0" y="170">inside every entry: one application command</text>
+            <path class="ln" d="M0 182 H654"/>
         </g>
 
-        <!-- the shared store -->
+        <!-- the replicated state machine -->
         <g class="anim anim-3">
-            <rect class="blk blk-data" x="0" y="188" width="654" height="164" rx="8"/>
-            <rect class="hd hd-data" x="0" y="188" width="654" height="22" rx="8"/>
-            <rect class="hd hd-data" x="0" y="202" width="654" height="8"/>
-            <text class="t-lbl t-data" x="12" y="203">TiKV &middot; one store, every node reads and writes it</text>
-            <text class="t-sm" x="12" y="224">keys under the configured prefix &middot; claims are compare-and-swap</text>
+            <rect class="blk blk-data" x="0" y="192" width="654" height="164" rx="8"/>
+            <rect class="hd hd-data" x="0" y="192" width="654" height="22" rx="8"/>
+            <rect class="hd hd-data" x="0" y="206" width="654" height="8"/>
+            <text class="t-lbl t-data" x="12" y="207">cluster-app.redb &middot; the same tables on every node</text>
+            <text class="t-sm" x="12" y="228">written only by apply &middot; read straight off the local copy</text>
+        </g>
 
-            <rect class="row" x="8" y="232" width="638" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="245">{p}/batch/{batch_id}</text>
-            <text class="t-sm" x="250" y="245">the registered master batch, Arrow IPC</text>
+        <g class="anim anim-4">
+            <rect class="row" x="8" y="236" width="638" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="249">arrow_master_batches</text>
+            <text class="t-sm" x="250" y="249">the registered master batch, Arrow IPC</text>
 
-            <rect class="row" x="8" y="254" width="638" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="267">{p}/rows/{batch_id}/{start}</text>
-            <text class="t-sm" x="250" y="267">one 512-row range and its claim state</text>
+            <rect class="row" x="8" y="258" width="638" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="271">arrow_pending_batches</text>
+            <text class="t-sm" x="250" y="271">batch ids with rows still to claim</text>
 
-            <rect class="row" x="8" y="276" width="638" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="289">{p}/checkpoint/{claim_id}/{stage}</text>
-            <text class="t-sm" x="250" y="289">Arrow IPC bytes, 4 MiB store ceiling</text>
+            <rect class="row" x="8" y="280" width="638" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="293">arrow_claims</text>
+            <text class="t-sm" x="250" y="293">one claim: its row range, status and lease</text>
 
-            <rect class="row" x="8" y="298" width="638" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="311">{p}/cursor/{workflow}/{node}</text>
-            <text class="t-sm" x="250" y="311">source cursors and processor priors</text>
+            <rect class="row" x="8" y="302" width="638" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="315">arrow_checkpoints</text>
+            <text class="t-sm" x="250" y="315">Arrow IPC bytes, 1 MiB per entry</text>
 
-            <rect class="row" x="8" y="320" width="638" height="18" rx="3"/>
-            <text class="t-sm" x="16" y="333">{p}/config/{name}</text>
-            <text class="t-sm" x="250" y="333">the KDL a node was started with</text>
+            <rect class="row" x="8" y="324" width="638" height="18" rx="3"/>
+            <text class="t-sm" x="16" y="337">arrow_instances</text>
+            <text class="t-sm" x="250" y="337">the last heartbeat each instance recorded</text>
         </g>
 
         <defs>
@@ -480,13 +522,13 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
     </svg>
     </div>
     <div class="dgm-key">
-        <span class="k-control"><i></i> membership and leadership</span>
-        <span class="k-data"><i></i> application state</span>
+        <span class="k-control"><i></i> the raft log and its traffic</span>
+        <span class="k-data"><i></i> the replicated application state</span>
     </div>
     <figcaption class="dgm-cap">
-        Nothing in <code>raft-log.redb</code> is application state. It carries this node's
-        vote, its entries and its view of the membership, so losing it costs a node its place
-        in the cluster and never a claim or a checkpoint.
+        The pipeline never queries <code>raft-log.redb</code>. It carries this node's vote
+        and its entries, and the state the pipeline reads is what applying those entries
+        leaves in <code>cluster-app.redb</code>.
     </figcaption>
 </div>
 
@@ -535,17 +577,19 @@ async fn main() -&gt; PcsResult&lt;()&gt; {
 <h2 id="cluster">Wiring a cluster</h2>
 
 <p>
-    A cluster node runs two things side by side: the store it shares with every other node,
-    and a Raft driver that gives the cluster a membership and a leader.
-    <code>ArrowRaftDriver::start</code> is async, takes the raft log path, and returns the
-    handle plus the driver's task. Keep the task alive for the life of the process.
+    A cluster node runs two things side by side: a raft driver that replicates the
+    application state, and a store that proposes into it.
+    <code>ArrowRaftDriver::start</code> is async, takes the raft log path and the
+    application database path, and returns the handle plus the driver's task. Keep the task
+    alive for the life of the process.
 </p>
 
 <div class="code">
-    <div class="code-cap"><span>Rust</span><em>features = "distributed-raft", "tikv-store"</em></div>
+    <div class="code-cap"><span>Rust</span><em>features = "distributed-raft"</em></div>
     <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::Arc;
 
-use pcs_service::distributed::TikvSharedStore;
+use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::consensus::{ArrowRaftDriver, ArrowRaftDriverConfig};
 
 let (handle, _driver_task) = ArrowRaftDriver::start(
@@ -558,22 +602,22 @@ let (handle, _driver_task) = ArrowRaftDriver::start(
             (2, "pcs-2:9001".to_string()),
             (3, "pcs-3:9001".to_string()),
         ]),
-        heartbeat_interval_ms: 50,
-        election_timeout_ms: 300,
-        // Compact the log every this many applied entries.
-        snapshot_log_interval: 10_000,
+        heartbeat_interval_ms: 300,
+        election_timeout_min_ms: 1_500,
+        election_timeout_max_ms: 3_000,
     },
-    data_dir.join("raft-log.redb"),      // the one file this node owns
+    data_dir.join("raft-log.redb"),      // this node's log
+    data_dir.join("cluster-app.redb"),   // this node's copy of the state
 )
 .await?;
 
 // `start` wires outbound connections only. Without this listener peers cannot
-// deliver votes or heartbeats and no leader is ever elected.
+// deliver votes, heartbeats or log entries, and no leader is ever elected.
 let _tcp_server = handle.spawn_tcp_server("0.0.0.0:9001".parse().unwrap());
 
-// The store is independent of the driver: the same endpoints and the same
-// key prefix on every node.
-let store = TikvSharedStore::connect(&amp;tikv_config).await?;</code></pre>
+// The store proposes through the driver and reads the same database the state
+// machine writes, so it opens no second file handle.
+let store = RedbSharedStore::multi_node(Arc::clone(handle.app_db()), handle.clone());</code></pre>
 </div>
 
 <p>
@@ -582,20 +626,24 @@ let store = TikvSharedStore::connect(&amp;tikv_config).await?;</code></pre>
 </p>
 
 <p>
-    Membership is static. The driver seeds its conf state from the configured peers on first
-    boot, so no node calls an initialize step and no node forwards work to another.
-    <code>bootstrap #true</code> writes a <code>bootstrap.lock</code> that records the
-    operator deliberately created this cluster; it does not elect anybody.
+    Membership is explicit. <code>bootstrap #true</code> on one node calls
+    <code>initialize</code> with the configured <code>peer</code> set and then writes
+    <code>bootstrap.lock</code>, so the file records that this cluster was deliberately
+    created and stops a later start from doing it twice. Every other node starts with
+    <code>bootstrap #false</code> and is caught up by the leader.
 </p>
 
 <p>
-    You do not route work to the leader, because there is nothing to route.
-    <code>claim_next_batch</code> talks to TiKV on every node, and TiKV's own
-    compare-and-swap decides who wins a contested range. The driver answers who is in the
-    cluster and who leads it, which is what the three <code>pcs_raft_*</code> gauges report.
-    The <code>pcs-service</code> binary does all of the wiring above from a config file under
-    <code>mode "cluster"</code>, so hand-rolling it is only for embedding the runner in your
-    own process.
+    You do not route work to the leader, but every mutation ends up there.
+    <code>RedbSharedStore</code> proposes each command with <code>Raft::client_write</code>;
+    on a follower that returns <code>ForwardToLeader</code>, and the store sends the same
+    command to the leader's configured address over the length-prefixed TCP transport the
+    peers already use. Reads never leave the node: they open the local
+    <code>cluster-app.redb</code> directly. A propose made while no leader is elected comes
+    back as a retryable error, and one that reaches a leader but never commits times out
+    after 30 seconds. The <code>pcs-service</code> binary does all
+    of the wiring above from a config file under <code>mode "cluster"</code>, so
+    hand-rolling it is only for embedding the runner in your own process.
 </p>
 
 <h3>What refuses to start</h3>
@@ -606,10 +654,13 @@ let store = TikvSharedStore::connect(&amp;tikv_config).await?;</code></pre>
 </p>
 
 <ul>
-    <li>No <code>store "tikv"</code> block under <code>mode "cluster"</code>: TiKV is the
-        only cluster application-data store, so there is nothing to fall back to.</li>
-    <li>A <code>store</code> block in a binary built without the <code>tikv-store</code>
-        feature. A section the binary cannot honour is a refusal, never an ignored key.</li>
+    <li>A <code>store</code> block under <code>mode "cluster"</code>. The error names it:
+        <code>mode "cluster" does not take a `store` block: cluster state lives in
+        node.data_dir</code>. A second, unreplicated home for the same data is a refusal,
+        never an ignored key.</li>
+    <li>A <code>lease_ttl_ms</code> below three <code>election_timeout_ms</code>. A batch
+        lease has to outlive one election, or a leader change alone would let a second node
+        claim a range still being processed.</li>
     <li><code>raft-log.redb</code> in <code>data_dir</code> without
         <code>bootstrap.lock</code>, which means a process died before bootstrap finished.</li>
     <li>A <code>node-id</code> file disagreeing with <code>node.id</code>, which means this
@@ -617,9 +668,11 @@ let store = TikvSharedStore::connect(&amp;tikv_config).await?;</code></pre>
 </ul>
 
 <p>
-    One more gate runs once the store is connected. The node compares its runtime's Arrow
-    schema fingerprint against the one recorded beside its checkpoints and refuses to resume
-    on state of a different shape.
+    Two more gates run after the four. <code>ArrowRaftDriver::start</code> opens both halves
+    of the directory and refuses when the state machine is behind what the log already
+    purged, which is what a restore from mismatched backups looks like. Then the node
+    compares its runtime's Arrow schema fingerprint against the one recorded beside its
+    checkpoints and refuses to resume on state of a different shape.
 </p>
 
 <h2 id="processor-state">State that outlives a batch</h2>
@@ -666,8 +719,8 @@ pcs_processor::export_pipeline!(build, state = Counter);</code></pre>
 <p>
     The pointer to the newest blob is a chain, not a fixed key: the blob is written under the
     claim that produced it and read back under the id of the claim that wrote the previous
-    one, because the store resolves a checkpoint's <code>batch_id</code> through the claim
-    index and rejects a write whose uuid is not a live claim. Reads survive the ack,
+    one, because the state machine resolves a checkpoint's <code>batch_id</code> through the
+    claims table and rejects a write whose uuid names no claim. Reads survive the ack,
     so the chain holds for as long as the runner loop does. A runner that restarts hands the
     runtime <code>None</code>, so the processor starts cold and rebuilds its state.
 </p>

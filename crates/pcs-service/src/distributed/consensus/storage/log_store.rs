@@ -1,101 +1,57 @@
 //! Raft log storage in a dedicated redb file.
 //!
-//! Holds [`RaftRedbLogStore`], the sync [`raft::Storage`] implementation that
-//! backs [`RawNode`](raft::RawNode). Raft metadata (hard state, conf state),
-//! log entries and the latest snapshot only, no Arrow data. The driver calls
-//! every method through [`tokio::task::spawn_blocking`]; the parent module doc
-//! explains why.
+//! Holds [`ArrowRedbLogStore`] and its [`RaftLogReader`] / [`RaftLogStorage`]
+//! implementations. Raft metadata (vote, purged log id) and log entries only, no
+//! Arrow data. Every trait-method redb transaction runs inside
+//! [`tokio::task::spawn_blocking`]; the parent module doc explains why.
 
+use std::fmt::Debug;
 use std::io;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::Arc;
 
-use prost::Message as _;
-use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
-use raft::storage::{GetEntriesContext, RaftState};
-use raft::{Error, Result as RaftResult, Storage, StorageError};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
+use openraft::RaftLogReader;
+use openraft::storage::{IOFlushed, LogState, RaftLogStorage};
+use openraft::type_config::alias::{EntryOf, LogIdOf, VoteOf};
+use redb::{Database, ReadableDatabase, ReadableTable};
 
+use super::{ENTRIES_TABLE, KEY_PURGED_LOG_ID, KEY_VOTE, META_TABLE, dec, enc, join_to_io, to_io};
+use crate::distributed::consensus::types::PcsTypeConfig;
 use crate::error::{PcsError, PcsResult};
 
-fn enc<T: serde::Serialize>(v: &T) -> io::Result<Vec<u8>> {
-    postcard::to_allocvec(v).map_err(|e| io::Error::other(format!("postcard encode: {e}")))
-}
-
-fn dec<T: for<'de> serde::Deserialize<'de>>(b: &[u8]) -> io::Result<T> {
-    postcard::from_bytes(b).map_err(|e| io::Error::other(format!("postcard decode: {e}")))
-}
-
-const HARD_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_hard_state");
-const CONF_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_conf_state");
-const ENTRIES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_entries");
-const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_snapshot");
-
-const KEY_HARD_STATE: &str = "hard_state";
-const KEY_CONF_STATE: &str = "conf_state";
-const KEY_SNAPSHOT: &str = "snapshot";
-
-/// One stored snapshot: the raft bookkeeping (index, term, conf state) the log
-/// needs to serve [`Storage::snapshot`], plus the opaque payload raft carries
-/// alongside it. The payload is empty in cluster mode — the PCS raft holds no
-/// application state, so a snapshot is metadata only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotRecord {
-    index: u64,
-    term: u64,
-    voters: Vec<u64>,
-    learners: Vec<u64>,
-    data: Vec<u8>,
-}
-
-impl From<&Snapshot> for SnapshotRecord {
-    fn from(s: &Snapshot) -> Self {
-        let meta = s.metadata.as_ref();
-        let conf = meta.and_then(|m| m.conf_state.as_ref());
-        SnapshotRecord {
-            index: meta.map_or(0, |m| m.index),
-            term: meta.map_or(0, |m| m.term),
-            voters: conf.map(|c| c.voters.clone()).unwrap_or_default(),
-            learners: conf.map(|c| c.learners.clone()).unwrap_or_default(),
-            data: s.data.clone(),
-        }
-    }
-}
-
-impl From<SnapshotRecord> for Snapshot {
-    fn from(r: SnapshotRecord) -> Self {
-        Snapshot {
-            data: r.data,
-            metadata: Some(SnapshotMetadata {
-                index: r.index,
-                term: r.term,
-                conf_state: Some(ConfState {
-                    voters: r.voters,
-                    learners: r.learners,
-                    ..Default::default()
-                }),
-            }),
-        }
-    }
+/// Materialise an owned `(Bound<u64>, Bound<u64>)` pair from an arbitrary
+/// `RangeBounds<u64>`, so it can be moved into a `spawn_blocking` closure
+/// without forcing the caller's range type to be `'static`.
+fn owned_bounds<RB: RangeBounds<u64>>(range: &RB) -> (Bound<u64>, Bound<u64>) {
+    let start = match range.start_bound() {
+        Bound::Included(v) => Bound::Included(*v),
+        Bound::Excluded(v) => Bound::Excluded(*v),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(v) => Bound::Included(*v),
+        Bound::Excluded(v) => Bound::Excluded(*v),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (start, end)
 }
 
 /// Persistent Raft log storage in a dedicated redb file.
 ///
 /// Contains only Raft metadata and log entries; no Arrow data.
 ///
-/// Cloning is cheap (an `Arc` bump). All redb I/O runs synchronously; the
-/// driver wraps every call in [`tokio::task::spawn_blocking`].
+/// Cloning is cheap (an `Arc` bump). All trait-method redb I/O runs inside
+/// [`tokio::task::spawn_blocking`]; see the module-level doc comment for the reason.
 #[derive(Clone)]
-pub struct RaftRedbLogStore {
+pub struct ArrowRedbLogStore {
+    /// `redb::Database` coordinates concurrent readers and a single writer internally,
+    /// and both `begin_read` and `begin_write` take `&self`. An external mutex would
+    /// only serialise readers unnecessarily.
     db: Arc<Database>,
 }
 
-fn to_raft_err(e: impl std::error::Error + Send + Sync + 'static) -> Error {
-    Error::Store(StorageError::Other(Box::new(e)))
-}
-
-impl RaftRedbLogStore {
+impl ArrowRedbLogStore {
     /// Open (or create) the log store at `path`.
     ///
     /// Initial table creation runs synchronously on the caller thread
@@ -108,417 +64,298 @@ impl RaftRedbLogStore {
             let txn = db
                 .begin_write()
                 .map_err(|e| PcsError::store(e.to_string()))?;
-            txn.open_table(HARD_STATE_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            txn.open_table(CONF_STATE_TABLE)
+            txn.open_table(META_TABLE)
                 .map_err(|e| PcsError::store(e.to_string()))?;
             txn.open_table(ENTRIES_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            txn.open_table(SNAPSHOT_TABLE)
                 .map_err(|e| PcsError::store(e.to_string()))?;
             txn.commit().map_err(|e| PcsError::store(e.to_string()))?;
         }
         Ok(Self { db: Arc::new(db) })
     }
+}
 
-    /// Persist the hard state (term / vote / commit). One row, overwritten.
-    pub fn persist_hard_state(&self, hs: &HardState) -> PcsResult<()> {
-        let bytes = hs.encode_to_vec();
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(HARD_STATE_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            table
-                .insert(KEY_HARD_STATE, bytes.as_slice())
-                .map_err(|e| PcsError::store(e.to_string()))?;
-        }
-        txn.commit().map_err(|e| PcsError::store(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Persist the conf state (static membership, written once on first boot).
-    pub fn persist_conf_state(&self, cs: &ConfState) -> PcsResult<()> {
-        let bytes = cs.encode_to_vec();
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(CONF_STATE_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            table
-                .insert(KEY_CONF_STATE, bytes.as_slice())
-                .map_err(|e| PcsError::store(e.to_string()))?;
-        }
-        txn.commit().map_err(|e| PcsError::store(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Persist log entries; returns the number stored.
-    ///
-    /// Entries are prost-encoded `eraftpb::Entry` under big-endian u64 index
-    /// keys, so a later snapshot compaction can delete a prefix range.
-    pub fn append_entries(&self, entries: &[Entry]) -> PcsResult<usize> {
-        let encoded: Vec<(u64, Vec<u8>)> = entries
-            .iter()
-            .map(|e| (e.index, e.encode_to_vec()))
-            .collect();
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(ENTRIES_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            for (idx, bytes) in &encoded {
-                table
-                    .insert(*idx, bytes.as_slice())
-                    .map_err(|e| PcsError::store(e.to_string()))?;
+impl RaftLogReader<PcsTypeConfig> for ArrowRedbLogStore {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<EntryOf<PcsTypeConfig>>, io::Error> {
+        let db = Arc::clone(&self.db);
+        let bounds = owned_bounds(&range);
+        tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let txn = db.begin_read().map_err(to_io)?;
+            let table = txn.open_table(ENTRIES_TABLE).map_err(to_io)?;
+            let mut out = Vec::new();
+            for item in table.range::<u64>(bounds).map_err(to_io)? {
+                let (_k, v) = item.map_err(to_io)?;
+                out.push(dec(v.value())?);
             }
-        }
-        txn.commit().map_err(|e| PcsError::store(e.to_string()))?;
-        Ok(encoded.len())
-    }
-
-    /// Read the persisted hard state, or an empty one when absent.
-    pub fn read_hard_state(&self) -> PcsResult<HardState> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        let table = txn
-            .open_table(HARD_STATE_TABLE)
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        match table
-            .get(KEY_HARD_STATE)
-            .map_err(|e| PcsError::store(e.to_string()))?
-        {
-            Some(v) => HardState::decode(v.value()).map_err(|e| PcsError::store(e.to_string())),
-            None => Ok(HardState::default()),
-        }
-    }
-
-    /// Read the persisted conf state, or an empty one when absent.
-    pub fn read_conf_state(&self) -> PcsResult<ConfState> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        let table = txn
-            .open_table(CONF_STATE_TABLE)
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        match table
-            .get(KEY_CONF_STATE)
-            .map_err(|e| PcsError::store(e.to_string()))?
-        {
-            Some(v) => ConfState::decode(v.value()).map_err(|e| PcsError::store(e.to_string())),
-            None => Ok(ConfState::default()),
-        }
-    }
-
-    /// Compact the log: delete entries up to `index` and persist `snapshot` as
-    /// the new base. One write transaction, one fsync.
-    pub fn compact_to(&self, index: u64, snapshot: &Snapshot) -> PcsResult<()> {
-        let record = SnapshotRecord::from(snapshot);
-        let snap_bytes =
-            enc(&record).map_err(|e| PcsError::store(format!("encode snapshot: {e}")))?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        {
-            let mut snap_table = txn
-                .open_table(SNAPSHOT_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            snap_table
-                .insert(KEY_SNAPSHOT, snap_bytes.as_slice())
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            let mut entries = txn
-                .open_table(ENTRIES_TABLE)
-                .map_err(|e| PcsError::store(e.to_string()))?;
-            let to_remove: Vec<u64> = entries
-                .range(..=index)
-                .map_err(|e| PcsError::store(e.to_string()))?
-                .map(|r| {
-                    r.map(|(k, _)| k.value())
-                        .map_err(|e| PcsError::store(e.to_string()))
-                })
-                .collect::<PcsResult<_>>()?;
-            for idx in to_remove {
-                entries
-                    .remove(idx)
-                    .map_err(|e| PcsError::store(e.to_string()))?;
-            }
-        }
-        txn.commit().map_err(|e| PcsError::store(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Read the latest snapshot, if any.
-    pub fn read_snapshot(&self) -> PcsResult<Option<Snapshot>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        let table = txn
-            .open_table(SNAPSHOT_TABLE)
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        match table
-            .get(KEY_SNAPSHOT)
-            .map_err(|e| PcsError::store(e.to_string()))?
-        {
-            Some(v) => {
-                let record: SnapshotRecord =
-                    dec(v.value()).map_err(|e| PcsError::store(e.to_string()))?;
-                Ok(Some(record.into()))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// The index of the first retained log entry: the snapshot index plus one,
-    /// or 1 when no snapshot exists.
-    pub fn first_index(&self) -> PcsResult<u64> {
-        Ok(match self.read_snapshot()? {
-            Some(s) => s.metadata.as_ref().map_or(1, |m| m.index + 1),
-            None => 1,
+            Ok(out)
         })
+        .await
+        .map_err(join_to_io)?
     }
 
-    /// The index of the last retained log entry, or `first_index - 1` when the
-    /// log is empty.
-    pub fn last_index(&self) -> PcsResult<u64> {
-        let first = self.first_index()?;
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        let table = txn
-            .open_table(ENTRIES_TABLE)
-            .map_err(|e| PcsError::store(e.to_string()))?;
-        Ok(
-            match table.last().map_err(|e| PcsError::store(e.to_string()))? {
-                Some((k, _)) => k.value(),
-                None => first.saturating_sub(1),
-            },
-        )
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<PcsTypeConfig>>, io::Error> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let txn = db.begin_read().map_err(to_io)?;
+            let table = txn.open_table(META_TABLE).map_err(to_io)?;
+            match table.get(KEY_VOTE).map_err(to_io)? {
+                Some(v) => dec::<VoteOf<PcsTypeConfig>>(v.value()).map(Some),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(join_to_io)?
     }
 }
 
-impl Storage for RaftRedbLogStore {
-    fn initial_state(&self) -> RaftResult<RaftState> {
-        let hard_state = self.read_hard_state().map_err(to_raft_err)?;
-        let conf_state = self.read_conf_state().map_err(to_raft_err)?;
-        Ok(RaftState {
-            hard_state,
-            conf_state,
+impl RaftLogStorage<PcsTypeConfig> for ArrowRedbLogStore {
+    type LogReader = ArrowRedbLogStore;
+
+    async fn get_log_state(&mut self) -> Result<LogState<PcsTypeConfig>, io::Error> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> io::Result<LogState<PcsTypeConfig>> {
+            let txn = db.begin_read().map_err(to_io)?;
+            // Read purged log id.
+            let purged: Option<LogIdOf<PcsTypeConfig>> = {
+                let meta = txn.open_table(META_TABLE).map_err(to_io)?;
+                match meta.get(KEY_PURGED_LOG_ID).map_err(to_io)? {
+                    Some(v) => Some(dec(v.value())?),
+                    None => None,
+                }
+            };
+            // Read last entry log id.
+            let last: Option<LogIdOf<PcsTypeConfig>> = {
+                let entries = txn.open_table(ENTRIES_TABLE).map_err(to_io)?;
+                match entries.last().map_err(to_io)? {
+                    Some((_k, v)) => {
+                        let entry: EntryOf<PcsTypeConfig> = dec(v.value())?;
+                        Some(entry.log_id)
+                    }
+                    None => None,
+                }
+            };
+            Ok(LogState {
+                last_purged_log_id: purged,
+                last_log_id: last.or(purged),
+            })
         })
+        .await
+        .map_err(join_to_io)?
     }
 
-    fn entries(
-        &self,
-        low: u64,
-        high: u64,
-        max_size: impl Into<Option<u64>>,
-        _ctx: GetEntriesContext,
-    ) -> RaftResult<Vec<Entry>> {
-        if low < self.first_index().map_err(to_raft_err)? {
-            return Err(Error::Store(StorageError::Compacted));
-        }
-        if high > self.last_index().map_err(to_raft_err)? + 1 {
-            return Err(Error::Store(StorageError::Unavailable));
-        }
-        let max_size = max_size.into();
-        let txn = self.db.begin_read().map_err(to_raft_err)?;
-        let table = txn.open_table(ENTRIES_TABLE).map_err(to_raft_err)?;
-        let mut out = Vec::new();
-        let mut size: u64 = 0;
-        for item in table.range(low..high).map_err(to_raft_err)? {
-            let (_k, v) = item.map_err(to_raft_err)?;
-            let entry = Entry::decode(v.value()).map_err(to_raft_err)?;
-            // Match raft's own limit_size semantics: always include the first
-            // entry, then stop once the cumulative encoded size passes max.
-            let entry_size = entry.encoded_len() as u64;
-            if !out.is_empty() && size + entry_size > max_size.unwrap_or(u64::MAX) {
-                break;
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+
+    async fn save_vote(&mut self, vote: &VoteOf<PcsTypeConfig>) -> Result<(), io::Error> {
+        // Encode before moving into the blocking task: keeps the closure cheap and
+        // avoids pushing serde work onto the blocking pool.
+        let bytes = enc(vote)?;
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let txn = db.begin_write().map_err(to_io)?;
+            {
+                let mut table = txn.open_table(META_TABLE).map_err(to_io)?;
+                table.insert(KEY_VOTE, bytes.as_slice()).map_err(to_io)?;
             }
-            size += entry_size;
-            out.push(entry);
-        }
-        Ok(out)
+            txn.commit().map_err(to_io)
+        })
+        .await
+        .map_err(join_to_io)?
     }
 
-    fn term(&self, idx: u64) -> RaftResult<u64> {
-        let first = self.first_index().map_err(to_raft_err)?;
-        if idx == first.saturating_sub(1) {
-            // The term of the entry before first_index is retained for matching.
-            return Ok(self
-                .read_snapshot()
-                .map_err(to_raft_err)?
-                .and_then(|s| s.metadata)
-                .map_or(0, |m| m.term));
-        }
-        let txn = self.db.begin_read().map_err(to_raft_err)?;
-        let table = txn.open_table(ENTRIES_TABLE).map_err(to_raft_err)?;
-        match table.get(idx).map_err(to_raft_err)? {
-            Some(v) => Ok(Entry::decode(v.value()).map_err(to_raft_err)?.term),
-            None => Err(Error::Store(StorageError::Unavailable)),
-        }
-    }
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<PcsTypeConfig>,
+    ) -> Result<(), io::Error>
+    where
+        I: IntoIterator<Item = EntryOf<PcsTypeConfig>> + Send,
+        I::IntoIter: Send,
+    {
+        // Encode entries on the caller thread. The encode cost is paid once per entry,
+        // and keeping it off the blocking pool leaves the blocking task as pure disk
+        // I/O: write and fsync. An encode failure fails fast without touching redb.
+        let encoded: Vec<(u64, Vec<u8>)> = entries
+            .into_iter()
+            .map(|e| {
+                let idx = e.log_id.index;
+                enc(&e).map(|bytes| (idx, bytes))
+            })
+            .collect::<io::Result<_>>()?;
 
-    fn first_index(&self) -> RaftResult<u64> {
-        Self::first_index(self).map_err(to_raft_err)
-    }
-
-    fn last_index(&self) -> RaftResult<u64> {
-        Self::last_index(self).map_err(to_raft_err)
-    }
-
-    fn snapshot(&self, request_index: u64, _to: u64) -> RaftResult<Snapshot> {
-        match self.read_snapshot().map_err(to_raft_err)? {
-            Some(s) => {
-                let idx = s.metadata.as_ref().map_or(0, |m| m.index);
-                if idx >= request_index {
-                    Ok(s)
-                } else {
-                    Err(Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        let db = Arc::clone(&self.db);
+        let res = tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let txn = db.begin_write().map_err(to_io)?;
+            {
+                let mut table = txn.open_table(ENTRIES_TABLE).map_err(to_io)?;
+                for (idx, bytes) in &encoded {
+                    table.insert(*idx, bytes.as_slice()).map_err(to_io)?;
                 }
             }
-            None => Ok(Snapshot::default()),
-        }
+            txn.commit().map_err(to_io)
+        })
+        .await
+        .map_err(join_to_io)?;
+
+        // Fire the flush callback only on success so openraft does not
+        // advance its durable-commit watermark past an unpersisted batch.
+        res?;
+        callback.io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn truncate_after(
+        &mut self,
+        last: Option<LogIdOf<PcsTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let from = last.as_ref().map_or(0, |l| l.index + 1);
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let txn = db.begin_write().map_err(to_io)?;
+            {
+                let mut table = txn.open_table(ENTRIES_TABLE).map_err(to_io)?;
+                let to_remove: Vec<u64> = table
+                    .range(from..)
+                    .map_err(to_io)?
+                    .map(|r| r.map(|(k, _)| k.value()).map_err(to_io))
+                    .collect::<io::Result<_>>()?;
+                for idx in to_remove {
+                    table.remove(idx).map_err(to_io)?;
+                }
+            }
+            txn.commit().map_err(to_io)
+        })
+        .await
+        .map_err(join_to_io)?
+    }
+
+    async fn purge(&mut self, log_id: LogIdOf<PcsTypeConfig>) -> Result<(), io::Error> {
+        let up_to = log_id.index;
+        // Encode the purge marker on this thread so the blocking closure does no serde
+        // work.
+        let marker = enc(&log_id)?;
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let txn = db.begin_write().map_err(to_io)?;
+            {
+                let mut meta = txn.open_table(META_TABLE).map_err(to_io)?;
+                let mut entries = txn.open_table(ENTRIES_TABLE).map_err(to_io)?;
+                meta.insert(KEY_PURGED_LOG_ID, marker.as_slice())
+                    .map_err(to_io)?;
+                let to_remove: Vec<u64> = entries
+                    .range(..=up_to)
+                    .map_err(to_io)?
+                    .map(|r| r.map(|(k, _)| k.value()).map_err(to_io))
+                    .collect::<io::Result<_>>()?;
+                for idx in to_remove {
+                    entries.remove(idx).map_err(to_io)?;
+                }
+            }
+            txn.commit().map_err(to_io)
+        })
+        .await
+        .map_err(join_to_io)?
     }
 }
+
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{blank_entry, log_id, make_store};
     use super::*;
     use tempfile::TempDir;
 
-    fn make_store(dir: &TempDir) -> RaftRedbLogStore {
-        RaftRedbLogStore::open(dir.path().join("raft-log.redb")).unwrap()
-    }
-
-    fn blank_entry(index: u64) -> Entry {
-        Entry {
-            term: 1,
-            index,
-            data: Vec::new(),
-            ..Default::default()
-        }
-    }
-
-    /// Postcard round-trip of the stored snapshot record, the one metadata row
-    /// whose encoding is not prost.
-    #[test]
-    fn test_snapshot_record_postcard_round_trip() {
-        let record = SnapshotRecord {
-            index: 10,
-            term: 2,
-            voters: vec![1, 2, 3],
-            learners: Vec::new(),
-            data: Vec::new(),
-        };
-        let decoded: SnapshotRecord = dec(&enc(&record).unwrap()).unwrap();
-        assert_eq!(decoded.index, 10);
-        assert_eq!(decoded.term, 2);
-        assert_eq!(decoded.voters, vec![1, 2, 3]);
-        assert!(decoded.data.is_empty());
-    }
-
-    #[test]
-    fn test_empty_state() {
+    #[tokio::test]
+    async fn test_empty_state() {
         let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        assert_eq!(store.first_index().unwrap(), 1);
-        assert_eq!(store.last_index().unwrap(), 0);
-        let state = store.initial_state().unwrap();
-        assert_eq!(state.hard_state, HardState::default());
-        assert_eq!(state.conf_state, ConfState::default());
+        let mut store = make_store(&dir);
+        let state = store.get_log_state().await.unwrap();
+        assert!(state.last_purged_log_id.is_none());
+        assert!(state.last_log_id.is_none());
     }
 
-    #[test]
-    fn test_append_and_read_entries() {
+    #[tokio::test]
+    async fn test_vote_round_trip() {
         let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        let n = store
-            .append_entries(&[blank_entry(1), blank_entry(2), blank_entry(3)])
-            .unwrap();
-        assert_eq!(n, 3);
-        assert_eq!(store.last_index().unwrap(), 3);
-        let ents = store
-            .entries(1, 4, None, GetEntriesContext::empty(false))
-            .unwrap();
-        assert_eq!(ents.len(), 3);
-        assert_eq!(ents[0].index, 1);
-        assert_eq!(store.term(1).unwrap(), 1);
-        assert!(
-            store.term(99).is_err(),
-            "term outside the log is unavailable"
-        );
+        let mut store = make_store(&dir);
+        let vote = openraft::Vote::new(1, 2);
+        store.save_vote(&vote).await.unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
     }
 
-    #[test]
-    fn test_hard_state_round_trip() {
+    #[tokio::test]
+    async fn test_append_and_read() {
         let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        let hs = HardState {
-            term: 2,
-            vote: 3,
-            commit: 5,
-        };
-        store.persist_hard_state(&hs).unwrap();
-        assert_eq!(store.read_hard_state().unwrap(), hs);
-    }
-
-    #[test]
-    fn test_conf_state_round_trip() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        let cs = ConfState {
-            voters: vec![1, 2, 3],
-            ..Default::default()
-        };
-        store.persist_conf_state(&cs).unwrap();
-        assert_eq!(store.read_conf_state().unwrap(), cs);
-        assert_eq!(store.initial_state().unwrap().conf_state, cs);
-    }
-
-    #[test]
-    fn test_compact_and_snapshot() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
+        let mut store = make_store(&dir);
         store
-            .append_entries(&[blank_entry(1), blank_entry(2)])
+            .append(
+                vec![blank_entry(1), blank_entry(2), blank_entry(3)],
+                IOFlushed::noop(),
+            )
+            .await
             .unwrap();
-        let snap = Snapshot {
-            data: b"pcs-snapshot".to_vec(),
-            metadata: Some(SnapshotMetadata {
-                index: 2,
-                term: 1,
-                conf_state: Some(ConfState {
-                    voters: vec![1],
-                    ..Default::default()
-                }),
-            }),
-        };
-        store.compact_to(2, &snap).unwrap();
-        assert_eq!(store.first_index().unwrap(), 3);
-        assert_eq!(store.last_index().unwrap(), 2);
-        // Entries at or below the snapshot index are gone.
-        assert!(
-            store
-                .entries(1, 2, None, GetEntriesContext::empty(false))
-                .is_err(),
-            "compacted entries must be unavailable"
-        );
-        // The term of first_index - 1 comes from the snapshot.
-        assert_eq!(store.term(2).unwrap(), 1);
-        let served = store.snapshot(0, 0).unwrap();
-        assert_eq!(served.data, b"pcs-snapshot");
+        let read = store.try_get_log_entries(1..4).await.unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(read[0].log_id.index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_truncate() {
+        let dir = TempDir::new().unwrap();
+        let mut store = make_store(&dir);
+        store
+            .append(
+                vec![blank_entry(1), blank_entry(2), blank_entry(3)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+        store.truncate_after(Some(log_id(1, 1))).await.unwrap();
+        let remaining = store.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_purge() {
+        let dir = TempDir::new().unwrap();
+        let mut store = make_store(&dir);
+        store
+            .append(
+                vec![blank_entry(1), blank_entry(2), blank_entry(3)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.unwrap().index, 2);
+    }
+
+    /// `truncate_after` removes entries above `last`.
+    #[tokio::test]
+    async fn truncate_after_removes_tail() {
+        let dir = TempDir::new().unwrap();
+        let mut store = make_store(&dir);
+        store
+            .append(
+                vec![
+                    blank_entry(1),
+                    blank_entry(2),
+                    blank_entry(3),
+                    blank_entry(4),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+
+        // Truncate after index 2 → 3 and 4 should be removed.
+        store.truncate_after(Some(log_id(1, 2))).await.unwrap();
+        let remaining = store.try_get_log_entries(1..10).await.unwrap();
+        assert_eq!(remaining.len(), 2, "only indices 1 and 2 should remain");
+        assert_eq!(remaining[0].log_id.index, 1);
+        assert_eq!(remaining[1].log_id.index, 2);
     }
 }

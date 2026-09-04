@@ -2,8 +2,8 @@
 //!
 //! The runner suites need a store whose claim bookkeeping is real but whose
 //! backing is a `Mutex<HashMap>`, so they can assert runner semantics — claim,
-//! renew, ack, release, checkpoint resume — without a container. Semantics
-//! mirror `TikvSharedStore`: one claimable row range per registered batch,
+//! renew, ack, release, checkpoint resume — without a cluster. Semantics
+//! mirror `RedbSharedStore`: one claimable row range per registered batch,
 //! `Pending → Claimed → Completed`, and an expired lease is reclaimable.
 //!
 //! ```rust,ignore

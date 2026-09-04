@@ -3,32 +3,24 @@
 //! Runs a 3-node Raft cluster where each node processes `Order` batches
 //! through a 4-stage pipeline, producing JSON invoice files.
 //!
-//! The PCS raft carries membership and leadership; the work pool — master
-//! batches, row-range claims and checkpoints — lives in TiKV, so every node
-//! needs the same `--pd-endpoints` and `--key-prefix`. Requires the
-//! `service-cluster` and `tikv-store` features and a running TiKV.
-//!
 //! ```
 //! # node 1: bootstrap and generator
 //! distributed_fulfillment --node-id 1 --bootstrap \
 //!     --data-dir /tmp/node1 --output-dir /tmp/output/node1 \
 //!     --listen 127.0.0.1:9001 \
-//!     --peers 127.0.0.1:9002,127.0.0.1:9003 \
-//!     --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
+//!     --peers 127.0.0.1:9002,127.0.0.1:9003
 //!
 //! # node 2
 //! distributed_fulfillment --node-id 2 \
 //!     --data-dir /tmp/node2 --output-dir /tmp/output/node2 \
 //!     --listen 127.0.0.1:9002 \
-//!     --peers 127.0.0.1:9001,127.0.0.1:9003 \
-//!     --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
+//!     --peers 127.0.0.1:9001,127.0.0.1:9003
 //!
 //! # node 3
 //! distributed_fulfillment --node-id 3 \
 //!     --data-dir /tmp/node3 --output-dir /tmp/output/node3 \
 //!     --listen 127.0.0.1:9003 \
-//!     --peers 127.0.0.1:9001,127.0.0.1:9002 \
-//!     --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
+//!     --peers 127.0.0.1:9001,127.0.0.1:9002
 //! ```
 
 mod components;
@@ -45,10 +37,10 @@ use std::time::Duration;
 
 use pcs_service::PcsError;
 use pcs_service::PcsResult;
+use pcs_service::distributed::RedbSharedStore;
 use pcs_service::distributed::consensus::{ArrowRaftDriver, ArrowRaftDriverConfig};
 use pcs_service::distributed::runner::{DistributedRunner, RunnerConfig};
 use pcs_service::distributed::strategy::CheckpointStrategy;
-use pcs_service::distributed::{TikvSharedStore, TikvStoreConfig};
 use pcs_service::service::config::{LogFormat, ObservabilityConfig};
 use pcs_service::service::logging::init_logging;
 
@@ -67,10 +59,6 @@ struct Args {
     bootstrap: bool,
     log_json: bool,
     generator_interval_secs: u64,
-    /// PD endpoints of the TiKV cluster holding the shared work pool.
-    pd_endpoints: Vec<String>,
-    /// Key prefix every node shares, so they claim from one work pool.
-    key_prefix: String,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -83,8 +71,6 @@ fn parse_args() -> Result<Args, String> {
     let mut bootstrap = false;
     let mut log_json = false;
     let mut generator_interval_secs: u64 = 2;
-    let mut pd_endpoints: Vec<String> = Vec::new();
-    let mut key_prefix = "fulfillment".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -108,18 +94,6 @@ fn parse_args() -> Result<Args, String> {
             "--output-dir" => {
                 i += 1;
                 output_dir = Some(PathBuf::from(&args[i]));
-            }
-            "--pd-endpoints" => {
-                i += 1;
-                pd_endpoints = args[i]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            "--key-prefix" => {
-                i += 1;
-                key_prefix = args[i].clone();
             }
             "--bootstrap" => bootstrap = true,
             "--log-json" => log_json = true,
@@ -155,10 +129,6 @@ fn parse_args() -> Result<Args, String> {
     let data_dir = data_dir.ok_or("--data-dir required")?;
     let output_dir = output_dir.unwrap_or_else(|| data_dir.join("output"));
 
-    if pd_endpoints.is_empty() {
-        pd_endpoints.push("127.0.0.1:2379".to_string());
-    }
-
     Ok(Args {
         node_id,
         listen,
@@ -168,8 +138,6 @@ fn parse_args() -> Result<Args, String> {
         bootstrap,
         log_json,
         generator_interval_secs,
-        pd_endpoints,
-        key_prefix,
     })
 }
 
@@ -209,39 +177,45 @@ async fn main() -> PcsResult<()> {
         listen_addr: args.listen,
         peers: args.peers.clone(),
         heartbeat_interval_ms: 50,
-        election_timeout_ms: 300,
-        snapshot_log_interval: 10_000,
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 300,
     };
 
-    let log_db = args.data_dir.join("raft-log.redb");
+    let log_db = args.data_dir.join("raft_log.redb");
+    let app_db_path = args.data_dir.join("app.redb");
 
-    let (raft_handle, raft_task) = ArrowRaftDriver::start(raft_cfg, &log_db).await?;
+    let (raft_handle, raft_task) = ArrowRaftDriver::start(raft_cfg, &log_db, &app_db_path).await?;
 
     // The driver wires only outbound connections, so the listener for inbound
-    // Raft RPCs has to be started separately.
-    let _tcp_server = raft_handle.spawn_tcp_server(args.listen);
+    // Raft RPCs has to be started separately. It binds before it accepts, so a
+    // taken address fails here.
+    let _tcp_server = raft_handle.spawn_tcp_server(args.listen).await?;
 
-    // Membership is static: each driver seeds its conf state from its peers on
-    // first boot, so the bootstrap flag only marks the data directory.
     if args.bootstrap {
+        use openraft::BasicNode;
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            args.node_id,
+            BasicNode {
+                addr: args.listen.to_string(),
+            },
+        );
+        for (peer_id, peer_addr) in &args.peers {
+            members.insert(
+                *peer_id,
+                BasicNode {
+                    addr: peer_addr.to_string(),
+                },
+            );
+        }
+        raft_handle.initialize(members).await?;
         #[cfg(feature = "tracing")]
         tracing::info!(node_id = args.node_id, "Raft cluster initialized");
     }
 
-    let store_cfg = TikvStoreConfig {
-        pd_endpoints: args.pd_endpoints.clone(),
-        key_prefix: args.key_prefix.clone(),
-        timeout: Duration::from_secs(10),
-        lease_ttl_millis: 30_000,
-    };
-    let inner_store = TikvSharedStore::connect(&store_cfg).await.map_err(|e| {
-        PcsError::configuration(format!(
-            "cannot reach TiKV at {:?}: {e}\n\
-             Every node needs the same --pd-endpoints and --key-prefix.",
-            args.pd_endpoints
-        ))
-    })?;
-    let store = Arc::new(FulfillmentStore::new(Arc::new(inner_store)));
+    let app_db = raft_handle.app_db().clone();
+    let inner_store = RedbSharedStore::multi_node(app_db.clone(), raft_handle.clone());
+    let store = Arc::new(FulfillmentStore::new(Arc::new(inner_store), app_db));
 
     wait_for_leader(raft_handle.clone(), Duration::from_secs(30)).await?;
 
@@ -335,10 +309,14 @@ async fn main() -> PcsResult<()> {
                     continue;
                 }
                 Err(e) => {
-                    // A CAS conflict or a transport hiccup against TiKV is
-                    // transient: sleep and retry once the store settles.
+                    // Propose timeouts and forwarding hiccups during leader
+                    // re-election are transient: sleep and retry once the
+                    // cluster stabilises.
                     let msg = e.to_string();
-                    if msg.contains("tikv") {
+                    if msg.contains("cluster propose timeout")
+                        || msg.contains("forward_proposal")
+                        || msg.contains("not leader")
+                    {
                         #[cfg(feature = "tracing")]
                         tracing::warn!(
                             node_id = node_id_log,
@@ -393,11 +371,11 @@ async fn wait_for_leader(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let metrics = handle.metrics();
-        if metrics.leader_id.is_some() && metrics.applied_index > 0 {
+        if metrics.current_leader.is_some() && metrics.last_applied.is_some() {
             #[cfg(feature = "tracing")]
             tracing::info!(
-                leader = ?metrics.leader_id,
-                last_applied = metrics.applied_index,
+                leader = ?metrics.current_leader,
+                last_applied = ?metrics.last_applied,
                 "cluster has leader"
             );
             return Ok(());

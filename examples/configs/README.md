@@ -18,10 +18,10 @@ that registers its factory. Build and run with:
 | `standalone_plugin.kdl` | `connector-file,transformer-csv,plugin` |
 | `postgresql.kdl` | `connector-postgresql,wasm` |
 | `s3.kdl` | `connector-s3,transformer-csv,wasm` |
-| `cluster.kdl` | `service-cluster,tikv-store,connector-file,transformer-csv,wasm` |
+| `cluster.kdl` | `service-cluster,connector-file,transformer-csv,wasm` |
 | `tcp.kdl` | `connector-tcp,wasm` |
 | `http.kdl` | `connector-http,transformer-csv,wasm` |
-| `tikv.kdl` | `tikv-store,connector-file,transformer-csv` |
+| `redb.kdl` | `connector-file,transformer-csv` |
 
 ## Build the binary
 
@@ -53,14 +53,14 @@ exist when the pipeline loads.
 
 ## How to validate the cluster example
 
-Cluster mode requires `--features service-cluster,tikv-store`. Without
-`tikv-store` the `store "tikv"` block is a configuration error, and without a
-`store` block cluster mode is rejected outright. The cluster config also names
-the file connector and wasm features.
+Cluster mode requires `--features service-cluster`, and takes no `store`
+block: its application state is the raft-replicated `cluster-app.redb` under
+`node.data_dir`, so a `store` block there is a configuration error. The
+cluster config also names the file connector and wasm features.
 
 ```text
 PCS_NODE_ID=1 PCS_DATA_DIR=/tmp/pcs-node-1 \
-cargo run -p pcs-service --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
+cargo run -p pcs-service --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
 ```
 
 Windows (PowerShell):
@@ -68,7 +68,7 @@ Windows (PowerShell):
 ```powershell
 $env:PCS_NODE_ID = "1"
 $env:PCS_DATA_DIR = "C:\tmp\pcs-node-1"
-cargo run -p pcs-service --features service-cluster,tikv-store,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
+cargo run -p pcs-service --features service-cluster,connector-file,transformer-csv,wasm --bin pcs-service -- validate --config examples/configs/cluster.kdl --strict
 ```
 
 To run a three-node cluster you need three processes, each with a distinct
@@ -76,22 +76,22 @@ To run a three-node cluster you need three processes, each with a distinct
 node during the first bring-up. See the comments in `cluster.kdl` for the
 step-by-step procedure.
 
-## How to run the TiKV-backed config
+## How to run the redb-backed config
 
-`tikv.kdl` needs a local PD and TiKV. With the `store` block present, `serve`
-persists the raw config file to TiKV before the pipeline builds, writes
-stream-mode source cursors and processor priors back as items flow, and a
-restarted service resumes from its last save point.
+`redb.kdl` needs no external service: the store is one local file. With the
+`store` block present, `serve` persists the raw config file to it before the
+pipeline builds, writes stream-mode source cursors and processor priors back
+as items flow, and a restarted service resumes from its last save point.
 
 ```text
-cargo run -p pcs-service --features tikv-store,connector-file,transformer-csv --bin pcs-service -- validate --config examples/configs/tikv.kdl
-cargo run -p pcs-service --features tikv-store,connector-file,transformer-csv --bin pcs-service -- serve --config examples/configs/tikv.kdl
+cargo run -p pcs-service --features connector-file,transformer-csv --bin pcs-service -- validate --config examples/configs/redb.kdl
+cargo run -p pcs-service --features connector-file,transformer-csv --bin pcs-service -- serve --config examples/configs/redb.kdl
 ```
 
 Runs the same on Linux, macOS and Windows (PowerShell).
 
 The pipeline reads `examples/configs/fixtures/orders.csv` and writes
-`/tmp/pcs-tikv-orders-out.csv`.
+`/tmp/pcs-redb-orders-out.csv`.
 
 ## Built-in factories
 
@@ -192,9 +192,9 @@ silently dropped section.
 
 | Feature | `mode "standalone"` | `mode "cluster"` |
 |---------|---------------------|------------------|
-| Feature flag | `service` | `service-cluster` plus `tikv-store` |
-| Consensus | None | Raft (raft-rs), membership and leadership |
-| `store "tikv"` block | Optional | Required, validation error if absent |
+| Feature flag | `service` | `service-cluster` |
+| Consensus | None | Raft (openraft), replicating the application state |
+| `store` block | Optional | Rejected, validation error if declared |
 | `source` nodes allowed | Yes | No, validation error if declared |
 | `sink` nodes allowed | Yes | No, validation error if declared |
 | `link` nodes allowed | Yes | No, validation error if declared |
@@ -207,10 +207,10 @@ A cluster-mode workflow declares exactly one processor node (`wasm` or
 `PartitionSource` and checkpoints its output, so there is no local sink to
 declare either.
 
-Cluster mode has no local application store. Master batches, row-range claims
-and checkpoints all live in TiKV, so every node needs the same `pd_endpoints`
-and the same `key_prefix`; the node's own `data_dir` holds only
-`raft-log.redb`, `bootstrap.lock` and `node-id`.
+Cluster state is replicated through the node's own raft, not a `store` block.
+Master batches, row-range claims and checkpoints live in `cluster-app.redb`
+under the node's `data_dir`, alongside `raft-log.redb`, `bootstrap.lock` and
+`node-id`.
 
 ## How to extend pcs-service with user factories
 
@@ -253,7 +253,7 @@ errors in strict mode.
 | File | Description |
 |------|-------------|
 | `standalone.kdl` | runnable single-node config using built-in types |
-| `cluster.kdl` | runnable cluster template; needs `tikv-store` and a PD |
+| `cluster.kdl` | runnable cluster template; needs `service-cluster` |
 | `standalone_wasm.kdl` | standalone config that loads a WASM processor pipeline |
 | `extension_example.kdl` | non-runnable template showing user-defined types |
 | `standalone_polyglot.kdl` | runs the Python processor from `examples/polyglot/` |
@@ -264,5 +264,5 @@ errors in strict mode.
 | `s3.kdl` | runnable config driving S3 at both ends, needs a bucket |
 | `tcp.kdl` | runnable config driving TCP at both ends, listens and dials |
 | `http.kdl` | runnable config driving HTTP at both ends, needs an endpoint |
-| `tikv.kdl` | standalone config backed by a TiKV store |
+| `redb.kdl` | standalone config backed by a local redb store |
 | `fixtures/` | the CSV inputs these configs read |

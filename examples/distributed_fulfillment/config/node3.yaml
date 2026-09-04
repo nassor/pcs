@@ -9,7 +9,3 @@ peers:
   - "node2:9002"
 log_json: true
 generator_interval_secs: 10
-# The shared work pool. Every node needs the same two values.
-pd_endpoints:
-  - "pd:2379"
-key_prefix: fulfillment

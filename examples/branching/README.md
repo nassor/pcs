@@ -25,8 +25,6 @@ continuously while it runs.
 ## Prerequisites
 
 - Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
-- `protoc` on `PATH`, because the `branching_publish` example compiles a
-  `pcs-service` example target (see `AGENTS.md` for install commands)
 - A Docker daemon, for the NATS container
 
 ## Build the processors

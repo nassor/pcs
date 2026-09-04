@@ -4,17 +4,17 @@ A 3-node PCS Raft cluster demonstrating the distributed processing features:
 field-granular DAG scheduling, parallel and sequential systems, world
 resources, checkpointing, Raft consensus, and structured tracing.
 
-The three PCS nodes form a Raft cluster for membership and leadership. The
-work pool, meaning the master batches, row-range claims and checkpoints,
-lives in a TiKV the Compose file deploys alongside them, so every node points
-at the same `--pd-endpoints` and the same `--key-prefix`.
+The three PCS nodes form a Raft cluster that replicates the work pool itself:
+the master batches, row-range claims and checkpoints all live in each node's
+own `cluster-app.redb`, applied from the raft log, so the cluster needs no
+external store.
 
 Node 1 bootstraps the Raft cluster and runs the order generator, which every
 `--generator-interval` seconds produces 300 to 500 synthetic `Order` rows and
 registers them as a master batch. All three nodes run a `DistributedRunner`
-that claims, processes, checkpoints and acks batches. Claims are atomic
-compare-and-swap transitions on TiKV keys, so exactly one node processes each
-row range, and the claim-to-ack cycle is what gives at-least-once delivery.
+that claims, processes, checkpoints and acks batches. A claim is a raft-
+committed state-machine transition, so exactly one node processes each row
+range, and the claim-to-ack cycle is what gives at-least-once delivery.
 
 Each batch runs a four-stage pipeline over `Order` rows:
 
@@ -34,16 +34,12 @@ dataset; nothing writes them to disk in this example.
 ## Prerequisites
 
 - Rust 1.95 or newer
-- `protoc` on `PATH`, because this compiles a `pcs-service` example target
-  (see `AGENTS.md` for install commands)
-- A Docker daemon
-- A reachable TiKV. `tiup playground --mode tikv-slim` starts one with PD on
-  `127.0.0.1:2379`
+- A Docker daemon, for the Compose path
 
 ## Run with Docker Compose
 
-Compose builds the example and starts PD, TiKV and all three nodes. Every
-command here runs the same on Linux, macOS and Windows (PowerShell).
+Compose builds the example and starts all three nodes. Every command here
+runs the same on Linux, macOS and Windows (PowerShell).
 
 ```text
 docker compose -f examples/distributed_fulfillment/docker-compose.yml up --build
@@ -69,12 +65,11 @@ docker compose -f examples/distributed_fulfillment/docker-compose.yml down
 Build the example binary:
 
 ```text
-cargo build -p pcs-service --example distributed_fulfillment --features service-cluster,tikv-store
+cargo build -p pcs-service --example distributed_fulfillment --features service-cluster
 ```
 
-Then start a TiKV (`tiup playground --mode tikv-slim` gives PD on
-`127.0.0.1:2379`) and run three nodes, one per terminal. Node 1 bootstraps
-the cluster and runs the generator.
+Then run three nodes, one per terminal. Node 1 bootstraps the cluster and
+runs the generator.
 
 Terminal 1, Linux and macOS:
 
@@ -85,7 +80,6 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --data-dir /tmp/fulfillment/node1 \
   --output-dir /tmp/fulfillment/output/node1 \
   --peers 127.0.0.1:9002,127.0.0.1:9003 \
-  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment \
   --generator-interval 10
 ```
 
@@ -97,8 +91,7 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --listen 127.0.0.1:9002 \
   --data-dir /tmp/fulfillment/node2 \
   --output-dir /tmp/fulfillment/output/node2 \
-  --peers 127.0.0.1:9001,127.0.0.1:9003 \
-  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
+  --peers 127.0.0.1:9001,127.0.0.1:9003
 ```
 
 Terminal 3:
@@ -109,15 +102,14 @@ RUST_LOG=trace ./target/debug/examples/distributed_fulfillment \
   --listen 127.0.0.1:9003 \
   --data-dir /tmp/fulfillment/node3 \
   --output-dir /tmp/fulfillment/output/node3 \
-  --peers 127.0.0.1:9001,127.0.0.1:9002 \
-  --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment
+  --peers 127.0.0.1:9001,127.0.0.1:9002
 ```
 
 Windows (PowerShell) runs the same flags, one node per terminal:
 
 ```powershell
 $env:RUST_LOG = "trace"
-.\target\debug\examples\distributed_fulfillment --node-id 1 --bootstrap --listen 127.0.0.1:9001 --data-dir C:\fulfillment\node1 --output-dir C:\fulfillment\output\node1 --peers 127.0.0.1:9002,127.0.0.1:9003 --pd-endpoints 127.0.0.1:2379 --key-prefix fulfillment --generator-interval 10
+.\target\debug\examples\distributed_fulfillment --node-id 1 --bootstrap --listen 127.0.0.1:9001 --data-dir C:\fulfillment\node1 --output-dir C:\fulfillment\output\node1 --peers 127.0.0.1:9002,127.0.0.1:9003 --generator-interval 10
 ```
 
 ## Observable behaviour
@@ -146,6 +138,6 @@ restarting the row range.
 | `components.rs` | the `Order` and `Invoice` component definitions |
 | `store.rs` | `FulfillmentStore`, the checkpoint and partition store wrapper |
 | `generator.rs` | the synthetic `Order` batch generator |
-| `docker-compose.yml` | PD, TiKV and the three nodes |
+| `docker-compose.yml` | the three nodes and their shared data volume |
 | `Dockerfile` | the release build that Compose uses |
 | `config/` | per-node YAML templates of the same settings |

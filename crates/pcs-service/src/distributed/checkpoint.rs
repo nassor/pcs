@@ -46,10 +46,12 @@ pub struct Checkpoint {
 
 /// Persistent storage for Arrow-IPC pipeline checkpoints.
 ///
-/// The TiKV-backed store writes each checkpoint as a single key, so a save is
-/// durable once it returns. Reads may be served by any replica: eventual
-/// consistency is acceptable for checkpoint data, because the worst case is
-/// re-processing one stage.
+/// In multi-node mode each mutation is committed through Raft before
+/// returning. In single-node mode mutations are applied directly to the local
+/// database.
+///
+/// Reads always go to the local replica. Eventual consistency is acceptable
+/// for checkpoint data: the worst case is re-processing one stage.
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
     /// Save a checkpoint for `claim_id` at `stage_idx`.
@@ -75,8 +77,9 @@ pub trait CheckpointStore: Send + Sync {
 
     /// Largest `ipc_bytes` this store accepts per checkpoint.
     ///
-    /// The trait default is [`MAX_LOG_ENTRY_BYTES`](crate::distributed::partition::MAX_LOG_ENTRY_BYTES);
-    /// the TiKV store overrides it with a larger envelope.
+    /// The trait default is [`MAX_LOG_ENTRY_BYTES`](crate::distributed::partition::MAX_LOG_ENTRY_BYTES),
+    /// which is what a checkpoint travelling inside a raft log entry allows.
+    /// A store with a larger envelope may raise it.
     /// Pre-check helpers (`save_accumulator_state`, `save_processor_state`)
     /// consult this instead of hard-coding the cap, so a store with a larger
     /// envelope does not needlessly reject state.

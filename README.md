@@ -93,10 +93,6 @@ Then run a working pipeline without writing anything:
 cargo run -p pcs-service --example scheduler_etl
 ```
 
-The example target compiles the crate's dev-dependencies, so it also needs
-`protoc` on PATH (`raft-proto` in that set has a build script that calls it;
-see AGENTS.md for the Windows install).
-
 It prints the stage plan PCS derived from the systems' field declarations (ValidateSystem and
 EnrichSystem share stage 1 because they write disjoint fields), then a summary report: 9
 transactions, 7 valid, 2 rejected.

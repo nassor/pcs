@@ -88,6 +88,7 @@ futures       = { version = "0.3.34" }
 futures-util  = { version = "0.3.34" }
 serde         = { version = "1.0.229", features = ["derive"] }
 serde_json    = { version = "1.0.151" }
+serde_bytes   = { version = "0.11.19" }
 # The service configuration language. KDL text is parsed here and mapped into
 # the self-describing `ConfigValue` tree the factory signatures carry. `span`
 # positions every diagnostic as `line:column`; the default `serde` feature is

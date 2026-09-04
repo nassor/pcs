@@ -164,12 +164,12 @@ async fn bidi_partition_elects_and_rejoins() -> anyhow::Result<()> {
         toxi.disable_proxy(&common::RaftClusterHarness::proxy_name(peer, leader_idx))?;
     }
 
-    // The two remaining nodes hold the majority. The isolated old leader never
-    // steps down (raft-rs defaults: `check_quorum = false`), so its stale
-    // self-report must be excluded: `await_leader` returns whichever node
-    // answers first, and when the isolated leader is `nodes[0]` that
-    // self-report would satisfy the poll forever. Still tolerate windows with
-    // no leader at all.
+    // The two remaining nodes hold the majority. The isolated old leader keeps
+    // reporting itself as leader until its own leader lease expires, so its
+    // stale self-report must be excluded: `await_leader` returns whichever
+    // node answers first, and when the isolated leader is `nodes[0]` that
+    // self-report would satisfy the poll meanwhile. Still tolerate windows
+    // with no leader at all.
     let deadline = Instant::now() + Duration::from_secs(30);
     let _new_leader = loop {
         if let Ok(candidate) = harness.await_leader_excluding(first_leader).await {

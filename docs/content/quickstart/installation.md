@@ -96,17 +96,15 @@ Each prints its version and exits 0.
 
 ## What stays opt-in
 
-Four features are not in the bundle, each for a reason. Add them only when you
+Three features are not in the bundle, each for a reason. Add them only when you
 need them, with the same `cargo install` from a checkout:
 
 - `connector-kafka` needs `cmake` and a C toolchain, because `librdkafka-sys`
   builds vendored C. Add it when you need Kafka:
   `cargo install --path crates/pcs-service --features connector-kafka`.
-- `tikv-store` pulls `tikv-client` (tonic and prost behind it). It carries
-  `TikvSharedStore`, the shared store the distributed runner claims from.
 - `distributed-raft` and `service-cluster` carry the PCS Raft stack. A cluster
   node is a deliberate deployment choice, built with
-  `cargo install --path crates/pcs-service --features service-cluster,tikv-store`.
+  `cargo install --path crates/pcs-service --features service-cluster`.
 
 See [Operating pcs-service](@/operations/running-pcs.md).
 

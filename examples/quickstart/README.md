@@ -18,8 +18,6 @@ stage, so the publisher writes it empty and it stays empty end to end.
 - Rust with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - `componentize-go` 0.4.1 with Go 1.25.5+, the .NET SDK 10, and `wasm-tools`
   1.246.2, all pinned in `examples/polyglot/PINS.md`
-- `protoc` on `PATH`, because the `quickstart_publish` example compiles a
-  `pcs-service` example target (see `AGENTS.md` for install commands)
 - A Docker daemon, for the NATS and PostgreSQL containers
 
 ## Run it

@@ -23,7 +23,7 @@ cargo xtask bench tpch_q6                                    # Benchmarks, alway
 cargo check --examples                                       # Verify examples compile
 cargo run -p pcs-service --example scheduler_etl             # Run an example
 cargo run -p pcs-service --example first_pipeline            # The native tutorial's example
-cargo run -p pcs-service --example distributed_scheduler --features tikv-store  # Needs a running TiKV
+cargo run -p pcs-service --example distributed_scheduler --features distributed  # No external service
 cargo run -p pcs-service --example scheduler_etl_parallel
 cargo audit                                                  # Security audit (needs cargo-audit)
 cargo xtask polyglot                                         # Build the six polyglot processors
@@ -46,29 +46,6 @@ its gates itself; run them directly when changing that crate without rebuilding 
 cargo fmt --manifest-path crates/pcs-service-ui/Cargo.toml -- --check
 cargo clippy --manifest-path crates/pcs-service-ui/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 ```
-
-### protoc prerequisite
-
-`protoc` must be on `PATH` before **any** `pcs-service` test, example or benchmark target
-compiles, whatever feature list is passed. `raft` is a non-optional entry in
-`crates/pcs-service/Cargo.toml`'s `[dev-dependencies]` with `features = ["prost-codec"]`, so it is
-not gated behind `distributed-raft` the way the normal dependency is: it pulls `raft-proto`, whose
-`protobuf-build`/`prost-build` build script invokes `protoc` to regenerate `eraftpb`. A plain
-`cargo build` of the library skips it; `cargo test`, `cargo check --examples` and
-`cargo xtask bench` do not.
-
-```bash
-sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu, what ci.yml runs
-brew install protobuf                       # macOS
-```
-
-On Windows, take the `protoc-*-win64.zip` release from
-`github.com/protocolbuffers/protobuf/releases` and put its `bin/` on `PATH`.
-
-`ci.yml` installs it in the `test`, `distributed_chaos`, `wasm_processor`, `polyglot` and `tikv_store` jobs, the
-five that compile a `pcs-service` test or example target. A missing `protoc` surfaces as a
-`raft-proto` build-script failure, not as a feature error, so it reads as unrelated to the change
-that triggered it.
 
 ### WASM fixture prerequisite
 
@@ -173,14 +150,16 @@ profiles exist, and which one to reach for depends on why you're running tests:
 - `cargo nextest run --workspace --all-features` (the `default` profile): the everyday command.
   It compiles the same `--all-features` closure as always, but skips every test that needs a
   Docker daemon: the testcontainers-backed connector suites
-  (`pcs-connector-kafka`/`-nats`/`-postgresql`/`-s3`'s `tests/`), `pcs-service`'s `tikv_store`
-  suite, the three Raft chaos binaries (`transport_chaos`, `distributed_harness_smoke`,
-  `raft_consensus_chaos`), and one Docker-backed test apiece in `pcs-service`'s
+  (`pcs-connector-kafka`/`-nats`/`-postgresql`/`-s3`'s `tests/`), the two whole Raft chaos
+  binaries (`transport_chaos`, `distributed_harness_smoke`), the Docker-gated cluster tests in
+  `raft_consensus_chaos` (its `unit` and `idempotency` modules are Docker-free and stay), and one
+  Docker-backed test apiece in `pcs-service`'s
   `kafka_service`/`nats_service`/`postgres_service`/`s3_service`. Run this constantly; it should
-  stay fast regardless of how large the Docker-backed suites grow. The other distributed suites
-  (`distributed_scheduler`, `runner_chaos`, `checkpoint_chaos`, `wasm_chaos`,
-  `distributed_processor_state`) run against the in-memory store fixture in
-  `tests/common/memory_store.rs`, need no daemon, and stay in the fast profile.
+  stay fast regardless of how large the Docker-backed suites grow. The embedded store suite
+  (`redb_store`) and the other distributed suites (`distributed_scheduler`, `runner_chaos`,
+  `checkpoint_chaos`, `wasm_chaos`, `distributed_processor_state`) need no daemon either: the
+  first drives a local redb file, the rest the in-memory store fixture in
+  `tests/common/memory_store.rs`.
 - `cargo nextest run --workspace --all-features --profile ci --run-ignored all` (the `ci`
   profile): the full suite, including everything `default` skips and any `#[ignore]`d test (today,
   only `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
@@ -207,9 +186,8 @@ have Docker, and it needs no nextest-side accommodation.
 The Raft chaos harness sharpens that rule: only the container step soft-skips.
 `RaftClusterHarness::try_start` returns `None` when the Docker daemon cannot supply the Toxiproxy
 container, and every step after it panics: host-port resolution, per-edge proxy creation, node
-startup, and the `await_listening` check that a node really accepted on its reserved port. The same
-split guards `tests/common/tikv.rs`: no daemon is a skip, containers up but the store unreachable is
-a real error. That is what stops a green run from hiding a broken harness.
+startup, and the `await_listening` check that a node really accepted on its reserved port. That is
+what stops a green run from hiding a broken harness.
 
 Every Docker-backed test starts its own fresh container (or, for a Raft chaos test, its own
 Toxiproxy container plus an N-node cluster with one proxy per directed edge) with OS-assigned host
@@ -309,13 +287,13 @@ examples/quickstart/              # The runnable Quick Start: NATS to PostgreSQL
 examples/native/                  # Single-file pcs-core/pcs-service tutorials and feature demos:
                                   # first_pipeline, scheduler_etl(_parallel|_dag), window_aggregation,
                                   # distributed_scheduler, distributed_windowed, windowed_fan_in,
-                                  # stream_latency. The two distributed_* demos need `tikv-store`
-                                  # and a reachable TiKV.
+                                  # stream_latency. The two distributed_* demos run on a local
+                                  # redb store, so they need no external service.
                                   # Declared as `[[example]]` targets of the pcs-service crate.
 examples/distributed_fulfillment/ # A 3-node PCS Raft cluster showcase: field-granular DAG
-                                  # scheduling, checkpointing into TiKV, Docker Compose deployment
-                                  # of the three nodes plus PD and TiKV. One `[[example]]` target of
-                                  # pcs-service.
+                                  # scheduling, checkpointing into the raft-replicated
+                                  # cluster-app.redb, Docker Compose deployment of the three
+                                  # nodes. One `[[example]]` target of pcs-service.
 examples/configs/                 # Runnable KDL configs for the pcs-service binary itself (not
                                   # `[[example]]` targets), one per connector plus standalone/cluster
                                   # templates. See its own README.md for the feature-to-config table.
@@ -431,24 +409,24 @@ cluster node is a deliberate deployment choice.
 - `wasm`: wasmtime host. `WasmEngine`, `WasmPipelineRuntime`, the `bindgen!` host bindings.
 - `plugin`: native plugin host. `NativePluginRuntime` dlopens a shared library exporting the
   `pcs-plugin-abi` C ABI, validates its manifest, and runs each batch through `run-batch`.
-- `distributed`: `PartitionSource`, `CheckpointStore`, `DistributedRunner`, `CheckpointStrategy`.
-  Traits and the runner loop only; it carries no store implementation and no redb.
-- `distributed-raft`: the PCS raft node (raft-rs, tikv/raft-rs) for membership and leadership:
-  `RaftRedbLogStore` over a log-only redb file, the node driver, the TCP peer transport. This is
-  the only feature that pulls `dep:redb`, and the only thing redb holds is the raft log
-  (implies `distributed`).
-- `tikv-store`: TiKV persistent layer, and the only shared store there is. `TikvSharedStore`
-  implements `PartitionSource` + `CheckpointStore` over a raw TiKV client (claims via CAS), and
-  `TikvStateClient` persists configs, processor priors and source cursors. Opt-in like
-  `connector-kafka`: tikv-client pulls tonic/prost. Implies `distributed`.
+- `distributed`: `PartitionSource`, `CheckpointStore`, `DistributedRunner`, `CheckpointStrategy`,
+  plus `RedbSharedStore`, which serves both traits over a local redb file. This is the feature
+  that pulls `dep:redb`, so `RedbSharedStore::single_node` is a working store with no consensus
+  at all, which is what makes the two `distributed_*` examples runnable without a cluster.
+- `distributed-raft`: the openraft node that replicates the application state:
+  `ArrowRedbLogStore` (the raft log in its own redb file), `ArrowRedbStateMachine` (the
+  application tables in `cluster-app.redb`), the driver, and the request/response TCP peer
+  transport. `RedbSharedStore::multi_node` proposes every mutation through it (implies
+  `distributed`).
 - `service`: the `pcs-service` binary. axum HTTP control plane, KDL config through
   `dep:pcs-config`, metrics, standalone runner (implies `pcs-core/io`, `distributed`,
   `parquet-checkpoint`, `tracing`, `metrics`, `inspector`). Also pulls `opentelemetry-otlp` and
-  `tracing-opentelemetry` for OTLP span export.
+  `tracing-opentelemetry` for OTLP span export, and `dep:postcard` for the source cursors
+  `RedbStateClient` persists.
   It does **not** imply `distributed-raft`.
 - `service-cluster`: cluster/Raft mode on top of `service` (implies `service`, `distributed-raft`).
-  It does **not** imply `tikv-store`, and `mode "cluster"` refuses to start without one, so a
-  cluster binary is built with `--features service-cluster,tikv-store`.
+  A cluster node keeps its state under `node.data_dir`, so a cluster binary needs no other
+  feature: `--features service-cluster`.
 
 ### `pcs-core`, columnar engine
 
@@ -609,8 +587,9 @@ on the host. `pcs-service` owns the `Registry` and `register_builtin_factories`,
 #### Distributed processing (`src/distributed/`)
 
 Multi-instance batch execution with at-least-once semantics. `pcs-core`'s `distributed` feature
-contributes shared types only; all runner code lives here. Application state lives in TiKV. The
-PCS raft node carries membership and leadership, and nothing else.
+contributes shared types only; all runner code lives here. The application state, meaning master
+batches, row-range claims, checkpoints and instance heartbeats, is replicated by the PCS raft
+itself and applied into each node's own redb file.
 
 **`distributed` feature:**
 - `PartitionSource`: claims, acks, and releases row-range batches across instances
@@ -621,34 +600,43 @@ PCS raft node carries membership and leadership, and nothing else.
   checkpoints and acks. The template's own data, sources, and sinks are never used.
 - `CheckpointStrategy`: `EveryStage`, `EveryNStages`, `None`
 - `MAX_LOG_ENTRY_BYTES` (1 MiB, `partition.rs`): caps the Arrow IPC payload of a registered master
-  batch, and is the `CheckpointStore::max_checkpoint_bytes` trait default
+  batch, and is the `CheckpointStore::max_checkpoint_bytes` trait default, which
+  `RedbSharedStore` does not raise because a checkpoint travels inside a raft log entry
 - `accumulator_store` and `processor_state_store`: free functions that park the window accumulator and
   the runtime state blob under reserved `stage_idx` sentinels (`ACCUMULATOR_STAGE_SENTINEL`,
   `PROCESSOR_STATE_STAGE_SENTINEL`)
 - `ParquetCheckpointStore`: archival checkpoint store (needs `parquet-checkpoint`)
 
-**`distributed-raft` feature** (`src/distributed/consensus/`), membership and leadership only.
-Nothing is proposed into this log, so its entries are raft's own per-term no-ops:
-- `RaftRedbLogStore`: raft-rs `Storage` over a log-only redb file (hard state, conf state,
-  prost-encoded entries, snapshot). The single-row snapshot table carries raft metadata alone,
-  index, term and conf state, with an empty data payload, because there is no application state
-  to capture. `snapshot_log_interval` is the log compaction cadence
-- `ArrowRaftDriver`, `ArrowRaftDriverConfig`, `ArrowRaftDriverHandle`: a `RawNode` drive loop
-  (tick/step/Ready cycle, static membership seeded from the configured peers on first boot).
-  `start(config, log_db_path)` takes the one redb path; the handle exposes `metrics`, `shutdown`
-  and `spawn_tcp_server`
-- `TransportHub`, `TcpNetwork`, `RaftTcpServer` (`consensus/transport/`): pooled length-prefixed
-  TCP carrying prost-encoded `eraftpb::Message`, fire and forget. One frame caps at
-  `MAX_FRAME_BYTES`, 16 MiB
-
-**`tikv-store` feature:** the shared store and every persistent ledger.
-- `TikvSharedStore`: `PartitionSource` + `CheckpointStore` over a raw TiKV client. Claims are
-  atomic CAS transitions on per-row-range keys; row ranges are fixed 512-row chunks created at
-  registration. Checkpoints cap at 4 MiB (`TIKV_MAX_CHECKPOINT_BYTES`).
-- `TikvStateClient`: config bytes, processor priors and source cursors under the store's key
-  prefix. The dual-impl no-op keeps callers free of `#[cfg]`.
-- Stream mode persists source cursors and processor priors whenever a store is configured;
-  interval/one-shot state carry is opt-in via `store "tikv" { batch_resume true }`.
+**`distributed-raft` feature** (`src/distributed/consensus/`), the openraft node and everything it
+replicates:
+- `types.rs`: `PcsTypeConfig` (`openraft::declare_raft_types!`), `ConsensusCommand` and
+  `ConsensusResponse`. Every command carrying wall-clock time carries it as a `now_at_propose`
+  field, so the state machine stays deterministic on replay
+- `state_machine/`: the redb application tables (`arrow_master_batches`, `arrow_claims`,
+  `arrow_claims_by_batch`, `arrow_checkpoints`, `arrow_instances`, `arrow_pending_batches`,
+  `arrow_sm_meta`) plus the apply handlers, queries and snapshot IO. Records are JSON-encoded;
+  only openraft-native persistence uses postcard
+- `storage/`: `ArrowRedbLogStore` (`RaftLogReader` + `RaftLogStorage`, calling
+  `IOFlushed::io_completed` only after the redb commit) and `ArrowRedbStateMachine`
+  (`RaftStateMachine`, `SnapshotData = Cursor<Vec<u8>>`), plus `validate_store_consistency`
+- `ArrowRaftDriver`, `ArrowRaftDriverConfig`, `ArrowRaftDriverHandle`:
+  `start(config, log_db_path, app_db_path)` opens both redb files, validates them against each
+  other, and spawns the proposal loop, whose `write_command` maps openraft's `ForwardToLeader`
+  onto `transport::forward_proposal`. The handle exposes `propose`, `app_db`, `metrics`,
+  `initialize`, `spawn_tcp_server` and `shutdown`
+- `transport/`: length-prefixed request/response TCP with a `serde_json` body,
+  `MAX_FRAME_BYTES` 16 MiB. `TcpNetworkFactory`/`TcpNetwork` implement `RaftNetworkV2` over a
+  peer pool with a circuit breaker; `RaftTcpServer` answers `AppendEntries`, `Vote`, snapshot
+  chunks and `ProposalForward`
+- `RedbSharedStore` (`consensus/store.rs`): `SingleNode` applies commands to the local redb file,
+  `MultiNode` proposes through the driver and reads from the state machine's own database. Claim
+  leases default to `DEFAULT_LEASE_TTL_MILLIS` (90 s) and a propose is bounded by
+  `CLUSTER_PROPOSE_TIMEOUT` (30 s)
+- `RedbStateClient` (`src/service/redb_state.rs`, `service` feature): the standalone/stream
+  persistence path. Config bytes, processor priors and source cursors in one local unreplicated
+  redb file declared by `store "redb"`. Stream mode persists cursors and priors whenever a store
+  is configured; interval/one-shot state carry is opt-in via
+  `store "redb" { batch_resume #true }`
 
 #### WASM host (`src/wasm/`, `wasm` feature)
 
@@ -667,10 +655,10 @@ standalone/cluster runners.
 
 Key types:
 - `ServiceConfig` and `ServiceMode`: the config schema (`mode "standalone"` or `mode "cluster"`)
-- `StoreConfig`: the top-level `store "tikv"` block (`pd_endpoints`, `key_prefix`, `timeout_ms`,
-  `lease_ttl_ms`, `batch_resume`). `mode "cluster"` refuses to start without one, because TiKV is
-  the only cluster application-data store; a `store` block in a binary built without `tikv-store`
-  is likewise a configuration error
+- `StoreConfig`: the top-level `store "redb"` block (`path`, `batch_resume`), the local
+  unreplicated store the standalone and stream runners persist through. `mode "cluster"` rejects
+  a `store` block, because a cluster node's state is the raft-replicated `cluster-app.redb` under
+  `node.data_dir`
 - `WorkflowSpec`: one declared workflow (standalone may declare several; cluster mode takes
   exactly one). Declared `transformer`, `source`, `wasm`, `plugin` and `sink` nodes, each with a
   mandatory id and an optional name, plus `link` nodes carrying `from`, `to` and an optional
@@ -709,9 +697,17 @@ Key types:
   `run_stream` walk `BuiltService::nodes` directly: each iteration fans a source's batch out to its
   `downstream` nodes, runs every processor in topological order, and stages/writes every sink.
   `run_stream` requires at least one source node and pulls them round-robin, one batch per item.
-  `run_cluster` validates `node.data_dir`, whose only three files are `bootstrap.lock`,
-  `raft-log.redb` and `node-id`, starts the `ArrowRaftDriver`, connects the `TikvSharedStore`,
-  waits for raft to settle, then drives the `DistributedRunner` loop until cancellation.
+  `run_cluster` validates `node.data_dir`, whose only four files are `bootstrap.lock`,
+  `raft-log.redb`, `cluster-app.redb` and `node-id`, starts the `ArrowRaftDriver`, binds its
+  peer listener through `spawn_tcp_server` (eagerly, so a taken address fails at startup rather
+  than leaving a member no peer can reach), builds a `RedbSharedStore::multi_node` over the
+  driver's own application database with the configured `lease_ttl_ms`, waits for raft to
+  settle, then re-enters the `DistributedRunner` loop until cancellation: `run` returns on an
+  empty work pool, and a node that exited there would drop its vote before an operator
+  registered anything. `bootstrap.lock` and `node-id` are written on **every** node once it
+  first reports a leader, which is what makes a follower's own restart pass
+  `validate_data_dir`. Shutdown aborts the listener, signals the driver and awaits its task,
+  because that task is what closes both redb files.
 - HTTP control plane: `/health`, `/ready`, `/metrics`, `/status` (axum-backed), plus the inspector's
   `/api/*` and `/ui` when `observability.inspector.enabled` is set. Those routes are **merged**
   rather than gated inside a handler, so a disabled inspector 404s instead of answering 403.
@@ -873,7 +869,7 @@ collector, a scraper or external storage. Nothing leaves the process.
 - Performance is a finishing check, not optional: `cargo clippy --all-targets --all-features -- -D
   warnings` (already required above) covers Clippy's Perf lint group on every task. A change that
   touches a hot path (`Dataset`/`System`/`Pipeline` execution in `pcs-core`, Arrow IPC ser/de at the
-  `pcs-service` wasm host/processor boundary, or the `distributed` checkpoint and TiKV store paths)
+  `pcs-service` wasm host/processor boundary, or the `distributed` checkpoint and redb store paths)
   or a build profile/allocator/dependency setting also needs
   `.agents/skills/rust-performance/SKILL.md`'s triage workflow, validated with
   `cargo xtask bench <name>` before/after.

@@ -142,7 +142,7 @@ pcs-connector-file = { git = "https://github.com/nassor/pcs" }</code></pre>
     Every connector depends on <code>pcs-core</code> with its <code>io</code> feature, so the
     <code>Source</code> and <code>Sink</code> traits arrive with it. Nothing here depends on
     <code>pcs-service</code>: the factory contract lives in <code>pcs-connector</code>, below
-    the host, so a connector compiles without wasmtime, axum or tikv-client in the graph. Each page
+    the host, so a connector compiles without wasmtime, axum or openraft in the graph. Each page
     above states the constructor, every config key and the errors that key can raise.
 </p>
 

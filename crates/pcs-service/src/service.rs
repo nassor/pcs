@@ -13,9 +13,9 @@
 //!   [`config::ServiceConfig`] schema, which can describe a cluster config even
 //!   though running one fails at startup.
 //! - `service-cluster`: adds the cluster runner ([`cluster::run_cluster`]) and
-//!   enables `distributed-raft`, compiling in the raft-rs drive loop, its
-//!   redb log store, and the TCP transport. Cluster mode also needs
-//!   `tikv-store`: TiKV is the only application-data store.
+//!   enables `distributed-raft`, compiling in the openraft node, its redb log
+//!   store, the replicated application state machine, and the TCP transport.
+//!   Cluster state lives under `node.data_dir`, so it needs no other store.
 //!
 //! ## Quick start
 //!
@@ -65,6 +65,8 @@ pub mod logging;
 #[cfg(all(feature = "service", feature = "plugin"))]
 pub mod plugin_loader;
 #[cfg(feature = "service")]
+pub mod redb_state;
+#[cfg(feature = "service")]
 pub mod registry;
 #[cfg(feature = "service")]
 pub mod shutdown;
@@ -74,8 +76,6 @@ pub mod span_metrics;
 pub mod standalone;
 #[cfg(feature = "service")]
 pub mod stream;
-#[cfg(feature = "service")]
-pub mod tikv_state;
 #[cfg(feature = "service")]
 pub mod topology;
 #[cfg(feature = "service")]
@@ -113,6 +113,8 @@ pub use pcs_connector::{ChannelBridge, ConnectorContext};
 #[cfg(all(feature = "service", feature = "plugin"))]
 pub use plugin_loader::load_plugin_runtime;
 #[cfg(feature = "service")]
+pub use redb_state::{RedbStateClient, SourceCursorMeta};
+#[cfg(feature = "service")]
 pub use registry::{
     Registry, SinkFactory, SourceFactory, Transformer, TransformerFactory, TransformerRegistry,
 };
@@ -124,8 +126,6 @@ pub use span_metrics::SpanMetricsLayer;
 pub use standalone::{StandaloneStats, run_standalone};
 #[cfg(feature = "service")]
 pub use stream::run_stream;
-#[cfg(feature = "service")]
-pub use tikv_state::{SourceCursorMeta, TikvStateClient};
 #[cfg(feature = "service")]
 pub use topology::build_topology;
 #[cfg(feature = "service")]

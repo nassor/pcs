@@ -15,8 +15,6 @@ requested stages need before building anything.
 
 - Rust 1.95.0 with the `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - `wasm-tools` 1.246.2
-- `protoc` on `PATH`, because the driver, the code generator and the chain
-  test all compile a `pcs-service` example or test target (see `AGENTS.md`)
 - Go 1.25.5+ with `componentize-go` 0.4.1
 - Python 3.10+ with `componentize-py` 0.25.0
 - Node 24.12+ with `@bytecodealliance/jco` 1.30.0 and `typescript` 5.9.3

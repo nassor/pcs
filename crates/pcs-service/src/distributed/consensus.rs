@@ -1,28 +1,33 @@
-//! Raft consensus layer for PCS's cluster mode.
+//! Arrow-IPC consensus layer for PCS's distributed execution.
 //!
-//! The PCS raft runs for membership and leadership only: application data
-//! (partitions, checkpoints, claims) lives in TiKV, so nothing is proposed
-//! into this log and its entries are raft's own per-term no-ops.
-//!
-//! - `driver`: the [`ArrowRaftDriver`] `RawNode` drive loop, its metrics
-//!   snapshot, and the shutdown handle.
-//! - `storage`: [`RaftRedbLogStore`], the `raft::Storage` implementation over
-//!   a log-only redb file.
-//! - `transport`: the length-prefixed TCP transport carrying prost-encoded
-//!   `eraftpb::Message` frames between peers.
+//! Holds the redb-backed state machine, optional openraft integration, and the TCP
+//! transport for the Arrow distributed layer.
 //!
 //! # Feature gates
 //!
-//! Every module here needs `distributed-raft`; without it this module is empty.
+//! - `distributed`: enables core types, state machine, and store.
+//! - `distributed-raft`: additionally enables openraft log storage,
+//!   state machine, snapshot builder, driver, and transport.
+
+pub mod state_machine;
+pub mod store;
+pub mod transport;
+pub mod types;
 
 #[cfg(feature = "distributed-raft")]
 pub mod driver;
 #[cfg(feature = "distributed-raft")]
-pub mod storage;
+pub mod snapshot;
 #[cfg(feature = "distributed-raft")]
-pub mod transport;
+pub mod storage;
+
+pub use state_machine::apply;
+pub use store::RedbSharedStore;
+pub use types::{ConsensusCommand, ConsensusResponse};
 
 #[cfg(feature = "distributed-raft")]
 pub use driver::{ArrowRaftDriver, ArrowRaftDriverConfig, ArrowRaftDriverHandle};
 #[cfg(feature = "distributed-raft")]
-pub use storage::RaftRedbLogStore;
+pub use snapshot::{build_snapshot_bytes, install_snapshot_bytes};
+#[cfg(feature = "distributed-raft")]
+pub use storage::{ArrowRedbLogStore, ArrowRedbStateMachine};

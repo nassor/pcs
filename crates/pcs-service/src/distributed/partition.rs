@@ -18,8 +18,9 @@ use crate::PcsResult;
 /// default — one stage checkpoint.
 ///
 /// Payloads above this limit are rejected before they are written; consumers
-/// that produce larger batches must split them first. A store may raise the
-/// checkpoint half: the TiKV store allows 4 MiB.
+/// that produce larger batches must split them first. Both halves travel
+/// inside a raft log entry in cluster mode, which is where the limit comes
+/// from.
 pub const MAX_LOG_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// A granted claim on a row-range slice of a replicated master `RecordBatch`.
@@ -71,8 +72,9 @@ pub struct BatchClaim {
 /// Source of Arrow-columnar work batches for distributed processing.
 ///
 /// Implementations coordinate across instances to ensure at-most-one claim
-/// per row range at any given time. The TiKV store does it with an atomic
-/// compare-and-swap on the row-range key.
+/// per row range at any given time. [`RedbSharedStore`](crate::distributed::RedbSharedStore)
+/// does it by proposing the claim through raft, where the state machine
+/// rejects a range that overlaps a live one.
 ///
 /// ## Lease contract
 ///
@@ -141,7 +143,8 @@ pub trait PartitionSource: Send + Sync {
     ///
     /// Returns the number of claims freed. The default implementation is a
     /// no-op (returns `Ok(0)`) for sources that do not support expiry sweeps.
-    /// The TiKV store overrides it with a scan over the batch's row ranges.
+    /// [`RedbSharedStore`](crate::distributed::RedbSharedStore) overrides it
+    /// with `ConsensusCommand::ReclaimExpired`.
     async fn reclaim_expired(&self, _now_millis: u64) -> PcsResult<u32> {
         Ok(0)
     }

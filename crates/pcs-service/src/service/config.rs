@@ -25,11 +25,11 @@
 //! [`WorkflowSpec`].
 //!
 //! Cluster mode instead sets `mode "cluster"`, `bootstrap` on the first node,
-//! and one `peer` node (`id`, `addr`) per cluster member, plus a
-//! `store "tikv"` block: TiKV is the only cluster application-data store. A
-//! cluster-mode workflow declares exactly one `wasm` or `plugin` node and no
-//! source, sink or link: the distributed runner ingests through
-//! `PartitionSource` and drives one runtime per node.
+//! and one `peer` node (`id`, `addr`) per cluster member, and takes no
+//! `store` block: cluster state is the raft-replicated `cluster-app.redb`
+//! under `node.data_dir`. A cluster-mode workflow declares exactly one
+//! `wasm` or `plugin` node and no source, sink or link: the distributed
+//! runner ingests through `PartitionSource` and drives one runtime per node.
 //!
 //! ## Env var substitution
 //!
@@ -188,6 +188,9 @@ fn default_heartbeat_interval() -> u64 {
 fn default_snapshot_log_interval() -> u64 {
     10_000
 }
+fn default_lease_ttl() -> u64 {
+    30_000
+}
 
 /// Configuration for cluster (multi-node Raft) mode.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -203,6 +206,13 @@ pub struct ClusterConfig {
     /// in templates.
     #[serde(default, deserialize_with = "de_bool_flexible")]
     pub bootstrap: bool,
+    /// How long a claimed row-range lease is held before it may be reclaimed.
+    ///
+    /// Must be at least three election timeouts: a batch lease has to outlive
+    /// one PCS election, or a leader change alone would let a second node
+    /// claim a range that is still being processed.
+    #[serde(default = "default_lease_ttl")]
+    pub lease_ttl_ms: u64,
     /// Raft election timeout in milliseconds.
     #[serde(default = "default_election_timeout")]
     pub election_timeout_ms: u64,
@@ -241,48 +251,31 @@ pub enum ServiceMode {
     },
 }
 
-/// Default TiKV key prefix for every key this store writes.
-fn default_tikv_key_prefix() -> String {
-    "pcs".to_string()
-}
-
-/// Default TiKV client operation timeout in milliseconds.
-fn default_tikv_timeout_ms() -> u64 {
-    10_000
-}
-
-/// Default claim lease TTL in milliseconds.
-fn default_tikv_lease_ttl_ms() -> u64 {
-    90_000
-}
-
 /// Persistent store declaration, tagged by `store`.
 ///
 /// ```kdl
-/// store "tikv" {
-///     pd_endpoints "127.0.0.1:2379"
-///     key_prefix "pcs-smoke"
+/// store "redb" {
+///     path "/var/lib/pcs/state.redb"
+///     batch_resume #true
 /// }
 /// ```
 ///
 /// With a `store` block present, the pipeline config is persisted to the
-/// store before the pipeline builds, stream-mode and cluster-mode resume
-/// state (processor priors and source cursors) is written back as work
-/// progresses, and the distributed runner in cluster mode is backed by the
-/// store. Interval/one-shot batch state carry is opt-in per store via
+/// store before the pipeline builds and stream-mode resume state (processor
+/// priors and source cursors) is written back as work progresses.
+/// Interval/one-shot batch state carry is opt-in per store via
 /// `batch_resume`.
+///
+/// This is standalone-mode persistence only: the file is local and
+/// unreplicated. Cluster mode takes no `store` block, because its
+/// application state is the raft-replicated `cluster-app.redb` under
+/// `node.data_dir`.
 #[derive(Debug, Clone, Serialize)]
 pub enum StoreConfig {
-    /// TiKV (raw kv client).
-    Tikv {
-        /// PD endpoints, one or several `host:port` strings.
-        pd_endpoints: Vec<String>,
-        /// Prefix for every key this store writes.
-        key_prefix: String,
-        /// Client operation timeout in milliseconds.
-        timeout_ms: u64,
-        /// Claim lease TTL in milliseconds.
-        lease_ttl_ms: u64,
+    /// A local embedded redb file.
+    Redb {
+        /// Path to the redb file. Created on first use.
+        path: PathBuf,
         /// Opt-in interval/one-shot processor state carry across iterations.
         batch_resume: bool,
     },
@@ -299,32 +292,22 @@ impl<'de> Deserialize<'de> for StoreConfig {
         // against the variant's shape.
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct TikvInner {
+        struct RedbInner {
             id: String,
-            #[serde(deserialize_with = "one_or_many")]
-            pd_endpoints: Vec<String>,
-            #[serde(default = "default_tikv_key_prefix")]
-            key_prefix: String,
-            #[serde(default = "default_tikv_timeout_ms")]
-            timeout_ms: u64,
-            #[serde(default = "default_tikv_lease_ttl_ms")]
-            lease_ttl_ms: u64,
+            path: PathBuf,
             #[serde(default)]
             batch_resume: bool,
         }
 
-        let inner = TikvInner::deserialize(deserializer)?;
-        if inner.id != "tikv" {
+        let inner = RedbInner::deserialize(deserializer)?;
+        if inner.id != "redb" {
             return Err(serde::de::Error::custom(format!(
-                "unknown store kind '{}' (expected \"tikv\")",
+                "unknown store kind '{}' (expected \"redb\")",
                 inner.id
             )));
         }
-        Ok(StoreConfig::Tikv {
-            pd_endpoints: inner.pd_endpoints,
-            key_prefix: inner.key_prefix,
-            timeout_ms: inner.timeout_ms,
-            lease_ttl_ms: inner.lease_ttl_ms,
+        Ok(StoreConfig::Redb {
+            path: inner.path,
             batch_resume: inner.batch_resume,
         })
     }
@@ -1540,6 +1523,14 @@ impl ServiceConfig {
                     "node id {node_id} is not listed in cluster.peers"
                 )));
             }
+
+            let min_lease = config.election_timeout_ms.saturating_mul(3);
+            if config.lease_ttl_ms < min_lease {
+                return Err(PcsError::configuration(format!(
+                    "lease_ttl_ms ({}) must be >= 3 × election_timeout_ms ({}) = {}",
+                    config.lease_ttl_ms, config.election_timeout_ms, min_lease,
+                )));
+            }
         }
 
         for wf in &self.workflows {
@@ -1637,9 +1628,8 @@ impl ServiceConfig {
             }
         }
 
-        // Persistent store validation. The feature gate is compile-time: a
-        // `store` block in a binary without `tikv-store` is a config error,
-        // not a silently ignored section.
+        // The HTTP bind address is validated before the store, so a config
+        // with both problems reports the listener first.
         if !self.http.disabled {
             SocketAddr::from_str(&self.http.bind).map_err(|e| {
                 PcsError::configuration(format!(
@@ -1649,64 +1639,23 @@ impl ServiceConfig {
             })?;
         }
 
-        // TiKV is the only cluster application-data store, so a cluster node
-        // without one has nowhere to claim partitions from. Checked after the
-        // workflow rules so a config with both problems reports the shape
-        // error first.
-        if matches!(self.mode, ServiceMode::Cluster { .. }) && self.store.is_none() {
+        // Cluster state lives in the raft-replicated `cluster-app.redb` under
+        // `node.data_dir`, so a `store` block there would name a second,
+        // unreplicated home for the same data. Checked after the workflow
+        // rules so a config with both problems reports the shape error first.
+        if matches!(self.mode, ServiceMode::Cluster { .. }) && self.store.is_some() {
             return Err(PcsError::configuration(
-                "mode \"cluster\" requires a `store \"tikv\"` block: TiKV is the only cluster \
-                 application-data store",
+                "mode \"cluster\" does not take a `store` block: cluster state lives in \
+                 node.data_dir",
             ));
         }
 
-        #[cfg(not(feature = "tikv-store"))]
-        if self.store.is_some() {
-            return Err(PcsError::configuration(
-                "config declares a `store` block, but this binary was built without \
-                 the `tikv-store` feature — rebuild with `--features tikv-store`",
-            ));
-        }
-        #[cfg(feature = "tikv-store")]
-        if let Some(StoreConfig::Tikv {
-            pd_endpoints,
-            key_prefix,
-            lease_ttl_ms,
-            ..
-        }) = &self.store
+        if let Some(StoreConfig::Redb { path, .. }) = &self.store
+            && path.as_os_str().is_empty()
         {
-            if pd_endpoints.is_empty() {
-                return Err(PcsError::configuration(
-                    "store tikv: pd_endpoints must not be empty",
-                ));
-            }
-            for ep in pd_endpoints {
-                let Some((host, port)) = ep.rsplit_once(':') else {
-                    return Err(PcsError::configuration(format!(
-                        "store tikv: invalid pd endpoint {ep} (expected host:port)"
-                    )));
-                };
-                if host.is_empty() || port.parse::<u16>().is_err() {
-                    return Err(PcsError::configuration(format!(
-                        "store tikv: invalid pd endpoint {ep} (expected host:port)"
-                    )));
-                }
-            }
-            if *lease_ttl_ms < 10_000 {
-                return Err(PcsError::configuration(format!(
-                    "store tikv: lease_ttl_ms ({lease_ttl_ms}) must be at least 10000"
-                )));
-            }
-            let valid_prefix = !key_prefix.is_empty()
-                && key_prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
-            if !valid_prefix {
-                return Err(PcsError::configuration(format!(
-                    "store tikv: key_prefix '{key_prefix}' must be non-empty and contain only \
-                     alphanumerics, '.', '_' or '-'"
-                )));
-            }
+            return Err(PcsError::configuration(
+                "store redb: path must not be empty",
+            ));
         }
         Ok(())
     }
@@ -1931,140 +1880,126 @@ node id=1 data_dir="/tmp/pcs"
         );
     }
 
-    /// A `store "tikv"` block parses into [`StoreConfig::Tikv`] with the
-    /// documented defaults, and validates when the `tikv-store` feature is
-    /// compiled in.
+    /// A `store "redb"` block parses into [`StoreConfig::Redb`] with
+    /// `batch_resume` defaulting to false.
     #[test]
-    #[cfg(feature = "tikv-store")]
-    fn test_store_tikv_parses_and_validates() {
+    fn test_store_redb_parses_and_validates() {
         let raw = format!(
             r#"
 mode "standalone"
 
 node id=1 data_dir="/tmp/pcs"
 
-store "tikv" {{
-    pd_endpoints "127.0.0.1:2379" "127.0.0.2:2379"
+store "redb" {{
+    path "/var/lib/pcs/state.redb"
 }}
 {TRIVIAL_WORKFLOW}
 "#
         );
         let cfg = parse(&raw).expect("parse");
         match &cfg.store {
-            Some(StoreConfig::Tikv {
-                pd_endpoints,
-                key_prefix,
-                timeout_ms,
-                lease_ttl_ms,
-                batch_resume,
-            }) => {
-                assert_eq!(pd_endpoints, &vec!["127.0.0.1:2379", "127.0.0.2:2379"]);
-                assert_eq!(key_prefix, &default_tikv_key_prefix());
-                assert_eq!(timeout_ms, &default_tikv_timeout_ms());
-                assert_eq!(lease_ttl_ms, &default_tikv_lease_ttl_ms());
+            Some(StoreConfig::Redb { path, batch_resume }) => {
+                assert_eq!(path, &PathBuf::from("/var/lib/pcs/state.redb"));
                 assert!(!batch_resume, "batch resume is opt-in, default false");
             }
-            other => panic!("expected a tikv store config, got {other:?}"),
+            other => panic!("expected a redb store config, got {other:?}"),
         }
         cfg.validate()
-            .expect("a well-formed tikv store should validate");
+            .expect("a well-formed redb store should validate");
     }
 
-    /// Without the `tikv-store` feature a `store` block is a configuration
-    /// error, not a silently ignored section.
+    /// `batch_resume` is read off the block when declared.
     #[test]
-    #[cfg(not(feature = "tikv-store"))]
-    fn test_store_block_rejected_without_feature() {
+    fn test_store_redb_batch_resume_opt_in() {
         let raw = format!(
             r#"
 mode "standalone"
 
 node id=1 data_dir="/tmp/pcs"
 
-store "tikv" {{
-    pd_endpoints "127.0.0.1:2379"
+store "redb" {{
+    path "state.redb"
+    batch_resume #true
 }}
 {TRIVIAL_WORKFLOW}
 "#
         );
         let cfg = parse(&raw).expect("parse");
+        assert!(matches!(
+            cfg.store,
+            Some(StoreConfig::Redb {
+                batch_resume: true,
+                ..
+            })
+        ));
+    }
+
+    /// Only `redb` is a known store kind, so any other tag is a parse error
+    /// rather than a store the service silently ignores.
+    #[test]
+    fn test_store_unknown_kind_is_a_parse_error() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "sqlite" {{
+    path "state.redb"
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let err = parse(&raw).expect_err("an unknown store kind must not parse");
+        assert!(
+            err.contains("unknown store kind"),
+            "error should name the kind: {err}"
+        );
+    }
+
+    /// `path` is required: a redb store with no file has nowhere to persist.
+    #[test]
+    fn test_store_redb_requires_path() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "redb" {{
+    batch_resume #true
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let err = parse(&raw).expect_err("a redb store without a path must not parse");
+        assert!(err.contains("path"), "error should name the field: {err}");
+    }
+
+    /// A declared but empty `path` parses and is caught by `validate`, which
+    /// is the only place that can tell an empty string from an absent key.
+    #[test]
+    fn test_store_redb_rejects_empty_path() {
+        let raw = format!(
+            r#"
+mode "standalone"
+
+node id=1 data_dir="/tmp/pcs"
+
+store "redb" {{
+    path ""
+}}
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("an empty path still parses");
         let err = cfg
             .validate()
-            .expect_err("store without the feature must fail");
+            .expect_err("an empty store path must not validate");
         assert!(
-            err.to_string().contains("tikv-store"),
-            "error should mention the missing feature: {err}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "tikv-store")]
-    fn test_store_tikv_rejects_bad_endpoint() {
-        let raw = format!(
-            r#"
-mode "standalone"
-
-node id=1 data_dir="/tmp/pcs"
-
-store "tikv" {{
-    pd_endpoints "127.0.0.1"
-}}
-{TRIVIAL_WORKFLOW}
-"#
-        );
-        let cfg = parse(&raw).expect("parse");
-        let err = cfg.validate().expect_err("a bare host must fail");
-        assert!(
-            err.to_string().contains("pd endpoint"),
-            "error should name the endpoint: {err}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "tikv-store")]
-    fn test_store_tikv_rejects_short_lease() {
-        let raw = format!(
-            r#"
-mode "standalone"
-
-node id=1 data_dir="/tmp/pcs"
-
-store "tikv" {{
-    pd_endpoints "127.0.0.1:2379"
-    lease_ttl_ms 5000
-}}
-{TRIVIAL_WORKFLOW}
-"#
-        );
-        let cfg = parse(&raw).expect("parse");
-        let err = cfg.validate().expect_err("a 5 s lease must fail");
-        assert!(
-            err.to_string().contains("lease_ttl_ms"),
-            "error should name the lease: {err}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "tikv-store")]
-    fn test_store_tikv_rejects_bad_prefix() {
-        let raw = format!(
-            r#"
-mode "standalone"
-
-node id=1 data_dir="/tmp/pcs"
-
-store "tikv" {{
-    pd_endpoints "127.0.0.1:2379"
-    key_prefix "pcs smoke"
-}}
-{TRIVIAL_WORKFLOW}
-"#
-        );
-        let cfg = parse(&raw).expect("parse");
-        let err = cfg.validate().expect_err("a prefix with a space must fail");
-        assert!(
-            err.to_string().contains("key_prefix"),
-            "error should name the prefix: {err}"
+            err.to_string()
+                .contains("store redb: path must not be empty"),
+            "error should name the empty path: {err}"
         );
     }
 
@@ -2156,11 +2091,11 @@ peer id=2 addr="127.0.0.2:9000"
         );
     }
 
-    /// Cluster mode has no local application store, so a config without a
-    /// `store "tikv"` block is rejected.
+    /// Cluster state lives in `node.data_dir`, so a `store` block there names
+    /// a second home for the same data and is rejected.
     #[cfg(feature = "wasm")]
     #[test]
-    fn test_cluster_without_store_rejected() {
+    fn test_cluster_with_store_block_rejected() {
         let raw = r#"
 mode "cluster"
 bootstrap #true
@@ -2168,6 +2103,10 @@ bootstrap #true
 node id=1 data_dir="/tmp/pcs"
 
 peer id=1 addr="127.0.0.1:9000"
+
+store "redb" {
+    path "/tmp/pcs-state.redb"
+}
 
 workflow "w" {
     wasm "p" module="p.wasm"
@@ -2176,17 +2115,17 @@ workflow "w" {
         let cfg = parse(raw).expect("parse should succeed");
         let err = cfg
             .validate()
-            .expect_err("cluster mode needs a store block");
+            .expect_err("cluster mode must refuse a store block");
         assert!(
-            err.to_string().contains("store \"tikv\""),
-            "error should name the required store block: {err}"
+            err.to_string().contains("does not take a `store` block"),
+            "error should name the rejected block: {err}"
         );
     }
 
-    /// The same config with a `store "tikv"` block validates.
-    #[cfg(all(feature = "wasm", feature = "tikv-store"))]
+    /// The same config without one validates.
+    #[cfg(feature = "wasm")]
     #[test]
-    fn test_cluster_with_tikv_store_validates() {
+    fn test_cluster_without_store_validates() {
         let raw = r#"
 mode "cluster"
 bootstrap #true
@@ -2195,17 +2134,37 @@ node id=1 data_dir="/tmp/pcs"
 
 peer id=1 addr="127.0.0.1:9000"
 
-store "tikv" {
-    pd_endpoints "127.0.0.1:2379"
-}
-
 workflow "w" {
     wasm "p" module="p.wasm"
 }
 "#;
         let cfg = parse(raw).expect("parse should succeed");
         cfg.validate()
-            .expect("a cluster config with a tikv store validates");
+            .expect("a cluster config with no store block validates");
+    }
+
+    /// A batch lease has to outlive one election, or a leader change alone
+    /// would let a second node claim a range still being processed.
+    #[test]
+    fn test_cluster_insufficient_lease_ttl_rejected() {
+        let raw = format!(
+            r#"
+mode "cluster"
+lease_ttl_ms 1000
+election_timeout_ms 1000
+
+node id=1 data_dir="/tmp/pcs"
+
+peer id=1 addr="127.0.0.1:9000"
+{TRIVIAL_WORKFLOW}
+"#
+        );
+        let cfg = parse(&raw).expect("parse should succeed");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("lease_ttl_ms"),
+            "error should mention lease_ttl_ms: {err}"
+        );
     }
 
     #[test]

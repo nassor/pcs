@@ -453,10 +453,8 @@ column swaps. Run the shipped example to see it:
 cargo run -p pcs-service --example scheduler_etl
 ```
 
-Runs the same on all three platforms. The example is a `pcs-service` target,
-so it compiles the crate's dev-dependencies; `raft-proto` in that set has a
-build script that needs `protoc` on PATH (see AGENTS.md). The visible result
-is the transaction report and the derived stage layout:
+Runs the same on all three platforms. The visible result is the transaction
+report and the derived stage layout:
 
 ```text,name=Expected ETL output
 Starting ETL pipeline...

@@ -28,7 +28,7 @@ defaults.
 | `node` | `id`, optional `name`, `data_dir` | required |
 | `run_mode` | how a standalone run paces itself | `kind="continuous"` |
 | `workflow` | the graph: transformers, sources, processors, sinks, links | required |
-| `store` | the persistent store: a `store "tikv"` block | none, required in cluster mode |
+| `store` | standalone persistence: a `store "redb"` block | none |
 | `http` | the control-plane address, or `disabled` | `bind="0.0.0.0:8080"` |
 | `observability` | log format and level, OTLP export, the inspector | pretty at `info`, capture on |
 | `variables` | names usable as `${name}` anywhere in the file | none |
@@ -340,54 +340,75 @@ waterfall. Levels per span name are in [Observability](@/service/observability.m
 
 ## The store block
 
-One `store "tikv"` block names the TiKV the process talks to. It needs a binary
-built with `--features tikv-store`; a `store` block without it is a refusal, not
-an ignored section.
+One `store "redb"` block declares the local file the process persists to.
+`redb` is the only store kind, and any other id fails the parse:
+`unknown store kind 'sqlite' (expected "redb")`. No extra feature is needed,
+because `service` implies `distributed`, which carries redb.
 
 ```kdl,name=The store block
-store "tikv" {
-    // One or several PD endpoints, host:port.
-    pd_endpoints "10.0.0.1:2379" "10.0.0.2:2379"
-    key_prefix "pcs"       // alphanumerics, '.', '_' and '-'; default "pcs"
-    timeout_ms 10000       // per-operation client timeout
-    lease_ttl_ms 90000     // claim lease TTL, at least 10000
-    batch_resume #false    // carry processor state across interval and one_shot runs
+store "redb" {
+    // Required. The redb file, created on first use.
+    path "/var/lib/pcs/state.redb"
+
+    // Carry processor state across interval and one_shot iterations.
+    // Default #false.
+    batch_resume #true
 }
 ```
 
-What it holds depends on the mode. Standalone and stream runs persist source
-cursors and processor priors, so a restart resumes instead of replaying from the
-start. Stream mode always writes them back as items flow; interval and one-shot
-runs only when `batch_resume #true`. Cluster mode adds the partitions, the
-claims and the checkpoints, which is why `mode "cluster"` refuses to start
-without this block.
+The file holds three tables: the raw pre-substitution config bytes, one
+processor prior per workflow node, and one cursor per source. Stream mode
+writes priors and cursors back as items flow. Interval and one-shot runs thread
+the prior into the next iteration only with `batch_resume #true`.
 
-`key_prefix` is the whole isolation boundary. Two deployments sharing one TiKV
-stay apart by choosing different prefixes. The PD endpoints must be non-empty
-`host:port` pairs, and `lease_ttl_ms` must be at least 10000.
+The file is local and unreplicated, and the block is standalone persistence
+only. `mode "cluster"` takes no `store` block, and a declared `path` must not
+be empty. Both are refusals from `validate`:
+
+```text,name=What validate refuses about a store block
+mode "cluster" does not take a `store` block: cluster state lives in node.data_dir
+store redb: path must not be empty
+```
 
 ## The cluster header
 
-In cluster mode the top of the document changes: drop `run_mode`, add the Raft
-timings and the peer list, and declare the store.
+In cluster mode the top of the document changes: drop `run_mode`, add the raft
+timings and the peer list. There is no `store` block, because cluster state
+lives in `node.data_dir`.
 
 ```kdl,name=The cluster header
 mode "cluster"
 bootstrap #true              // true on exactly one node, on first bring-up only
+lease_ttl_ms 30000
 election_timeout_ms 1500
 heartbeat_interval_ms 300
 snapshot_log_interval 10000  // compact the raft log every N applied entries
 
 // Every member, including this node. node id must appear here.
-// addr is the Raft transport address, not the HTTP control-plane port.
+// addr is the raft transport address, not the HTTP control-plane port.
 peer id=1 addr="10.0.0.1:9000"
 peer id=2 addr="10.0.0.2:9000"
 peer id=3 addr="10.0.0.3:9000"
 ```
 
-These timings drive elections, not claims. The claim lease is
-`store "tikv" { lease_ttl_ms }`, and it is the only lease knob. Peers must be
-unique, at least one, and include `node.id`.
+| Key | Default | Meaning |
+|---|---|---|
+| `bootstrap` | `#false` | bootstrap a fresh cluster when `data_dir` is empty; `#false` on a node that joins an existing one |
+| `lease_ttl_ms` | 30000 | how long a claimed row-range lease is held before it may be reclaimed |
+| `election_timeout_ms` | 1500 | raft election timeout in milliseconds |
+| `heartbeat_interval_ms` | 300 | raft heartbeat interval in milliseconds |
+| `snapshot_log_interval` | 10000 | compact the raft log every N applied log entries |
+
+`lease_ttl_ms` is the row-range claim lease, and it is the only lease knob. It
+must be at least three election timeouts, or a leader change alone would let a
+second node claim a range that is still being processed:
+
+```text,name=What validate refuses about a short lease
+lease_ttl_ms (1000) must be >= 3 × election_timeout_ms (1000) = 3000
+```
+
+Peers must be unique, at least one, and include `node.id`. Cluster mode
+declares exactly one workflow.
 
 The workflow that follows carries exactly one `wasm` or `plugin` node and no
 `source`, `sink` or `link`. `validate` reports `mode: cluster` once the header is
@@ -402,8 +423,8 @@ binary:
 - `service` registers no source, sink or format by itself. Each `connector-*`
   feature adds one connector, each `transformer-*` one byte format, and all of
   them imply `service` plus `inspector`.
-- `service-cluster` is `service` plus `distributed-raft`. `mode "cluster"` needs
-  it and `tikv-store` together.
+- `service-cluster` is `service` plus `distributed-raft`, which itself implies
+  `distributed`. `mode "cluster"` needs `service-cluster` and nothing else.
 - Neither implies `wasm`; `plugin` is its own feature.
 
 <div class="note note-warn">
@@ -425,10 +446,23 @@ cargo build --release -p pcs-service --bin pcs-service \
 # Same, plus cluster mode.
 cargo build --release -p pcs-service --bin pcs-service \
   --no-default-features \
-  --features mimalloc,service-cluster,tikv-store,connector-file,transformer-csv,wasm
+  --features mimalloc,service-cluster,connector-file,transformer-csv,wasm
 ```
 
-Runs the same on Linux, macOS and Windows (PowerShell):
+Windows (PowerShell):
+
+```powershell
+# Single node, WASM pipelines, CSV in and out.
+cargo build --release -p pcs-service --bin pcs-service `
+  --no-default-features --features mimalloc,connector-file,transformer-csv,wasm
+
+# Same, plus cluster mode.
+cargo build --release -p pcs-service --bin pcs-service `
+  --no-default-features `
+  --features mimalloc,service-cluster,connector-file,transformer-csv,wasm
+```
+
+The full default build runs the same on Linux, macOS and Windows (PowerShell):
 
     cargo build --release -p pcs-service --bin pcs-service
 
@@ -503,7 +537,7 @@ about your component is touched until gate 2.
             <text class="t-lbl t-ctl" x="448" y="59">rejects</text>
             <text class="t-sm" x="448" y="80">a link into a source</text>
             <text class="t-sm" x="448" y="94">a duplicate node id</text>
-            <text class="t-sm" x="448" y="108">cluster with no store</text>
+            <text class="t-sm" x="448" y="108">a store block in cluster mode</text>
         </g>
         <path class="arw arw-bnd" d="M215 120 V132" marker-end="url(#svc-b)"/>
         <g class="anim anim-2">
@@ -541,7 +575,7 @@ about your component is touched until gate 2.
             <text class="t-lbl t-data" x="12" y="335">4 &nbsp;validate_schema_fingerprint</text>
             <text class="t-sm" x="12" y="356">the processor's Arrow schema fingerprint against the one</text>
             <text class="t-sm" x="12" y="370">written into this node's persisted checkpoints</text>
-            <text class="t-sm" x="12" y="384">cluster mode only: inside run_cluster, once TiKV answers</text>
+            <text class="t-sm" x="12" y="384">cluster mode only: inside run_cluster, once raft settles</text>
             <text class="t-lbl t-data" x="448" y="335">rejects</text>
             <text class="t-sm" x="448" y="356">a schema change laid</text>
             <text class="t-sm" x="448" y="370">on top of checkpoints</text>

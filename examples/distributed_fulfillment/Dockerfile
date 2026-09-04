@@ -26,7 +26,7 @@ COPY xtask ./xtask
 RUN cargo build \
     -p pcs-service \
     --example distributed_fulfillment \
-    --features service-cluster,tikv-store \
+    --features service-cluster \
     --release
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────

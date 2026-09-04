@@ -24,7 +24,7 @@
 //!   processor state survives across items even though the WASM store does
 //!   not. One blob per processor node; the blobs live in loop memory and, with
 //!   no store configured, are never checkpointed, so they are lost on
-//!   restart. With a `store "tikv" { … }` block, priors and source cursors
+//!   restart. With a `store "redb" { … }` block, priors and source cursors
 //!   persist between runs and a restarted service resumes from its last save
 //!   point.
 //! - **At-most-once.** An item whose processor call fails drops that
@@ -53,8 +53,8 @@ use pcs_core::io::source::Source;
 use pcs_core::runtime::PipelineRuntime;
 
 use super::builder::{BuiltNodeKind, BuiltService};
+use super::redb_state::{RedbStateClient, SourceCursorMeta};
 use super::standalone::{NodeRunStats, StandaloneStats};
-use super::tikv_state::{SourceCursorMeta, TikvStateClient};
 #[cfg(feature = "windows")]
 use super::windowing::WindowTracker;
 
@@ -118,7 +118,7 @@ pub async fn run_stream(
     built: BuiltService,
     cancel: CancellationToken,
     live_stats: Option<Arc<RwLock<StandaloneStats>>>,
-    tikv: Option<Arc<TikvStateClient>>,
+    state: Option<Arc<RedbStateClient>>,
 ) -> Result<StandaloneStats, PcsError> {
     let source_count = built
         .nodes
@@ -215,10 +215,10 @@ pub async fn run_stream(
     let mut items_per_source: Vec<u64> = vec![0; n];
 
     // Resume persisted state when a store is configured: processor priors
-    // and source cursors come back from TiKV so a restart continues from the
-    // last save point. Errors abort startup — a store that cannot be read
-    // must not silently restart from zero.
-    if let Some(client) = &tikv {
+    // and source cursors come back from the redb file so a restart continues
+    // from the last save point. Errors abort startup — a store that cannot be
+    // read must not silently restart from zero.
+    if let Some(client) = &state {
         for i in 0..n {
             if matches!(kinds[i], NodeRunKind::Processor) {
                 prior[i] = client.load_prior(&workflow_id, &ids[i]).await?;
@@ -393,7 +393,7 @@ pub async fn run_stream(
         // effort: memory stays authoritative and an at-least-once source
         // covers a missed write with one replay.
         items_per_source[source_index] += 1;
-        if let Some(client) = &tikv {
+        if let Some(client) = &state {
             let meta = SourceCursorMeta {
                 items_processed: items_per_source[source_index],
                 last_batch_at_ms: wall_clock_ms(),
@@ -532,7 +532,7 @@ pub async fn run_stream(
                             // means the processor carries no state, so it
                             // must clear `prior` too.
                             prior[i] = out.state;
-                            if let Some(client) = &tikv {
+                            if let Some(client) = &state {
                                 let result = match &prior[i] {
                                     Some(blob) => {
                                         client.save_prior(&workflow_id, &ids[i], blob).await

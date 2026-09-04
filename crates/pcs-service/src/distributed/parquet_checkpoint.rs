@@ -13,8 +13,8 @@
 //! - Long-lived cold storage that outlives a single pipeline run.
 //!
 //! Live distributed operation needs crash recovery and at-least-once semantics, so
-//! there the TiKV shared store is the primary store and this one is only an
-//! archival sink.
+//! there [`RedbSharedStore`](crate::distributed::RedbSharedStore) is the primary
+//! store and this one is only an archival sink.
 //!
 //! ## Limitations
 //!

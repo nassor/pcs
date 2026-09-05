@@ -199,6 +199,28 @@
 //!   once. The comparison is on decoded rows, not bytes, because an Avro
 //!   container file carries a random sync marker.
 //!
+//! # What a green matrix does not claim
+//!
+//! Two properties are outside what any case here can observe, so a pass is
+//! silent about both.
+//!
+//! - **The bytes a format writes.** [`read_back`] decodes a `file`, `http` or
+//!   `tcp` sink through the same [`Transformer`] the sink wrote with, and
+//!   reads a `kafka`, `nats` or `s3` sink back through the sibling source
+//!   connector. Only the `postgresql` readback goes around the connector, in
+//!   SQL. A change that corrupts a format symmetrically therefore cancels out:
+//!   every case round-trips its rows while the file on disk, the object, the
+//!   message and the frame are all in the wrong format. What a transformer
+//!   emits is pinned by that transformer's own unit tests. This matrix pins
+//!   that a connector pair can carry rows through it.
+//! - **Where a build refusal went.** [`execute`] derives `build_only` from
+//!   [`Case::expect`], so a [`Site::Build`] case resolves placeholder
+//!   endpoints, seeds nothing and returns as soon as `build_all` succeeds. It
+//!   reports that the refusal is gone and cannot distinguish a combination
+//!   that is now supported from one that is now refused at run. The other
+//!   direction is exact: a [`Site::Run`] case whose build fails reports the
+//!   build message it did not expect.
+//!
 //! # What the config has to carry for a `channel` end
 //!
 //! `ServiceConfig::validate` pairs every channel name's `ChannelSink` with its
@@ -911,9 +933,16 @@ impl Case {
         };
 
         // The node's own `config` is deserialized before anything else, and
-        // `PgFieldType` has no unsigned variant to hold `Ping.seq`.
+        // `PgFieldType` has no unsigned variant to hold `Ping.seq`. The
+        // fragment is serde's own unknown-variant wording rather than the type
+        // name alone: `is_cursor_capable` refuses the same column with a
+        // message that also carries `uint64`, so the bare name would be
+        // satisfied by a refusal from a different check.
         if connector == Connector::Postgresql && self.row() == RowKind::Ping {
-            return rejected("PgFieldType has no unsigned variant", "uint64");
+            return rejected(
+                "PgFieldType has no unsigned variant",
+                "unknown variant `uint64`",
+            );
         }
         if connector.surface() == Surface::Rows {
             return None;
@@ -1112,11 +1141,9 @@ impl Report {
             "source", "sink", "transformer", "runtime", "outcome", "site", "elapsed"
         );
         for report in &self.cases {
-            // A failed case's detail carries the whole config it ran, and the
-            // table is one line per case: printing all of it here buries the
-            // grids and the totals under a config per failure and leaves no
-            // readable table at all. The failure list `full_matrix` builds
-            // prints the rest.
+            // One line per case: a failed case's detail also carries the whole
+            // config it ran, which the failure list in `full_matrix` prints in
+            // full.
             println!(
                 "{:<12} {:<12} {:<10} {:<8} {:<10} {:<8} {:>8.1?}  {}",
                 report.case.source.label(),
@@ -2929,9 +2956,16 @@ pub async fn run_case(
         .await
         .unwrap_or_else(|_| Err(format!("timed out after {CASE_BUDGET:?}")));
     let (outcome, detail) = match result {
-        Ok(()) => match &expect {
+        Ok(refusal) => match &expect {
             Expect::Supported => (Outcome::Supported, String::new()),
-            Expect::Rejected { reason, .. } => (Outcome::Rejected, (*reason).to_string()),
+            // The message is carried, not just the predicted reason: a
+            // fragment is a substring test, so a refusal that drifted to a
+            // different check can still satisfy it. The report is where that
+            // shows, because the case itself still passes.
+            Expect::Rejected { reason, .. } if refusal.is_empty() => {
+                (Outcome::Rejected, (*reason).to_string())
+            }
+            Expect::Rejected { reason, .. } => (Outcome::Rejected, format!("{reason}: {refusal}")),
         },
         Err(detail) => (Outcome::Failed, detail),
     };
@@ -2948,14 +2982,14 @@ pub async fn run_case(
     }
 }
 
-/// `Ok(())` when the case met its expectation; `Err` describes what it did
-/// instead.
+/// The refusal message a rejected case matched, empty for a supported one;
+/// `Err` describes what the case did instead of meeting its expectation.
 async fn execute(
     case: Case,
     expect: &Expect,
     resources: &Resources,
     fixtures: &Fixtures,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let row = case.row();
     let build_only = matches!(
         expect,
@@ -3089,7 +3123,7 @@ async fn execute(
                      \n--- config ---\n{raw}"
                 ));
             }
-            Ok(())
+            Ok(String::new())
         }
         Expect::Rejected {
             site,
@@ -3118,7 +3152,7 @@ async fn execute(
                         .ok_or("a run refusal naming a fragment needs a source probe")?;
                     let message = probe.refusal().await?;
                     if message.contains(fragment) {
-                        Ok(())
+                        Ok(message)
                     } else {
                         Err(format!(
                             "refused at run for the wrong reason: expected {reason:?} \
@@ -3127,15 +3161,18 @@ async fn execute(
                         ))
                     }
                 }
-                Site::Run => Ok(()),
+                // The site alone is the assertion, and the runner kept no
+                // message to report.
+                Site::Run => Ok(String::new()),
             }
         }
     }
 }
 
 /// A build-time error is the answer only when the case expected one, with the
-/// message the capability table predicted.
-fn check_build_refusal(expect: &Expect, message: &str, raw: &str) -> Result<(), String> {
+/// message the capability table predicted. The matched message is returned so
+/// the report can print what actually refused the case.
+fn check_build_refusal(expect: &Expect, message: &str, raw: &str) -> Result<String, String> {
     match expect {
         Expect::Rejected {
             site: Site::Build,
@@ -3143,7 +3180,7 @@ fn check_build_refusal(expect: &Expect, message: &str, raw: &str) -> Result<(), 
             reason,
         } => {
             if message.contains(fragment) {
-                Ok(())
+                Ok(message.to_string())
             } else {
                 Err(format!(
                     "refused at build for the wrong reason: expected {reason:?} \

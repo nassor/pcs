@@ -611,15 +611,16 @@ async fn tcp_rst_does_not_cause_divergence() -> anyhow::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Remove fault and let the cluster heal. The window must exceed the
-    // transport's 30s circuit-open duration: the RST storm trips the leader's
-    // per-peer circuit breaker (5 consecutive send failures), so it fast-fails
-    // every send to the follower for 30s, and while the follower's log is one
-    // entry behind, raft's up-to-date vote restriction blocks it from winning
-    // an election, so it can only catch up once the circuit half-opens.
-    // Observed once: 'applied indices did not converge: [Some(2), Some(1),
-    // Some(2)], term=76 leaderless' after 34.8s, a 30s window that exactly
-    // matched the circuit-open duration.
+    // Remove the fault and let the cluster heal. The budget covers the
+    // leader's own recovery, not just the network's: a reset_peer toxic lets
+    // the connect through and kills the stream after it, so the RST storm
+    // reaches the leader's per-peer circuit-open threshold, every send to the
+    // follower fast-fails for the 2s window, and the next real attempt waits
+    // out the openraft backoff step that fast-fail consumed, up to 12s more.
+    // The follower cannot shortcut that: one entry behind, raft's up-to-date
+    // vote restriction blocks it from winning an election, so it catches up
+    // only when a send from the leader gets through. The rest of the 60s is
+    // room for the re-election a mid-storm step-down costs.
     harness.toxiproxy().reset()?;
     harness.await_convergence(Duration::from_secs(60)).await?;
 

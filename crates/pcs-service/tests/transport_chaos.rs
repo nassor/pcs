@@ -225,17 +225,14 @@ async fn limit_data_truncated_frame_errors_not_panic() -> anyhow::Result<()> {
     // every node agrees on one applied index once the toxic clears. A
     // re-election during the disruption is an acceptable outcome.
     //
-    // The wait must exceed the transport's 30s circuit-open duration: a
-    // truncated replication can leave the faulted follower with an empty log,
-    // and its higher-term campaigns keep stepping down the majority's
-    // elections — raft's up-to-date vote restriction blocks the empty-log node
-    // from winning, and the deterministic 400ms election timeout synchronizes
-    // every node's retries — so the cluster can stay leaderless until
-    // reconnection succeeds. Observed once: 'timed out waiting for Raft leader
-    // election; per-node state: [node1: Follower term=53 applied=0 last_log=0
-    // leader=None; node2: Follower term=53 applied=1 last_log=1 leader=None;
-    // node3: Follower term=53 applied=1 last_log=1 leader=None]' with a 15s
-    // wait.
+    // The wait covers several leaderless election rounds: a truncated
+    // replication can leave the faulted follower with an empty log, and its
+    // higher-term campaigns keep stepping down the majority's elections.
+    // Raft's up-to-date vote restriction blocks the empty-log node from
+    // winning, so the cluster can stay leaderless until a full replication
+    // round reaches it. Reaching it waits on the transport's 2s circuit-open
+    // window, and behind that on openraft's backoff once enough consecutive
+    // failures engage it, up to 12s at its cap.
     await_leader_within(&harness, Duration::from_secs(45)).await?;
     harness.await_convergence(Duration::from_secs(30)).await?;
 

@@ -134,7 +134,9 @@ struct PeerPool {
     /// names such as `"node2:9002"` work without a pre-boot DNS lookup.
     addr: String,
     idle: Mutex<VecDeque<PooledStream>>,
-    /// Per-peer circuit breaker; keeps `acquire` from hammering a dead peer.
+    /// Per-peer circuit breaker. Counts only failures on an *established*
+    /// stream (see [`PeerPool::record_failure`]); a failed connect propagates
+    /// as `Unreachable` and is paced by openraft's own backoff instead.
     circuit: Mutex<CircuitState>,
 }
 
@@ -213,6 +215,9 @@ impl PeerPool {
     }
 
     /// Record a failed RPC against this peer; may open the circuit.
+    ///
+    /// Only reached once a stream is in hand, so a refused or timed-out
+    /// connect never counts towards [`CIRCUIT_OPEN_THRESHOLD`].
     async fn record_failure(&self) {
         self.circuit.lock().await.record_failure();
     }

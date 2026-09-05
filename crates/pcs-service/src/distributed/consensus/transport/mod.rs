@@ -134,13 +134,44 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(feature = "distributed-raft")]
 const MAX_SNAPSHOT_CHUNK_BYTES: usize = SNAPSHOT_CHUNK_BYTES; // 4 MiB
 
-/// Number of consecutive RPC failures before a per-peer circuit opens.
+/// Number of consecutive failed RPCs on an established stream before a
+/// per-peer circuit opens.
+///
+/// A refused or timed-out connect never counts: it leaves
+/// `PeerPool::acquire` before a stream exists, surfaces as
+/// [`RPCError::Unreachable`](openraft::error::RPCError), and is paced by
+/// openraft's backoff instead.
 #[cfg(feature = "distributed-raft")]
 const CIRCUIT_OPEN_THRESHOLD: u32 = 5;
 
-/// Duration a circuit stays open before allowing a retry attempt.
+/// Duration a circuit stays open before the next attempt is let through.
+///
+/// openraft drives replication one heartbeat apart, so a peer that accepts
+/// connections but fails every RPC on them reaches
+/// [`CIRCUIT_OPEN_THRESHOLD`] within a few hundred milliseconds. The window
+/// is not the whole recovery bound. `PeerPool::acquire` reports its fast-fail
+/// to openraft as a `Network` error, and openraft throttles replication once
+/// the accumulated rank of consecutive errors passes its threshold, so a
+/// short burst of fast-fails engages that target's
+/// [`Backoff`](openraft::network::Backoff) ramp (`TcpNetwork::backoff`:
+/// 100 ms doubling to a 10 s cap, plus up to 20% jitter) and every fast-fail
+/// after it costs a step. A peer whose network has already healed therefore
+/// waits for the window to elapse and then for the next backoff step to come
+/// due, up to 12 s beyond it.
+///
+/// 2 s keeps that total inside the same order as Raft's own timescale, which
+/// runs a 50 ms heartbeat and a 150 to 300 ms election timeout
+/// ([`ArrowRaftDriverConfig`](crate::distributed::consensus::ArrowRaftDriverConfig)).
+/// A window of tens of seconds instead strands an already-recovered follower
+/// for tens of seconds, long enough to outlast a whole election and every
+/// commit in it. The flat shape is deliberate: openraft owns the exponential
+/// ramp per target, and a growing window here would compound with it and
+/// stretch recovery for exactly the peer that just came back.
+///
+/// The price of a short window is a flapping peer, which draws a fresh burst
+/// of [`CIRCUIT_OPEN_THRESHOLD`] failed RPCs every 2 s.
 #[cfg(feature = "distributed-raft")]
-const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(30);
+const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(2);
 
 /// Fine-grained transport error, mapped to the appropriate openraft error type.
 ///
@@ -179,9 +210,13 @@ pub enum TransportError {
 
 #[cfg(feature = "distributed-raft")]
 impl TransportError {
-    /// Map to openraft `RPCError`. Connect failures and encode errors surface as
-    /// `Unreachable`, which makes openraft back off; everything else is `Network`,
-    /// transient with an immediate retry.
+    /// Map to openraft `RPCError`. Connect failures and encode errors surface
+    /// as `Unreachable`, everything else as `Network`, a fault on a live
+    /// stream. openraft weights the two: replication throttles once the
+    /// accumulated rank of consecutive errors passes 20, and `Unreachable`
+    /// counts 100 against `Network`'s 2, so an unreachable peer is paced from
+    /// its first error while a live-stream fault takes eleven in a row. Any
+    /// success clears the rank.
     pub fn into_rpc_error(self) -> RPCError<PcsTypeConfig> {
         match self {
             TransportError::ConnectFailed(e) => {

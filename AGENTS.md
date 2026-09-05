@@ -304,7 +304,8 @@ crates/
 │                            # crates/pcs-service/assets/ui/, rebuilt by `cargo xtask ui`.
 ├── pcs-transformer/           # The byte-format contract: Transformer, BatchReader, BatchWriter,
 │                              # MessageDecoder, TransformerFactory, TransformerRegistry.
-├── pcs-transformer-arrow-ipc/ # ArrowIpcTransformer: PerBatch messages only, no stream surface.
+├── pcs-transformer-arrow-ipc/ # ArrowIpcTransformer: stream read and write plus PerBatch
+│                              # messages, both over the same Arrow IPC stream encapsulation.
 ├── pcs-transformer-avro/      # AvroTransformer: object container files plus PerRow messages,
 │                              # framed single-object or Confluent. Options compression, schema_id.
 ├── pcs-transformer-csv/       # CsvTransformer: stream read and write. Option has_headers.

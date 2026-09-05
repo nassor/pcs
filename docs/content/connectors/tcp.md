@@ -29,8 +29,8 @@ only, so a `tcp` sink runs in every run mode.
 
 The listener socket is bound inside the source's constructor, which also opens a message decoder
 off the declared schema, so a busy port, a bad address, or a format with no message decoder fails
-at config time rather than on the first batch. The sink resolves its address there too, and dials
-on the first batch.
+at config time rather than on the first batch. The sink resolves its address there too and refuses
+a format that declares no message shape, then dials on the first batch.
 
 ## In Rust
 
@@ -133,26 +133,6 @@ running. Each one is logged: `TcpIngestSource: oversized frame, closing connecti
 batch` and `TcpIngestSource: bad frame, closing connection`. A schema mismatch arrives inside the
 last of those, as `arrow-ipc: received batch with schema {:?}, expected {:?}`.
 
-## Sharp edge: the sink's missing message encoder waits for the first batch
-
-<div class="note note-warn">
-<span class="note-label">Sharp edge</span>
-<p>
-The source settles this while it builds: <code>TcpIngestSource::new</code> opens a message decoder
-off the declared schema, so a <code>csv</code> transformer fails
-<code>pcs-service validate</code> with
-<code>format 'csv' does not support decoding discrete messages</code> rather than accepting
-connections it can only close. The sink cannot ask the same question:
-<code>encode_messages</code> needs a batch to encode, and the one question available while
-building, <code>message_shape</code>, is a declaration an encoder may omit, so gating on it would
-refuse a working sink. <code>TcpSink::connect</code> therefore takes the transformer and nothing
-more, and a <code>csv</code> sink builds and fails its first write with
-<code>format 'csv' does not support encoding discrete messages</code>. That batch is lost and the
-run reports a non-fatal error. A <code>transformer</code> node naming a format no transformer is
-registered for still fails at build.
-</p>
-</div>
-
 ## Sharp edge: the sink dials late and never redials
 
 <div class="note note-warn">
@@ -176,6 +156,7 @@ that same socket.
 | `tcp moves bytes and needs a 'transformer' key naming a declared transformer` | the shared context, when the node declared none |
 | `format '{format}' does not support decoding discrete messages` | the source's constructor, for a format with no message decoder |
 | `TcpIngestSource: cannot bind '{bind}': {e}` | binding the listener |
+| `TcpSink: format '{format}' has no message codec` | the sink's constructor, for a format with no message surface |
 | `TcpSink: cannot resolve 'connect' address '{connect}': {e}` | resolving the sink's address at build |
 | `TcpSink: 'connect' address '{connect}' resolved to no address` | the same, when resolution yields nothing |
 | `TcpSink: cannot connect to {peer}: {e}` | the first batch's dial |

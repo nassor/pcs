@@ -66,7 +66,7 @@
 //! | `file` | stream | `pcs-connector-file/src/{source,sink}.rs` call `open_reader`/`open_writer` |
 //! | `http` | stream | `pcs-connector-http/src/{source,sink}.rs` spool a whole document |
 //! | `s3` | stream | `pcs-connector-s3/src/{source,sink}.rs` spool one object |
-//! | `tcp` | message | `pcs-connector-tcp/src/{source,sink}.rs` call `open_message_decoder`/`encode_messages` |
+//! | `tcp` | message | `pcs-connector-tcp/src/{source,sink}.rs` call `open_message_decoder`/`encode_messages`, the sink behind a `message_shape` gate |
 //! | `kafka` | message | `pcs-connector-kafka/src/{source,sink}.rs`, plus a `message_shape` gate |
 //! | `nats` | message | `pcs-connector-nats/src/{source,sink}.rs`, plus a `message_shape` gate |
 //!
@@ -118,7 +118,7 @@
 //! | a stream-less format on an `s3` **source** | run | the seeded object is real, so the drain reaches `open_reader` and the format refuses to open one |
 //! | a stream-less format on an `s3` **sink** | run | it encodes per batch, so nothing touches the format while building |
 //! | `csv`/`parquet` on a `kafka`/`nats` node | build | explicit `message_shape().is_none()` gate in `new` |
-//! | `csv`/`parquet` on a `tcp` **sink** | run | `encode_messages` needs a batch, and `message_shape` is a declaration a working encoder may omit, so `TcpSink::connect` asks nothing; the first write does |
+//! | `csv`/`parquet` on a `tcp` **sink** | build | `message_shape().is_none()` gate in `TcpSink::connect`: there is no encoder to open, and the declaration is the whole answer for every batch |
 //! | `csv`/`parquet` on a `tcp` **source** | build | `open_message_decoder` needs only the declared schema, so `TcpIngestSource::new` opens one and hands the refusal back |
 //! | `avro` + WASM on a `file` source | build | the container file's `Int64` disagrees with `Ping.seq` |
 //! | `avro` + WASM on an `http`/`s3` source | run | the `schema_from` cross-check compares the stream's `Int64` against `Ping.seq` at drain time |
@@ -932,21 +932,20 @@ impl Case {
             Connector::Kafka | Connector::Nats => {
                 rejected("the format has no message codec", "no message codec")
             }
-            // The source asks the transformer for the exact capability it
-            // needs: `open_message_decoder` takes only the declared schema, so
-            // `TcpIngestSource::new` opens one and hands the refusal back. The
-            // sink cannot do the same. `encode_messages` needs a batch, and
-            // the one question it could ask while building, `message_shape`,
-            // is a declaration rather than the capability: this crate's own
-            // `NoMessages` test transformer (`tcp/src/sink.rs`) encodes
-            // messages without declaring a shape, so gating on it would refuse
-            // a sink that works. `TcpSink` therefore refuses on the first
-            // write, where the runner counts and reports it.
+            // Both halves settle the format while building, each through the
+            // question its own direction admits. The source asks for the exact
+            // capability it needs: `open_message_decoder` takes only the
+            // declared schema, so `TcpIngestSource::new` opens one and hands
+            // the refusal back. The sink has no encoder to open, because
+            // `encode_messages` is the only encode entry point and it needs a
+            // batch, so `TcpSink::connect` gates on `message_shape`, whose
+            // contract is that `None` means no message surface. That is the
+            // same gate Kafka and NATS use.
             Connector::Tcp if is_source => rejected(
                 "the format has no message decoder",
                 "does not support decoding discrete messages",
             ),
-            Connector::Tcp => None,
+            Connector::Tcp => rejected("the format has no message codec", "no message codec"),
             Connector::Channel | Connector::Postgresql => {
                 unreachable!("a rows connector returned above")
             }
@@ -975,12 +974,13 @@ impl Case {
         }
         if !self.format.fits(connector) {
             return match connector {
-                // The source opens its decoder in `TcpIngestSource::new`, so a
-                // format it cannot decode never gets this far.
-                Connector::Tcp if is_source => {
-                    unreachable!("a tcp source with no message decoder is refused while building")
+                // Both tcp halves settle the format while building:
+                // `TcpIngestSource::new` opens a decoder and `TcpSink::connect`
+                // gates on `message_shape`, so a format neither can carry never
+                // gets this far.
+                Connector::Tcp => {
+                    unreachable!("a tcp node with no message codec is refused while building")
                 }
-                Connector::Tcp => rejected(Site::Run, "the tcp sink encodes on the first batch"),
                 Connector::Http => rejected(Site::Run, "the format has no byte-stream surface"),
                 // The object is real (seeded as ndjson, because the case's own
                 // format has no stream writer to seed with), so the source

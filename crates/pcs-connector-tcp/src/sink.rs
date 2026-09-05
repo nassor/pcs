@@ -12,6 +12,19 @@
 //! ([`encode_messages`](Transformer::encode_messages)), the same surface the
 //! Kafka and NATS sinks publish from. Framing is transport and belongs here;
 //! what a payload means does not.
+//!
+//! Whether the format has a message surface at all is not a write failure but
+//! a property of the config, and the answer is the same for every batch.
+//! [`connect`](TcpSink::connect) therefore settles it while building and hands
+//! the refusal back, the way the source opens a decoder while binding. The
+//! question is put differently only because the trait offers nothing else:
+//! there is no encoder to open, and `encode_messages` needs a batch, so what
+//! is answerable without one is
+//! [`message_shape`](Transformer::message_shape), whose contract is that
+//! `None` means the format has no message surface. That is the same gate the
+//! Kafka and NATS sinks already stand on. A sink that deferred the answer
+//! would build, dial, and fail its first write with the pipeline already
+//! live.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -52,18 +65,33 @@ impl TcpSink {
     ///
     /// `connect` is a `host:port` string. Its first resolved address is the
     /// peer for the sink's lifetime. `transformer` encodes each batch into the
-    /// payloads to frame; a format with no message encoder fails on the first
-    /// batch, not here.
+    /// payloads to frame, and a format that declares no message shape has no
+    /// message surface to encode with: that is settled here rather than on the
+    /// first batch, because no batch can change the answer.
     ///
     /// # Errors
     ///
-    /// Returns [`PcsError::Configuration`] if `connect` cannot be parsed or
-    /// resolved, or if it resolves to no address at all.
+    /// Returns [`PcsError::Configuration`] if `transformer` declares no
+    /// [`message_shape`](Transformer::message_shape), if `connect` cannot be
+    /// parsed or resolved, or if it resolves to no address at all.
     pub fn connect(
         connect: &str,
         schema: Arc<Schema>,
         transformer: Arc<dyn Transformer>,
     ) -> Result<Self, PcsError> {
+        // The declaration is the whole answer for every batch this sink will
+        // ever encode, so asking once here is what makes a format with no
+        // message surface a config error the caller is told about, rather than
+        // a sink that builds, dials, and fails its first write. There is no
+        // encoder to open the way the source opens a decoder: `encode_messages`
+        // is the only encode entry point and it needs a batch.
+        if transformer.message_shape().is_none() {
+            return Err(PcsError::configuration(format!(
+                "TcpSink: format '{}' has no message codec",
+                transformer.format()
+            )));
+        }
+
         let peer = connect
             .to_socket_addrs()
             .map_err(|e| {
@@ -186,6 +214,7 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
+    use pcs_transformer::MessageShape;
     use pcs_transformer_arrow_ipc::ArrowIpcTransformer;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -210,7 +239,8 @@ mod tests {
 
     /// A format that encodes every batch to no messages at all, which is the
     /// only way to observe "no payloads, no frames" without a real codec that
-    /// does it.
+    /// does it. It declares a shape because it has an encoder: that is what
+    /// [`Transformer::message_shape`] is for.
     struct NoMessages;
 
     impl Transformer for NoMessages {
@@ -220,6 +250,20 @@ mod tests {
 
         fn encode_messages(&self, _batch: &RecordBatch) -> Result<Vec<Vec<u8>>, PcsError> {
             Ok(Vec::new())
+        }
+
+        fn message_shape(&self) -> Option<MessageShape> {
+            Some(MessageShape::PerBatch)
+        }
+    }
+
+    /// A format with no message surface at all: every message method is the
+    /// trait's default, which is exactly what `csv` and `parquet` are.
+    struct NoMessageSurface;
+
+    impl Transformer for NoMessageSurface {
+        fn format(&self) -> &'static str {
+            "no-surface"
         }
     }
 
@@ -249,6 +293,19 @@ mod tests {
             .expect("resolution must fail");
         assert_eq!(err.category(), "configuration", "got: {err}");
         assert!(err.to_string().contains("'connect'"), "got: {err}");
+    }
+
+    /// The refusal is the config's, not the first batch's: nothing about a
+    /// batch can change whether the format has a message surface, and the same
+    /// misconfiguration on a `tcp` source is refused while building too.
+    #[test]
+    fn connect_refuses_a_format_with_no_message_codec() {
+        let err = TcpSink::connect("127.0.0.1:9501", test_schema(), Arc::new(NoMessageSurface))
+            .err()
+            .expect("a format with no message surface must be refused");
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(err.to_string().contains("no message codec"), "got: {err}");
+        assert!(err.to_string().contains("no-surface"), "got: {err}");
     }
 
     /// A peer that is down is not a construction error: the dial waits for the

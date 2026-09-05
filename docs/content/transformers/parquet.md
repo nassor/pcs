@@ -37,12 +37,12 @@ rather than a check, so the message you see comes from the connector:
 
 ## Surfaces
 
-Stream read and write. There is no message codec, so a Kafka or NATS node, or a `tcp` source,
-naming a `parquet` transformer fails at build:
-`KafkaSink: format 'parquet' has no message codec` from the `message_shape` gate, and
-`format 'parquet' does not support decoding discrete messages` from the decoder
-`TcpIngestSource::new` opens. A `tcp` sink is the one that waits, because `encode_messages` needs
-a batch: its first write fails with `format 'parquet' does not support encoding discrete messages`.
+Stream read and write. There is no message codec, so a Kafka, NATS or `tcp` node naming a
+`parquet` transformer fails at build. The message names the half that refused:
+`KafkaSink: format 'parquet' has no message codec` and
+`TcpSink: format 'parquet' has no message codec` from the `message_shape` gate each sink stands
+on, and `format 'parquet' does not support decoding discrete messages` from the decoder
+`TcpIngestSource::new` opens.
 
 ## estimated_rows
 

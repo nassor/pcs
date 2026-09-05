@@ -111,6 +111,24 @@ impl Source for S3Source {
         Arc::clone(&self.declared)
     }
 
+    /// One batch off the object at the front of the listing, or `Ok(None)`
+    /// once that listing is exhausted. The first call lists the prefix.
+    ///
+    /// # Errors
+    ///
+    /// A location leaves the listing only when its object's batch stream ends
+    /// cleanly, so every other outcome leaves it at the front: a listing
+    /// error, a download or spool error, a reader the object's bytes refuse,
+    /// the `schema_from="object"` schema check, and a decode error raised part
+    /// way through the object. A caller's retry therefore re-attempts that
+    /// same object rather than advancing past it.
+    ///
+    /// A failure before the object's first batch replays nothing. A failure
+    /// after some of its batches have been handed over replays those batches:
+    /// the retry reopens the object at its start, so the rows already
+    /// delivered arrive a second time. That duplication is what this engine's
+    /// at-least-once delivery allows, and it is the price of not dropping the
+    /// rest of the object in silence.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
         // 1. First call: list the prefix once, in location order. object_store
         //    documents no ordering guarantee, so the sort is load-bearing.
@@ -282,6 +300,11 @@ mod tests {
     /// its object has been fully and successfully drained, so a caller
     /// retrying after an error re-attempts the same object instead of
     /// silently advancing past it.
+    ///
+    /// This covers a failure raised before the object's first batch, where
+    /// the retry replays nothing. It says nothing about a decode error part
+    /// way through an object, whose retry reopens it from the start and
+    /// re-emits the batches already delivered.
     #[tokio::test]
     async fn a_source_whose_object_fails_to_open_reports_an_error_not_eof() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

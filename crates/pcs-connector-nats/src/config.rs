@@ -360,10 +360,32 @@ pub struct JetstreamSourceMode {
     /// server default.
     #[serde(default)]
     pub ack_wait_ms: u64,
-    /// Delivery attempts per message before it is dropped. 0 keeps the server
-    /// default.
+    /// Delivery attempts per message before the *server* stops redelivering
+    /// and drops it. 0 keeps the server default, and the server reads 0 as
+    /// unlimited: nothing on the broker side ever retires a message this
+    /// consumer keeps failing on. `max_decode_attempts` is the bound the
+    /// source itself enforces, so a message the format cannot decode is
+    /// retired loudly rather than redelivered forever.
     #[serde(default)]
     pub max_deliver: i64,
+    /// Delivery attempts the source spends on a message before it terminates
+    /// it and reports an error naming the stream and the sequence.
+    ///
+    /// A payload the configured format cannot decode fails identically on
+    /// every redelivery, and an undecodable window is never acknowledged, so
+    /// without a bound the server redelivers it after each `ack_wait`
+    /// forever and the consumer never advances past it. On the last permitted
+    /// attempt the source sends `+TERM` for that one message — the rest of
+    /// the window is left unacknowledged and redelivered as usual — and
+    /// returns an error naming it, so the rows it carried are lost with a
+    /// record of which message lost them.
+    ///
+    /// Counted from the server's own delivery count for that message, so
+    /// restarts count too. Clamped by `max_deliver` when that is set, so the
+    /// source reports the message rather than letting the server retire it
+    /// silently. 0 disables the bound and restores unbounded redelivery.
+    #[serde(default = "default_max_decode_attempts")]
+    pub max_decode_attempts: u32,
     /// Unacknowledged messages allowed in flight. 0 keeps the server default.
     #[serde(default)]
     pub max_ack_pending: i64,
@@ -446,6 +468,7 @@ impl Default for JetstreamSourceMode {
             double_ack: false,
             ack_wait_ms: 0,
             max_deliver: 0,
+            max_decode_attempts: default_max_decode_attempts(),
             max_ack_pending: 0,
             max_waiting: 0,
             max_batch: 0,
@@ -1190,6 +1213,14 @@ fn default_batch_size() -> usize {
 fn default_poll_timeout_ms() -> u64 {
     1_000
 }
+/// Five delivery attempts before the source retires a message it cannot
+/// decode: enough for a redelivery caused by anything other than the payload
+/// (a restart, a lost ack, a window nobody read) to pass, and bounded, so a
+/// payload that will never decode costs at most five `ack_wait` windows
+/// rather than the stream's whole life.
+fn default_max_decode_attempts() -> u32 {
+    5
+}
 fn default_fetch_expires_ms() -> u64 {
     5_000
 }
@@ -1298,6 +1329,7 @@ mode kind="jetstream" stream="ORDERS" {
     double_ack #true
     ack_wait_ms 15000
     max_deliver 5
+    max_decode_attempts 3
     max_ack_pending 200
     max_waiting 32
     max_batch 500
@@ -1353,6 +1385,7 @@ schema_fields "id" type="int64"
         };
         assert_eq!(js.ack_policy, AckPolicyConfig::All);
         assert_eq!(js.replay_policy, ReplayPolicyConfig::Original);
+        assert_eq!(js.max_decode_attempts, 3);
         assert_eq!(js.stream_provision.retention, RetentionConfig::WorkQueue);
         assert_eq!(js.stream_provision.compression, CompressionConfig::S2);
         assert_eq!(

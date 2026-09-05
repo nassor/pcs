@@ -17,6 +17,13 @@
 //! pipeline later fails is gone. A `queue_group` spreads one core subject across
 //! several PCS instances.
 //!
+//! A window the format cannot decode is reported rather than skipped, and
+//! nothing in it is acknowledged, so JetStream redelivers it. The same
+//! payload fails the same way, so `mode.max_decode_attempts` bounds that:
+//! on the last permitted delivery the offending message is terminated and the
+//! error names the stream sequence it retired, which is what keeps one poison
+//! message from being either swallowed in silence or redelivered forever.
+//!
 //! [`next_batch`](Source::next_batch) is cancel-safe either way: the collected
 //! window lives on the source rather than in the future, and a message's ack
 //! travels beside it until the window is handed over. Dropping that future — as
@@ -30,7 +37,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_nats::jetstream::consumer::PullConsumer;
-use async_nats::jetstream::message::Acker;
+use async_nats::jetstream::message::{AckKind, Acker};
 use async_nats::{Client, Subject, Subscriber};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -82,6 +89,19 @@ struct Received {
     /// acknowledged. `None` in core mode, which has no acks at all, and under
     /// `ack_policy = "none"`.
     ack: Option<Acker>,
+    /// The server's own count of delivery attempts for this message, 1 on a
+    /// first delivery. This is what bounds redelivery of a payload the format
+    /// cannot decode. 0 in core mode, which never redelivers anything.
+    delivered: u32,
+}
+
+/// A window the format rejected, and which message it blames.
+struct DecodeFailure {
+    /// The message the decoder rejected, as an index into the window. `None`
+    /// when the failure belongs to the window as a whole: opening the decoder,
+    /// flushing it, or a window that decoded no rows at all.
+    index: Option<usize>,
+    error: PcsError,
 }
 
 /// What the pull consumer needs per window, resolved once at start.
@@ -147,6 +167,10 @@ pub struct NatsSource {
     /// Ackers for the batch already handed to the caller, sent at the start of
     /// the next call. This is what makes JetStream delivery at-least-once.
     pending_acks: Vec<Acker>,
+    /// Delivery attempts spent on one message before the source terminates it
+    /// as undecodable. 0 disables the bound, which is what core mode gets:
+    /// core NATS redelivers nothing, so no window can come back.
+    max_decode_attempts: u32,
     /// JetStream's own count of messages still waiting for this consumer.
     last_pending: Option<usize>,
 }
@@ -178,6 +202,24 @@ impl NatsSource {
                 (_, false) => AckMode::Single,
             },
         };
+        let max_decode_attempts = match &cfg.mode {
+            // Core NATS has no ack and no redelivery, so an undecodable
+            // window is reported once and gone; there is nothing to bound.
+            SourceMode::Core(_) => 0,
+            SourceMode::Jetstream(js) => {
+                // A `max_deliver` the operator set is the server's own
+                // ceiling, and the server retires the message silently once
+                // it is reached. Clamping to it keeps the last attempt this
+                // source's, so the message is named rather than dropped
+                // behind an advisory nobody here subscribes to.
+                let server_ceiling = u32::try_from(js.max_deliver).unwrap_or(u32::MAX);
+                if js.max_deliver > 0 {
+                    js.max_decode_attempts.min(server_ceiling)
+                } else {
+                    js.max_decode_attempts
+                }
+            }
+        };
         Ok(Self {
             cfg,
             schema,
@@ -186,6 +228,7 @@ impl NatsSource {
             state: None,
             buffer: Vec::new(),
             pending_acks: Vec::new(),
+            max_decode_attempts,
             last_pending: None,
         })
     }
@@ -322,22 +365,85 @@ impl NatsSource {
     /// Feed a whole window through one decoder and take the batch out.
     ///
     /// Each push names the message it failed on, keeping per-message
-    /// attribution; the transformer names the format that rejected it.
-    fn decode_window(&self, received: &[Received]) -> Result<RecordBatch, PcsError> {
+    /// attribution; the transformer names the format that rejected it. That
+    /// attribution is also what [`retire_exhausted`](Self::retire_exhausted)
+    /// bounds redelivery by, so the failure carries the offending message's
+    /// index rather than only its label.
+    fn decode_window(&self, received: &[Received]) -> Result<RecordBatch, DecodeFailure> {
+        let whole_window = |error| DecodeFailure { index: None, error };
         let mut decoder = self
             .transformer
-            .open_message_decoder(Arc::clone(&self.schema))?;
-        for message in received {
-            decoder.push(&message.payload).map_err(|e| {
-                PcsError::generic(format!(
+            .open_message_decoder(Arc::clone(&self.schema))
+            .map_err(whole_window)?;
+        for (index, message) in received.iter().enumerate() {
+            decoder.push(&message.payload).map_err(|e| DecodeFailure {
+                index: Some(index),
+                error: PcsError::generic(format!(
                     "{WHAT}: decode failed for {}: {e}",
                     self.origin_label(&message.origin)
-                ))
+                )),
             })?;
         }
-        decoder
-            .flush()?
-            .ok_or_else(|| PcsError::generic(format!("{WHAT}: window decoded no rows")))
+        decoder.flush().map_err(whole_window)?.ok_or_else(|| {
+            whole_window(PcsError::generic(format!("{WHAT}: window decoded no rows")))
+        })
+    }
+
+    /// Terminate the message a decode failure blames, once the server has
+    /// delivered it as often as `max_decode_attempts` allows, and name it in
+    /// the returned error.
+    ///
+    /// An undecodable window is never acknowledged, so the server redelivers
+    /// it after each `ack_wait` and the same payload fails the same way: with
+    /// no bound the consumer never advances past it. On the last permitted
+    /// attempt this sends `+TERM` for that one message, which stops its
+    /// redelivery without acknowledging it, and reports which stream sequence
+    /// was retired. Every other message in the window keeps its own `Acker`,
+    /// which is dropped here, so those come back on the next window as usual.
+    ///
+    /// Before the bound is reached, and whenever the failure belongs to no one
+    /// message, the decode error is returned as it stands and the window is
+    /// redelivered.
+    async fn retire_exhausted(&self, window: Vec<Received>, failure: DecodeFailure) -> PcsError {
+        if self.max_decode_attempts == 0 {
+            return failure.error;
+        }
+        // A failure the decoder could not attribute still belongs to a
+        // one-message window: there is nothing else in it to blame.
+        let index = failure
+            .index
+            .or_else(|| (window.len() == 1).then_some(0usize));
+        let Some(message) = index.and_then(|index| window.get(index)) else {
+            return failure.error;
+        };
+        if message.delivered < self.max_decode_attempts {
+            return failure.error;
+        }
+        let Some(acker) = message.ack.as_ref() else {
+            return failure.error;
+        };
+        let terminated = if self.ack_mode == AckMode::Double {
+            acker.double_ack_with(AckKind::Term).await
+        } else {
+            acker.ack_with(AckKind::Term).await
+        };
+        let label = self.origin_label(&message.origin);
+        match terminated {
+            Ok(()) => PcsError::generic(format!(
+                "{WHAT}: {label} failed to decode on all {} delivery attempt(s) \
+                 'mode.max_decode_attempts' allows and has been terminated, so the consumer can \
+                 advance; the row(s) it carried are lost: {}",
+                self.max_decode_attempts,
+                failure.error.message()
+            )),
+            Err(e) => PcsError::generic(format!(
+                "{WHAT}: {label} failed to decode on all {} delivery attempt(s) \
+                 'mode.max_decode_attempts' allows and could not be terminated ({e}), so the \
+                 server will redeliver it: {}",
+                self.max_decode_attempts,
+                failure.error.message()
+            )),
+        }
     }
 
     /// Where a message came from, in words. Built only on the error path, so a
@@ -400,6 +506,8 @@ fn received_core(message: async_nats::Message) -> Received {
         origin: Origin::Subject(message.subject),
         payload: message.payload,
         ack: None,
+        // Core NATS delivers a message once or not at all.
+        delivered: 0,
     }
 }
 
@@ -531,14 +639,14 @@ async fn collect_jetstream(
                     ))
                 })?;
                 // `info` parses the reply subject, with no round-trip.
-                let (sequence, pending) = {
+                let (sequence, pending, delivered) = {
                     let info = message.info().map_err(|e| {
                         PcsError::generic(format!(
                             "{WHAT}: message on stream '{}' carries no JetStream metadata: {e}",
                             window.stream
                         ))
                     })?;
-                    (info.stream_sequence, info.pending)
+                    (info.stream_sequence, info.pending, info.delivered)
                 };
                 *last_pending = Some(usize::try_from(pending).unwrap_or(usize::MAX));
 
@@ -552,6 +660,7 @@ async fn collect_jetstream(
                     origin: Origin::Sequence(sequence),
                     payload,
                     ack,
+                    delivered: u32::try_from(delivered).unwrap_or(u32::MAX),
                 });
             }
         }
@@ -594,6 +703,14 @@ impl Source for NatsSource {
     /// `Acker` joins `pending_acks` only once that message is on its way to
     /// the caller, so a dropped future neither loses a window nor
     /// acknowledges one.
+    ///
+    /// # Errors
+    ///
+    /// A window the format cannot decode is reported rather than skipped, and
+    /// its acks are dropped, so JetStream redelivers it. That redelivery is
+    /// bounded by `mode.max_decode_attempts`: on the last permitted attempt
+    /// the source terminates the offending message and the error names the
+    /// stream sequence it retired.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
         self.ensure_started().await?;
         self.flush_pending_acks().await?;
@@ -604,13 +721,20 @@ impl Source for NatsSource {
         }
 
         let window = std::mem::take(&mut self.buffer);
-        let batch = self.decode_window(&window)?;
-        // Handed over, so this window's acks become the ones the next call
-        // sends. A decode error instead drops them here, and the server
-        // redelivers what it never saw acknowledged.
-        self.pending_acks
-            .extend(window.into_iter().filter_map(|message| message.ack));
-        Ok(Some(batch))
+        let failure = match self.decode_window(&window) {
+            // Handed over, so this window's acks become the ones the next
+            // call sends.
+            Ok(batch) => {
+                self.pending_acks
+                    .extend(window.into_iter().filter_map(|message| message.ack));
+                return Ok(Some(batch));
+            }
+            Err(failure) => failure,
+        };
+        // Every ack in the window is dropped, so the server redelivers what it
+        // never saw acknowledged — except a message that has now used up its
+        // decode attempts, which is terminated so the consumer can advance.
+        Err(self.retire_exhausted(window, failure).await)
     }
 
     /// JetStream's own count of messages still waiting for this consumer, which

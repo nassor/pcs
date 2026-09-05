@@ -964,3 +964,104 @@ async fn estimated_rows_reports_what_jetstream_still_owes() {
         "two of the three messages are still waiting for this consumer"
     );
 }
+
+/// An undecodable payload is never acknowledged, so JetStream keeps
+/// redelivering it and every attempt fails on the same bytes.
+/// `max_decode_attempts` is what turns that into a bounded, named outcome:
+/// the source terminates that one message, reports an error carrying the
+/// stream and the sequence it retired, and then advances — so a stream with
+/// one poison message neither loops forever nor swallows it in silence, and
+/// the message that shared its window still arrives.
+#[tokio::test]
+async fn an_undecodable_message_is_retired_by_name_instead_of_redelivered_forever() {
+    let Some(nats) = common::try_start().await else {
+        return;
+    };
+    let stream = nats.stream("JS_POISON");
+    let subject = nats.subject("js-poison");
+    let schema = schema();
+
+    // Published raw: the poison payload is exactly what no ndjson decoder can
+    // accept, which a sink writing this schema could never produce.
+    let js = nats.jetstream().await;
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: stream.clone(),
+        subjects: vec![subject.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("stream is created");
+    for payload in [
+        "}{ this is not ndjson",
+        "{\"id\":2,\"name\":\"b\",\"total\":2.5}",
+    ] {
+        js.publish(subject.clone(), payload.into())
+            .await
+            .expect("publish")
+            .await
+            .expect("publish ack");
+    }
+
+    const ATTEMPTS: u32 = 2;
+    let mut source = NatsSource::new(
+        NatsSourceConfig {
+            mode: SourceMode::Jetstream(Box::new(JetstreamSourceMode {
+                stream: stream.clone(),
+                durable_name: Some("pcs-poison".to_string()),
+                // Short enough that two redeliveries fit the test's budget.
+                ack_wait_ms: 1_000,
+                fetch_expires_ms: 500,
+                max_decode_attempts: ATTEMPTS,
+                ..JetstreamSourceMode::default()
+            })),
+            poll_timeout_ms: 1_000,
+            ..js_source_cfg(&nats.url(), &stream, "pcs-poison")
+        },
+        schema,
+        ndjson(),
+    )
+    .expect("source builds");
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut ids: Vec<i64> = Vec::new();
+    let mut reached_eof = false;
+    // One call per iteration, each bounded: a source stuck on the poison
+    // message fails this loop instead of hanging the suite.
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(20), source.next_batch())
+            .await
+            .expect("a next_batch that neither decodes nor gives up is a livelock")
+        {
+            Ok(Some(batch)) => ids.extend(ids_of(&batch)),
+            Ok(None) => {
+                reached_eof = true;
+                break;
+            }
+            Err(e) => errors.push(e.message().to_string()),
+        }
+    }
+
+    assert!(
+        reached_eof,
+        "the source must advance past the poison message; errors so far: {errors:?}"
+    );
+    assert_eq!(
+        errors.len() as u32,
+        ATTEMPTS,
+        "the undecodable message costs one error per permitted delivery and no more: {errors:?}"
+    );
+    let retired = errors.last().expect("at least one attempt failed");
+    assert!(
+        retired.contains(&stream) && retired.contains("@1"),
+        "the last error must name the stream and the sequence it retired: {retired}"
+    );
+    assert!(
+        retired.contains("terminated"),
+        "the last error must say the message was retired, not merely that it failed: {retired}"
+    );
+    assert_eq!(
+        ids,
+        vec![2],
+        "only the poison message is lost; the one that shared its window arrives"
+    );
+}

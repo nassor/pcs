@@ -181,7 +181,9 @@ how a core subject spreads across PCS instances.
 | `deliver_policy` | `kind="all"` |
 | `ack_policy` | `"explicit"`, or `"all"` or `"none"` |
 | `double_ack` | `false` |
-| `ack_wait_ms`, `max_deliver`, `max_ack_pending`, `max_waiting`, `max_batch`, `max_bytes`, `max_expires_ms`, `inactive_threshold_ms`, `num_replicas`, `rate_limit_bps`, `sample_frequency` | `0`, keeping the server default |
+| `ack_wait_ms`, `max_ack_pending`, `max_waiting`, `max_batch`, `max_bytes`, `max_expires_ms`, `inactive_threshold_ms`, `num_replicas`, `rate_limit_bps`, `sample_frequency` | `0`, keeping the server default |
+| `max_deliver` | `0`, keeping the server default, which is unlimited redelivery |
+| `max_decode_attempts` | `5` |
 | `memory_storage`, `headers_only` | `false` |
 | `replay_policy` | `"instant"`, or `"original"` |
 | `backoff_ms` | empty |
@@ -307,10 +309,17 @@ stream holds the rows.
 A message is acknowledged only once its window has been handed to the caller: each one carries its
 own ack until then, so a dropped `next_batch` future leaves the window on the source rather than
 acknowledging rows nobody received. A window the format cannot decode is therefore never
-acknowledged either — the source reports the decode error and the server redelivers that window
-after `ack_wait`, which repeats for as long as the payload stays undecodable. Bound it with
-`max_deliver`, which retires a message the consumer keeps failing on instead of letting it stall
-the stream.
+acknowledged either. The source reports the decode error, and the server redelivers that window
+after `ack_wait`.
+
+`max_decode_attempts` bounds that redelivery, because the same payload fails the same way every
+time. It counts the server's own delivery attempts for a message, five by default, and on the last
+one the source sends `+TERM` for that message alone and returns an error naming the stream and the
+sequence it retired. The rows that message carried are lost, and the error says which message lost
+them; the rest of its window is left unacknowledged and comes back as usual. `max_deliver` clamps
+the bound when it is set, so the last attempt stays the source's and the server never retires the
+message behind an advisory instead. `max_decode_attempts=0` removes the bound, and an undecodable
+message then redelivers for as long as it stays undecodable.
 
 Core NATS is at-most-once and has no ack at all: a message consumed while the pipeline later fails
 is gone. A core sink's `flush_every_batch` waits for the server to acknowledge the whole write,
@@ -351,5 +360,5 @@ cargo run --features connector-nats,wasm --bin pcs-service -- \
 
 </div>
 
-`crates/pcs-connector-nats/tests/nats_roundtrip.rs` runs thirteen tests against a real server in a
+`crates/pcs-connector-nats/tests/nats_roundtrip.rs` runs sixteen tests against a real server in a
 container, and prints `SKIP:` and passes when no Docker daemon is reachable.

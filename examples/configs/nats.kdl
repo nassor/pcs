@@ -88,6 +88,11 @@ workflow "orders" {
                 double_ack #false
                 ack_wait_ms 30000
                 max_deliver 5
+                // Delivery attempts the source spends on a message the format
+                // cannot decode. On the last one it terminates that message and
+                // reports the stream and sequence, so a poison payload is
+                // neither skipped in silence nor redelivered forever.
+                max_decode_attempts 5
                 max_ack_pending 1000
                 // How long a pull request stays open server-side while the stream
                 // is empty.

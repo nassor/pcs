@@ -161,14 +161,15 @@ false, they may not exist`.
 
 ## Formats
 
-A transformer with no message codec is refused on either half:
-`KafkaSink: format '{format}' has no message codec`, and the source's twin. That rules out
-[csv](@/transformers/csv.md) and [parquet](@/transformers/parquet.md).
+Every registered format carries a message codec, so all five run on either half. A transformer
+that declared none would be refused with
+`KafkaSink: format '{format}' has no message codec`, and the source's twin.
 
 `key_field` needs a format that emits one message per row, so
-[arrow-ipc](@/transformers/arrow-ipc.md) is refused with
+[arrow-ipc](@/transformers/arrow-ipc.md) and [parquet](@/transformers/parquet.md) are refused with
 `KafkaSink config: 'key_field' needs a row-per-message format; '{format}' emits one message per
-batch`. [ndjson](@/transformers/ndjson.md) and [avro](@/transformers/avro.md) both qualify.
+batch`. [csv](@/transformers/csv.md), [ndjson](@/transformers/ndjson.md) and
+[avro](@/transformers/avro.md) all qualify.
 
 ## Transport
 

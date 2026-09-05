@@ -1,24 +1,36 @@
-//! [`ParquetTransformer`]: the `parquet` format, read and written through the
-//! synchronous `parquet` Arrow reader and writer.
+//! [`ParquetTransformer`]: the `parquet` format, both surfaces.
 
 use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+use arrow_select::concat::concat_batches;
+use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use pcs_core::error::PcsError;
-use pcs_transformer::{BatchReader, BatchWriter, ConfigValue, Transformer, TransformerFactory};
+use pcs_transformer::{
+    BatchReader, BatchWriter, ConfigValue, MessageDecoder, MessageShape, Transformer,
+    TransformerFactory,
+};
 
-/// The `parquet` byte format.
+/// The `parquet` byte format: one self-contained Parquet file, whether that
+/// file is a whole object or one message payload.
 ///
 /// Snappy compression is fixed: it is the only setting a PCS pipeline has ever
 /// written, and a checkpoint or dataset file that changes codec between runs is
 /// a compatibility problem, not a tuning knob.
+///
+/// A Parquet file ends in a footer, so a payload has to be a whole file and the
+/// message shape is [`MessageShape::PerBatch`]. That is the smallest unit
+/// Parquet has, and it is not free: the magic bytes, the per-column page
+/// headers and the Thrift footer come to about 470 bytes for a three-column
+/// row type before a single row is written. That cost is paid once per batch,
+/// so a message transport carrying this format wants batches, not rows.
 #[derive(Default)]
 pub struct ParquetTransformer;
 
@@ -27,6 +39,13 @@ impl ParquetTransformer {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// The one write configuration both surfaces use.
+fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build()
 }
 
 impl Transformer for ParquetTransformer {
@@ -73,14 +92,48 @@ impl Transformer for ParquetTransformer {
         output: Box<dyn Write + Send>,
         schema: Arc<Schema>,
     ) -> Result<Box<dyn BatchWriter>, PcsError> {
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
         // `ArrowWriter` buffers a row group of its own, so the handle arrives
         // unwrapped and `close` flushes through it.
-        let writer = ArrowWriter::try_new(output, schema, Some(props))
+        let writer = ArrowWriter::try_new(output, schema, Some(writer_properties()))
             .map_err(|e| PcsError::generic(format!("parquet: writer init error: {e}")))?;
         Ok(Box::new(ParquetBatchWriter { writer }))
+    }
+
+    /// Open a decoder for discrete payloads, one whole Parquet file apiece.
+    ///
+    /// `schema` is not handed to the reader: a payload carries its own, the
+    /// same way an object does. It is the expectation every payload is checked
+    /// against, so a producer writing other columns is refused rather than
+    /// silently appended.
+    fn open_message_decoder(
+        &self,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn MessageDecoder>, PcsError> {
+        Ok(Box::new(ParquetMessageDecoder {
+            schema,
+            batches: Vec::new(),
+        }))
+    }
+
+    /// Encode the whole batch as one payload: a complete Parquet file, footer
+    /// included.
+    fn encode_messages(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, PcsError> {
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), batch.schema(), Some(writer_properties()))
+                .map_err(|e| PcsError::generic(format!("parquet: encode: {e}")))?;
+        writer
+            .write(batch)
+            .map_err(|e| PcsError::generic(format!("parquet: encode: {e}")))?;
+        // `into_inner` writes the footer, which is what makes the payload a
+        // readable file rather than a prefix of one.
+        let payload = writer
+            .into_inner()
+            .map_err(|e| PcsError::generic(format!("parquet: encode: {e}")))?;
+        Ok(vec![payload])
+    }
+
+    fn message_shape(&self) -> Option<MessageShape> {
+        Some(MessageShape::PerBatch)
     }
 }
 
@@ -142,9 +195,49 @@ impl BatchWriter for ParquetBatchWriter {
     }
 }
 
+/// One whole Parquet file per payload, folded into one batch per window.
+struct ParquetMessageDecoder {
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+}
+
+impl MessageDecoder for ParquetMessageDecoder {
+    fn push(&mut self, payload: &[u8]) -> Result<(), PcsError> {
+        // `ChunkReader` needs random access inside the payload, which the
+        // footer at its end forces. A payload is already whole and in memory,
+        // so `Bytes` gives that with one copy and no temporary file.
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(payload))
+            .map_err(|e| PcsError::generic(format!("parquet: file header: {e}")))?
+            .build()
+            .map_err(|e| PcsError::generic(format!("parquet: reader build error: {e}")))?;
+        for batch in reader {
+            let batch = batch.map_err(|e| PcsError::generic(format!("parquet: decode: {e}")))?;
+            if batch.schema().fields() != self.schema.fields() {
+                return Err(PcsError::generic(format!(
+                    "parquet: received batch with schema {:?}, expected {:?}",
+                    batch.schema(),
+                    self.schema
+                )));
+            }
+            self.batches.push(batch);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<Option<RecordBatch>, PcsError> {
+        if self.batches.is_empty() {
+            return Ok(None);
+        }
+        let batch = concat_batches(&self.schema, self.batches.iter())
+            .map_err(|e| PcsError::generic(format!("parquet: concatenating batches: {e}")))?;
+        self.batches.clear();
+        Ok(Some(batch))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Float64Array, Int64Array};
+    use arrow_array::{Float64Array, Int64Array, UInt64Array};
     use arrow_schema::{DataType, Field};
     use tempfile::NamedTempFile;
 
@@ -238,13 +331,111 @@ mod tests {
     }
 
     #[test]
-    fn parquet_has_no_message_surface() {
+    fn the_message_shape_is_one_payload_per_batch() {
+        assert_eq!(
+            ParquetTransformer::new().message_shape(),
+            Some(MessageShape::PerBatch)
+        );
+    }
+
+    #[test]
+    fn encoding_emits_one_self_contained_file_for_the_whole_batch() {
+        let payloads = ParquetTransformer::new()
+            .encode_messages(&batch(3))
+            .expect("encode");
+        assert_eq!(payloads.len(), 1);
+        let payload = &payloads[0];
+        assert_eq!(
+            &payload[..4],
+            b"PAR1",
+            "a Parquet file opens with its magic"
+        );
+        assert_eq!(
+            &payload[payload.len() - 4..],
+            b"PAR1",
+            "and closes with it, after the footer"
+        );
+    }
+
+    #[test]
+    fn a_message_round_trip_preserves_every_row_and_column_type() {
         let transformer = ParquetTransformer::new();
-        assert_eq!(transformer.message_shape(), None);
-        let Err(err) = transformer.encode_messages(&batch(1)) else {
-            panic!("parquet encodes no discrete messages");
+        let original = batch(500);
+        let payloads = transformer.encode_messages(&original).expect("encode");
+        let mut decoder = transformer
+            .open_message_decoder(schema())
+            .expect("decoder opens");
+        decoder.push(&payloads[0]).expect("push");
+        let decoded = decoder.flush().expect("flush").expect("one batch");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn every_payload_of_a_window_folds_into_one_batch() {
+        let transformer = ParquetTransformer::new();
+        let mut decoder = transformer
+            .open_message_decoder(schema())
+            .expect("decoder opens");
+        for _ in 0..3 {
+            let payloads = transformer.encode_messages(&batch(4)).expect("encode");
+            decoder.push(&payloads[0]).expect("push");
+        }
+        let decoded = decoder.flush().expect("flush").expect("one batch");
+        assert_eq!(decoded.num_rows(), 12);
+        // The window is consumed, so a second flush has nothing to hand back.
+        assert!(decoder.flush().expect("flush").is_none());
+    }
+
+    #[test]
+    fn an_unsigned_column_survives_the_message_round_trip_unwidened() {
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "seq",
+            DataType::UInt64,
+            false,
+        )]));
+        let original = RecordBatch::try_new(
+            Arc::clone(&declared),
+            vec![Arc::new(UInt64Array::from(vec![1u64, 2, u64::MAX]))],
+        )
+        .expect("batch");
+
+        let transformer = ParquetTransformer::new();
+        let payloads = transformer.encode_messages(&original).expect("encode");
+        let mut decoder = transformer
+            .open_message_decoder(declared)
+            .expect("decoder opens");
+        decoder.push(&payloads[0]).expect("push");
+        let decoded = decoder.flush().expect("flush").expect("one batch");
+        assert_eq!(decoded.schema_ref().field(0).data_type(), &DataType::UInt64);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn a_payload_carrying_other_columns_is_refused() {
+        let other = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let payloads = ParquetTransformer::new()
+            .encode_messages(
+                &RecordBatch::try_new(other, vec![Arc::new(Int64Array::from(vec![1i64]))])
+                    .expect("batch"),
+            )
+            .expect("encode");
+        let mut decoder = ParquetTransformer::new()
+            .open_message_decoder(schema())
+            .expect("decoder opens");
+        let Err(err) = decoder.push(&payloads[0]) else {
+            panic!("a payload must carry the declared columns");
         };
-        assert_eq!(err.category(), "configuration");
-        assert!(err.message().contains("'parquet'"), "got: {err}");
+        assert!(err.message().contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_parquet_file_is_refused() {
+        let mut decoder = ParquetTransformer::new()
+            .open_message_decoder(schema())
+            .expect("decoder opens");
+        let Err(err) = decoder.push(b"id,val\n1,1.5\n") else {
+            panic!("only a whole Parquet file decodes");
+        };
+        assert!(err.message().contains("file header"), "got: {err}");
     }
 }

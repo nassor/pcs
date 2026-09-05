@@ -149,16 +149,17 @@ optional table handed to the format's own factory.
 
 | `format` | Stream read | Stream write | Message codec | Schema rule | Crate | Feature |
 |----------|-------------|--------------|---------------|-------------|-------|---------|
-| `csv` | yes | yes | no | `schema_fields` required | `pcs-transformer-csv` | `transformer-csv` |
-| `ndjson` | yes | yes | one per row | inferred when absent | `pcs-transformer-ndjson` | `transformer-ndjson` |
-| `parquet` | yes | yes | no | read from the file; `schema_fields` rejected on a source | `pcs-transformer-parquet` | `transformer-parquet` |
+| `csv` | yes | yes | one per row | `schema_fields` required | `pcs-transformer-csv` | `transformer-csv` |
+| `ndjson` | yes | yes | one per row | inferred when absent on a stream read, required on the message surface | `pcs-transformer-ndjson` | `transformer-ndjson` |
+| `parquet` | yes | yes | one per batch | read from the file; `schema_fields` rejected on a source, required on a sink and on the message surface | `pcs-transformer-parquet` | `transformer-parquet` |
 | `avro` | yes | yes | one per row | read from the file; `schema_fields` rejected on a source, required on a sink and on the message surface | `pcs-transformer-avro` | `transformer-avro` |
-| `arrow-ipc` | no | no | one per batch | `schema_fields` required | `pcs-transformer-arrow-ipc` | `transformer-arrow-ipc` |
+| `arrow-ipc` | yes | yes | one per batch | read from the stream; `schema_fields` rejected on a source, required on a sink and on the message surface | `pcs-transformer-arrow-ipc` | `transformer-arrow-ipc` |
 
-`options`: `csv` takes `has_headers` (bool, default `#true`), `ndjson` takes
-`infer_max` (integer, default `1024`), `avro` takes `compression` (string, one
-of `null`, `deflate`, `snappy`, `zstd`, default `null`) and `schema_id`
-(integer, the Confluent registry id), and the other two take none.
+`options`: `csv` takes `has_headers` (bool, default `#true`, stream surface
+only, a message is one record with no header row), `ndjson` takes `infer_max`
+(integer, default `1024`), `avro` takes `compression` (string, one of `null`,
+`deflate`, `snappy`, `zstd`, default `null`) and `schema_id` (integer, the
+Confluent registry id), and the other two take none.
 
 **Important**: `FileSink` opens the output file as soon as the factory is
 built, `pcs-service validate` included, so the parent directory must exist

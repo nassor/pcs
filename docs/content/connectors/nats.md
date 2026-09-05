@@ -330,14 +330,15 @@ mode has no such number and reports none.
 
 ## Formats
 
-A transformer with no message codec is refused on either half:
-`NatsSink: format '{format}' has no message codec`, and the source's twin. That rules out
-[csv](@/transformers/csv.md) and [parquet](@/transformers/parquet.md).
+Every registered format carries a message codec, so all five run on either half. A transformer
+that declared none would be refused with
+`NatsSink: format '{format}' has no message codec`, and the source's twin.
 
 `subject_field`, `header_fields` and `message_id_field` each need a format that emits one message
-per row, so [arrow-ipc](@/transformers/arrow-ipc.md) is refused with
-`NatsSink config: 'mode.subject_field' needs a row-per-message format; '{format}' emits one message
-per batch`. [ndjson](@/transformers/ndjson.md) and [avro](@/transformers/avro.md) both qualify.
+per row, so [arrow-ipc](@/transformers/arrow-ipc.md) and [parquet](@/transformers/parquet.md) are
+refused with `NatsSink config: 'mode.subject_field' needs a row-per-message format; '{format}'
+emits one message per batch`. [csv](@/transformers/csv.md), [ndjson](@/transformers/ndjson.md) and
+[avro](@/transformers/avro.md) all qualify.
 
 A rendered cell replaces the configured subject outright, so the column holds the whole subject and
 `subject` is the fallback for a null cell. Header names and values reach `HeaderName::from_str` and

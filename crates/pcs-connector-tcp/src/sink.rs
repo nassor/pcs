@@ -266,7 +266,8 @@ mod tests {
     }
 
     /// A format with no message surface at all: every message method is the
-    /// trait's default, which is exactly what `csv` and `parquet` are.
+    /// trait's default. Every format PCS registers implements the message
+    /// surface, so the gate is exercised against a stand-in.
     struct NoMessageSurface;
 
     impl Transformer for NoMessageSurface {

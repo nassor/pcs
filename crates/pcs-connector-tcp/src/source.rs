@@ -303,7 +303,8 @@ mod tests {
     }
 
     /// A stream-only format: every message method keeps the trait's
-    /// `unsupported` default, exactly as `csv` and `parquet` do.
+    /// `unsupported` default. Every format PCS registers implements the message
+    /// surface, so the gate is exercised against a stand-in.
     struct StreamOnly;
 
     impl Transformer for StreamOnly {

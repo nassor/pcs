@@ -181,16 +181,29 @@ mode kind="core" subject="orders"
         }
     }
 
+    /// A stream-only format: every message method keeps the [`Transformer`]
+    /// contract's `unsupported` default. Every format PCS registers implements
+    /// the message surface, so the gate is exercised against a stand-in rather
+    /// than a shipped format.
+    struct StreamOnly;
+
+    impl Transformer for StreamOnly {
+        fn format(&self) -> &'static str {
+            "stream-only"
+        }
+    }
+
     #[test]
     fn a_transformer_with_no_message_codec_is_rejected() {
         let value = from_kdl_str(SINK).expect("parse kdl");
-        let csv: Arc<dyn Transformer> = Arc::new(pcs_transformer_csv::CsvTransformer::default());
+        let stream_only: Arc<dyn Transformer> = Arc::new(StreamOnly);
 
-        let Err(err) = NatsSinkFactory.build(&value, &bound(csv)) else {
-            panic!("csv has no message surface");
+        let Err(err) = NatsSinkFactory.build(&value, &bound(stream_only)) else {
+            panic!("a format with no message surface must be refused");
         };
         assert_eq!(err.category(), "configuration");
         assert!(err.message().contains("has no message codec"), "got: {err}");
+        assert!(err.message().contains("'stream-only'"), "got: {err}");
     }
 
     #[test]

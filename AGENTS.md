@@ -308,9 +308,11 @@ crates/
 │                              # messages, both over the same Arrow IPC stream encapsulation.
 ├── pcs-transformer-avro/      # AvroTransformer: object container files plus PerRow messages,
 │                              # framed single-object or Confluent. Options compression, schema_id.
-├── pcs-transformer-csv/       # CsvTransformer: stream read and write. Option has_headers.
+├── pcs-transformer-csv/       # CsvTransformer: stream read and write plus PerRow messages, one
+│                              # record per payload. Option has_headers, stream surface only.
 ├── pcs-transformer-ndjson/    # NdjsonTransformer: stream plus PerRow messages. Option infer_max.
-└── pcs-transformer-parquet/   # ParquetTransformer: stream read and write, Snappy, estimated_rows.
+└── pcs-transformer-parquet/   # ParquetTransformer: stream read and write plus PerBatch messages,
+                               # one whole file per payload. Snappy, estimated_rows.
 examples/wasm/order_processing/   # A realistic processor pipeline, built for wasm32-wasip2.
 examples/polyglot/                # Six processor components (Go, Python, TypeScript, Kotlin, C#,
                                   # Rust) against one WIT world. Each of the six now declares its

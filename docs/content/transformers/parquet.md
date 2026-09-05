@@ -12,16 +12,17 @@ label = "Feature"
 value = "<code>transformer-parquet</code>"
 [[extra.facts]]
 label = "Surfaces"
-value = "Stream read and write; no message codec"
+value = "All four; message shape <code>PerBatch</code>"
 [[extra.facts]]
 label = "Declared schema"
-value = "Refused when reading"
+value = "Refused reading a file, required writing and on messages"
 +++
 
 ## What it does
 
-`ParquetTransformer` reads and writes Parquet through the `parquet` crate. The file describes
-itself: the footer carries every column, its type, and the row count per row group.
+`ParquetTransformer` reads and writes Parquet through the `parquet` crate, as a file and as
+discrete messages. Both are the same thing: the format describes itself, and its footer carries
+every column, its type, and the row count per row group.
 
 ## options
 
@@ -35,14 +36,25 @@ Required when writing, and baked into the writer at creation. That is a type-lev
 rather than a check, so the message you see comes from the connector:
 `FileSink config requires a 'schema_fields' list`.
 
+On the message surface the declared schema is required and is not handed to the reader: a payload
+carries its own. It is the expectation each payload is checked against, field for field, so a
+producer writing other columns is `parquet: received batch with schema ..., expected ...` rather
+than a silent append.
+
 ## Surfaces
 
-Stream read and write. There is no message codec, so a Kafka, NATS or `tcp` node naming a
-`parquet` transformer fails at build. The message names the half that refused:
-`KafkaSink: format 'parquet' has no message codec` and
-`TcpSink: format 'parquet' has no message codec` from the `message_shape` gate each sink stands
-on, and `format 'parquet' does not support decoding discrete messages` from the decoder
-`TcpIngestSource::new` opens.
+All four: stream read, stream write, message decode and message encode, with shape `PerBatch`.
+
+A Parquet file ends in a footer, so a payload has to be a whole file and a batch is the smallest
+unit the format has. That is not free: the magic bytes, the per-column page headers and the Thrift
+footer come to about 470 bytes for a three-column row type before a single row is written, paid
+once per payload. A message transport carrying this format wants batches, not rows.
+
+A payload is read through `bytes::Bytes`, because the footer at the end of a file means the reader
+needs random access inside it and `parquet` implements that for a file handle and for `Bytes`.
+A payload that is not a Parquet file at all is `parquet: file header: ...`.
+
+One window is one batch: every payload's row groups are concatenated on flush.
 
 ## estimated_rows
 

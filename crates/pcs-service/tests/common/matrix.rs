@@ -77,12 +77,18 @@
 //! |---|---|---|---|
 //! | `arrow-ipc` | yes | yes | `PerBatch` |
 //! | `avro` | yes | yes | `PerRow` |
-//! | `csv` | yes | no | none |
+//! | `csv` | yes | yes | `PerRow` |
 //! | `ndjson` | yes | yes | `PerRow` |
-//! | `parquet` | yes | no | none |
+//! | `parquet` | yes | yes | `PerBatch` |
 //!
-//! Three further rules are properties of a *source* rather than of the format,
-//! and each one was read out of the code it constrains:
+//! Every format offers both surfaces, so no case in this matrix is refused for
+//! wanting a surface its format lacks. What remains is the type systems: the
+//! text and container formats do not all carry every Arrow type the three row
+//! schemas declare.
+//!
+//! Four further rules are properties of a *source* or of a format's own type
+//! system rather than of the surfaces above, and each one was read out of the
+//! code it constrains:
 //!
 //! - A stream source of a self-describing format must let the stream carry the
 //!   schema: `arrow-ipc`, `avro` and `parquet` all refuse a declared schema in
@@ -103,6 +109,11 @@
 //!   variant at all, so a `uint64` `schema_fields` entry is not a
 //!   PostgreSQL config. Every `postgresql` x WASM case is rejected while
 //!   parsing that node's `config`.
+//! - CSV is text and carries no types, so the declared schema governs both
+//!   ends and every column of all three row schemas round-trips exactly,
+//!   `Ping.seq: UInt64` included. The one value it cannot carry is an empty
+//!   string, which it writes as nothing and reads back as a null. No row
+//!   fixture here holds one, so no `csv` case is refused for a type reason.
 //!
 //! # Where a refusal lands
 //!
@@ -112,17 +123,16 @@
 //! | Refusal | Site | Evidence |
 //! |---|---|---|
 //! | byte connector with no `transformer` key | build | `ConnectorContext::transformer` |
-//! | `csv`/`parquet` on a `kafka`/`nats` node | build | explicit `message_shape().is_none()` gate in `new` |
-//! | `csv`/`parquet` on a `tcp` **sink** | build | `message_shape().is_none()` gate in `TcpSink::connect`: there is no encoder to open, and the declaration is the whole answer for every batch |
-//! | `csv`/`parquet` on a `tcp` **source** | build | `open_message_decoder` needs only the declared schema, so `TcpIngestSource::new` opens one and hands the refusal back |
 //! | `avro` + WASM on a `file` source | build | the container file's `Int64` disagrees with `Ping.seq` |
 //! | `avro` + WASM on an `http`/`s3` source | run | the `schema_from` cross-check compares the stream's `Int64` against `Ping.seq` at drain time |
 //! | `uint64` on a `postgresql` node | build | no `PgFieldType` variant |
 //!
-//! Every transformer implements both stream methods, so a `file`, `http` or
-//! `s3` node has exactly one format it refuses, [`Format::None`], and it
-//! refuses it while building. Only the three message connectors can be handed
-//! a format whose surface they cannot drive.
+//! Every transformer implements all four transformer methods, so every byte
+//! connector, on either end, has exactly one format it refuses,
+//! [`Format::None`], and it refuses it while building. The `message_shape`
+//! gates in `KafkaSink`, `NatsSink` and `TcpSink::connect`, and the decoder
+//! `TcpIngestSource::new` opens, are all still live; no registered format
+//! trips them.
 //!
 //! The order is the order the service checks in, and it decides which refusal
 //! a case observes: every node is built in topological order (source before
@@ -401,11 +411,9 @@ impl Format {
             // A rows connector resolves no transformer, so any declaration is
             // simply unreferenced.
             Surface::Rows => true,
-            Surface::Stream => matches!(
-                self,
-                Self::ArrowIpc | Self::Avro | Self::Csv | Self::Ndjson | Self::Parquet
-            ),
-            Surface::Message => matches!(self, Self::ArrowIpc | Self::Avro | Self::Ndjson),
+            // Every transformer implements both byte surfaces, so the only
+            // thing a byte connector cannot carry is the absence of a format.
+            Surface::Stream | Surface::Message => self != Self::None,
         }
     }
 }
@@ -864,8 +872,8 @@ impl Case {
         let ends = [(self.source, true), (self.sink, false)];
 
         // 1. Node build, source first.
-        for (connector, is_source) in ends {
-            if let Some(refusal) = self.node_build_refusal(connector, is_source) {
+        for (connector, _is_source) in ends {
+            if let Some(refusal) = self.node_build_refusal(connector) {
                 return refusal;
             }
         }
@@ -893,7 +901,7 @@ impl Case {
     }
 
     /// What refuses `connector`'s own node while the factory builds it.
-    fn node_build_refusal(self, connector: Connector, is_source: bool) -> Option<Expect> {
+    fn node_build_refusal(self, connector: Connector) -> Option<Expect> {
         let rejected = |reason: &'static str, fragment: &'static str| {
             Some(Expect::Rejected {
                 site: Site::Build,
@@ -916,39 +924,18 @@ impl Case {
                 "needs a 'transformer' key",
             );
         }
-        if self.format.fits(connector) {
-            return None;
-        }
-        match connector {
-            // Every transformer implements the stream surface, so the only
-            // format a stream connector cannot carry is [`Format::None`],
-            // refused above. Nothing else reaches a `file`, `http` or `s3`
-            // node without the surface it drives.
-            Connector::File | Connector::Http | Connector::S3 => {
-                unreachable!("every format offers the byte-stream surface")
-            }
-            // Kafka and NATS gate on `message_shape` inside `new`.
-            Connector::Kafka | Connector::Nats => {
-                rejected("the format has no message codec", "no message codec")
-            }
-            // Both halves settle the format while building, each through the
-            // question its own direction admits. The source asks for the exact
-            // capability it needs: `open_message_decoder` takes only the
-            // declared schema, so `TcpIngestSource::new` opens one and hands
-            // the refusal back. The sink has no encoder to open, because
-            // `encode_messages` is the only encode entry point and it needs a
-            // batch, so `TcpSink::connect` gates on `message_shape`, whose
-            // contract is that `None` means no message surface. That is the
-            // same gate Kafka and NATS use.
-            Connector::Tcp if is_source => rejected(
-                "the format has no message decoder",
-                "does not support decoding discrete messages",
-            ),
-            Connector::Tcp => rejected("the format has no message codec", "no message codec"),
-            Connector::Channel | Connector::Postgresql => {
-                unreachable!("a rows connector returned above")
-            }
-        }
+        // Every transformer implements both byte surfaces, so [`Format::None`]
+        // above is the only format any byte connector refuses. Nothing else
+        // reaches a node without the surface it drives, on either end: a
+        // `file`, `http` or `s3` node opens a reader or a writer, a `kafka`,
+        // `nats` or `tcp` sink gates on `message_shape` and a `tcp` source
+        // opens a decoder, and all five formats answer all four.
+        assert!(
+            self.format.fits(connector),
+            "every format offers the surface a {} node drives",
+            connector.label()
+        );
+        None
     }
 
     /// What refuses `connector` once rows are moving.

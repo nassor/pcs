@@ -78,6 +78,10 @@ arrow-csv     = { version = "59.2.0" }
 # and arrow-avro rejects an OCF in either codec by naming the missing feature.
 arrow-avro    = { version = "59.2.0", default-features = false, features = ["deflate", "snappy", "zstd"] }
 parquet       = { version = "=59.2.0", default-features = false, features = ["arrow", "snap"] }
+# `parquet`'s `ChunkReader` is implemented for `File` and for `bytes::Bytes`
+# only, so a Parquet file that lives in a message payload rather than on disk
+# is read through `Bytes`.
+bytes         = { version = "1.12.1" }
 serde_arrow   = { version = "0.15.0", features = ["arrow-59"] }
 
 # Common runtime deps

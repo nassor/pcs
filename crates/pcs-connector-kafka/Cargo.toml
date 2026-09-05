@@ -41,7 +41,6 @@ rdkafka       = { version = "0.39", features = ["cmake-build"] }
 [dev-dependencies]
 # The payload formats the round-trip tests exercise, constructed directly.
 pcs-transformer-arrow-ipc = { path = "../pcs-transformer-arrow-ipc" }
-pcs-transformer-csv = { path = "../pcs-transformer-csv" }
 pcs-transformer-ndjson = { path = "../pcs-transformer-ndjson" }
 
 # The Kafka broker the integration tests drive. The core crate rather than

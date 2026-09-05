@@ -47,7 +47,6 @@ async-nats = { version = "0.50.0", default-features = false, features = [
 [dev-dependencies]
 # The payload formats the round-trip tests exercise, constructed directly.
 pcs-transformer-arrow-ipc = { path = "../pcs-transformer-arrow-ipc" }
-pcs-transformer-csv       = { path = "../pcs-transformer-csv" }
 pcs-transformer-ndjson    = { path = "../pcs-transformer-ndjson" }
 
 # The NATS server the integration tests drive. Pinned here rather than in

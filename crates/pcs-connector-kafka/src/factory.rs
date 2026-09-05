@@ -173,16 +173,29 @@ schema_fields "id" type="int64"
         assert!(err.message().contains("'key_field'"), "got: {err}");
     }
 
+    /// A stream-only format: every message method keeps the [`Transformer`]
+    /// contract's `unsupported` default. Every format PCS registers implements
+    /// the message surface, so the gate is exercised against a stand-in rather
+    /// than a shipped format.
+    struct StreamOnly;
+
+    impl Transformer for StreamOnly {
+        fn format(&self) -> &'static str {
+            "stream-only"
+        }
+    }
+
     #[test]
     fn a_format_with_no_message_codec_is_rejected() {
         let value = from_kdl_str(SINK).expect("parse kdl");
-        let ctx = context(pcs_transformer_csv::CsvTransformerFactory);
+        let ctx = ConnectorContext::new(Some(Arc::new(StreamOnly) as Arc<dyn Transformer>));
 
         let Err(err) = KafkaSinkFactory.build(&value, &ctx) else {
-            panic!("csv has no message surface");
+            panic!("a format with no message surface must be refused");
         };
         assert_eq!(err.category(), "configuration");
-        assert!(err.message().contains("'csv'"), "got: {err}");
+        assert!(err.message().contains("'stream-only'"), "got: {err}");
+        assert!(err.message().contains("no message codec"), "got: {err}");
     }
 
     #[test]

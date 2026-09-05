@@ -165,18 +165,20 @@ source "orders_in" type="FileSource" component="Order" transformer="orders_csv" 
 <h2 id="capabilities">What each format can do</h2>
 
 <p>
-    A transformer has two surfaces and need not implement both. The stream surface,
-    <code>open_reader</code> and <code>open_writer</code>, is what the file connector uses. The
-    message surface, <code>open_message_decoder</code> and <code>encode_messages</code>, is
-    what TCP and Kafka use. A surface a format does not implement is a configuration error
+    A transformer has two surfaces. The stream surface, <code>open_reader</code> and
+    <code>open_writer</code>, is what the file, HTTP and S3 connectors use. The message
+    surface, <code>open_message_decoder</code> and <code>encode_messages</code>, is what
+    Kafka, NATS and TCP use. All five formats implement both, so no format is refused for
+    lacking a surface; a format that implemented only one would be a configuration error
     naming the format and the capability.
 </p>
 
 <p>
-    File and Kafka raise it while the connector is built, because both ask for the surface
-    there. TCP takes the transformer it is handed and asks for nothing, so a <code>csv</code>
-    transformer on a <code>tcp</code> source passes <code>pcs-service validate</code> and the
-    missing decoder is logged when a connection arrives, closing that one connection.
+    Every connector settles that at build time. A message sink gates on
+    <code>message_shape</code>, which answers for both directions, and a <code>tcp</code>
+    source opens a decoder off the declared schema inside its constructor, so
+    <code>pcs-service validate</code> is where a mismatch surfaces rather than the first
+    connection.
 </p>
 
 <table class="rule-table">
@@ -188,8 +190,8 @@ source "orders_in" type="FileSource" component="Order" transformer="orders_csv" 
             <td><strong><a href="{{ get_url(path='@/transformers/csv.md') }}"><code>csv</code></a></strong></td>
             <td><b>yes</b></td>
             <td><b>yes</b></td>
-            <td>no</td>
-            <td>none</td>
+            <td><b>yes</b></td>
+            <td><code>PerRow</code></td>
             <td>required</td>
             <td><code>pcs-transformer-csv</code></td>
         </tr>
@@ -206,9 +208,9 @@ source "orders_in" type="FileSource" component="Order" transformer="orders_csv" 
             <td><strong><a href="{{ get_url(path='@/transformers/parquet.md') }}"><code>parquet</code></a></strong></td>
             <td><b>yes</b></td>
             <td><b>yes</b></td>
-            <td>no</td>
-            <td>none</td>
-            <td>refused</td>
+            <td><b>yes</b></td>
+            <td><code>PerBatch</code></td>
+            <td>refused reading a file, required writing and on messages</td>
             <td><code>pcs-transformer-parquet</code></td>
         </tr>
         <tr>
@@ -226,21 +228,26 @@ source "orders_in" type="FileSource" component="Order" transformer="orders_csv" 
             <td><b>yes</b></td>
             <td><b>yes</b></td>
             <td><code>PerBatch</code></td>
-            <td>refused reading a stream, required on messages</td>
+            <td>refused reading a stream, required writing and on messages</td>
             <td><code>pcs-transformer-arrow-ipc</code></td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    <code>arrow-ipc</code> uses one encapsulation on both surfaces, so a file written by a
-    <code>FileSink</code> decodes through the message decoder and one Kafka payload opens as a
-    reader.
-    <code>csv</code> and <code>parquet</code> have no message codec, so a <code>csv</code>
-    transformer on a Kafka source or sink fails at build with
-    <code>KafkaSink: format 'csv' has no message codec</code>. <code>parquet</code> is the only
-    format that reports <code>estimated_rows</code>, summed from row-group metadata without
-    reading any data.
+    <code>arrow-ipc</code> and <code>parquet</code> each use one encapsulation on both
+    surfaces, so a file written by a <code>FileSink</code> decodes through the message decoder
+    and one Kafka payload opens as a reader. A <code>parquet</code> payload is a whole file,
+    footer included: about 470 bytes of fixed cost for a three-column row type before any
+    data, which is why its shape is <code>PerBatch</code>. <code>parquet</code> is also the
+    only format that reports <code>estimated_rows</code>, summed from row-group metadata
+    without reading any data.
+</p>
+
+<p>
+    <code>csv</code>'s <code>has_headers</code> option governs the stream surface alone. A
+    message is one record with no header line, in either direction, because the decoder is
+    handed the declared schema and needs no column names.
 </p>
 
 <p>

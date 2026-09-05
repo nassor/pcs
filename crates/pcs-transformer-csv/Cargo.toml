@@ -16,6 +16,7 @@ pcs-transformer = { path = "../pcs-transformer", version = "0.1.0" }
 arrow-array   = { workspace = true }
 arrow-csv     = { workspace = true }
 arrow-schema  = { workspace = true }
+arrow-select  = { workspace = true }
 
 [dev-dependencies]
 tempfile      = { workspace = true }

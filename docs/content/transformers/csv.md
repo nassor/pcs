@@ -12,17 +12,16 @@ label = "Feature"
 value = "<code>transformer-csv</code>"
 [[extra.facts]]
 label = "Surfaces"
-value = "Stream read and write; no message codec"
+value = "All four; message shape <code>PerRow</code>"
 [[extra.facts]]
 label = "Declared schema"
-value = "Required when reading"
+value = "Required reading a file and on messages"
 +++
 
 ## What it does
 
-`CsvTransformer` reads and writes comma separated text through `arrow-csv`. The format carries
-no types, so the declared schema is what governs them. It has no message codec, which makes it
-a file format only.
+`CsvTransformer` reads and writes comma separated text through `arrow-csv`, as a stream and as
+discrete messages. The format carries no types, so the declared schema is what governs them.
 
 ## options
 
@@ -41,20 +40,37 @@ Reading requires a declared schema. Without one the build fails with
 Writing takes the columns of each batch it is handed. The writer stores no schema at all, so
 `schema_fields` on a `FileSink` is the connector's requirement, not this format's.
 
+On the message surface the declared schema builds the decoder directly, and it is the only thing
+that names the columns: a payload carries no header row.
+
 ## Surfaces
 
-Stream read and write. There is no message codec, so a Kafka, NATS or `tcp` node naming a `csv`
-transformer fails at build. The message names the half that refused:
-`KafkaSink: format 'csv' has no message codec` and `TcpSink: format 'csv' has no message codec`
-from the `message_shape` gate each sink stands on, and
-`format 'csv' does not support decoding discrete messages` from the decoder
-`TcpIngestSource::new` opens.
+All four: stream read, stream write, message decode and message encode, with shape `PerRow`.
+
+Encoding emits one payload per row, no header line and no record terminator. Each row is written
+through its own writer rather than splitting one encoding of the batch on newlines, because a
+quoted field may carry a newline of its own.
+
+Decoding feeds each payload plus a newline into the streaming decoder, so a producer that left a
+terminator on its payload and one that did not both decode to one row. An empty payload is
+`csv: empty payload`. One window is one batch however many payloads it holds.
 
 ## Header rows
 
-`has_headers` drives the header on both halves: the reader expects one, the writer emits one, so
-a round trip is symmetric. `finish` flushes the last block explicitly rather than leaving it to
-`Drop`, which would swallow the error.
+`has_headers` governs the stream surface alone: the reader expects a header row, the writer emits
+one, so a stream round trip is symmetric. `finish` flushes the last block explicitly rather than
+leaving it to `Drop`, which would swallow the error.
+
+The message surface has no header row in either direction, whatever the option says. A payload is
+one record, which leaves no line to spare, and the decoder is handed the declared schema. A stream
+option that changed message framing would leave a topic readable only by a consumer that guessed
+the producer's setting.
+
+## Types
+
+Text with a declared schema round-trips every Arrow type the schema names, unsigned integers
+included: the declared type parses the field whatever the digits look like. The one value CSV
+cannot carry is an empty string, which it writes as nothing and reads back as a null.
 
 ## Example
 

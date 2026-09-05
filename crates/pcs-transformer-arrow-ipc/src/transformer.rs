@@ -146,9 +146,11 @@ impl BatchWriter for ArrowIpcBatchWriter {
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), PcsError> {
-        // Writes the end-of-stream marker and flushes the `BufWriter` down to
-        // the handle. Without it a reader reports a truncated message instead
-        // of end of stream.
+        // Writes the end-of-stream marker, then flushes the `BufWriter` down
+        // to the handle. The flush is what makes this load-bearing: a
+        // `StreamReader` treats plain EOF as a clean end of stream, so a
+        // skipped `finish` loses the buffered tail silently, up to and
+        // including the schema message of a stream that wrote one batch.
         self.writer
             .finish()
             .map_err(|e| PcsError::generic(format!("arrow-ipc: finish error: {e}")))

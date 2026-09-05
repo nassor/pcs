@@ -85,6 +85,17 @@ jobs:
     - name: Check examples
       run: cargo check -q --examples
 
+    # Registry pass builds and runs the runnable example configs
+    # (examples.rs); a missing toolchain (Go/dotnet for quickstart, Gradle
+    # for polyglot) is recorded as a failure for that one config and does not
+    # stop the rest, so this runs unconditionally alongside the Rust-only
+    # ones. Config-only pass then parses every examples/configs/*.kdl file
+    # through every built-in connector's factory with `--all-features`,
+    # which is why this job's librdkafka prerequisite above has to run
+    # before this step.
+    - name: Validate example configs
+      run: cargo xtask validate
+
     # `ci` profile: the full suite, including the Docker-backed
     # connector/chaos tests the `default` profile skips for everyday local
     # runs. The one #[ignore]d test (a ~70-100s chaos run) is deliberately

@@ -1023,6 +1023,127 @@ mod tests {
         assert_eq!(service.nodes[0].artifact, None);
     }
 
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn test_connectors_only_runs_every_connector_but_skips_a_missing_processor_module() {
+        /// A minimal stand-in for a real connector's `deny_unknown_fields`
+        /// config, so this test exercises the same failure mode a real
+        /// connector's factory does: an unrecognised key is a hard error,
+        /// not something dropped silently.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictSourceConfig {
+            #[serde(default)]
+            #[allow(dead_code)]
+            greeting: String,
+        }
+
+        struct StrictSourceFactory;
+        impl SourceFactory for StrictSourceFactory {
+            fn type_name(&self) -> &'static str {
+                "StrictSource"
+            }
+            fn build(
+                &self,
+                config: &ConfigValue,
+                _ctx: &ConnectorContext,
+            ) -> Result<Box<dyn Source>, PcsError> {
+                serde_json::from_value::<StrictSourceConfig>(config.clone())
+                    .map_err(|e| PcsError::configuration(format!("StrictSource config: {e}")))?;
+                use pcs_connector_channel::ChannelSource;
+                let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+                let (_tx, src) = ChannelSource::new(schema, 1);
+                Ok(Box::new(src))
+            }
+        }
+
+        // Source, processor and sink linked end to end, the same shape
+        // `build_all` walks — but the wasm node names a module this test
+        // never writes to disk, so `build_all` would fail trying to read it.
+        fn workflow_naming_a_missing_module(source_config: ConfigValue) -> WorkflowSpec {
+            let mut workflow = empty_workflow("w");
+            workflow.sources.push(SourceSpec {
+                id: "src1".to_string(),
+                name: None,
+                type_name: "StrictSource".to_string(),
+                transformer: None,
+                component: "comp1".to_string(),
+                retry: RetryConfig::default(),
+                config: source_config,
+            });
+            workflow.sinks.push(SinkSpec {
+                id: "sink1".to_string(),
+                name: None,
+                type_name: "NoopSink".to_string(),
+                transformer: None,
+                component: "comp1".to_string(),
+                retry: RetryConfig::default(),
+                config: ConfigValue::Object(ConfigMap::new()),
+            });
+            workflow.wasm.push(super::super::config::WasmSpec {
+                id: "p".to_string(),
+                name: None,
+                module: Some("pipelines/does-not-exist.wasm".to_string()),
+                sha3_256: None,
+                config: std::collections::HashMap::new(),
+                #[cfg(feature = "windows")]
+                window: None,
+            });
+            workflow.links.push(super::super::config::LinkSpec {
+                from: "src1".to_string(),
+                to: "p".to_string(),
+                branch: None,
+            });
+            workflow.links.push(super::super::config::LinkSpec {
+                from: "p".to_string(),
+                to: "sink1".to_string(),
+                branch: None,
+            });
+            workflow
+        }
+
+        // Half 1: a valid connector config plus a processor artifact that
+        // does not exist on disk. This is the whole reason
+        // `build_connectors_only` exists: it must succeed here, where
+        // `build_all` would fail on the missing module before ever reaching
+        // the sink.
+        let mut valid = ConfigMap::new();
+        valid.insert(
+            "greeting".to_string(),
+            ConfigValue::String("hi".to_string()),
+        );
+        let config = base_config(workflow_naming_a_missing_module(ConfigValue::Object(valid)));
+        ServiceBuilder::new()
+            .register_source(StrictSourceFactory)
+            .register_sink(NoopSinkFactory)
+            .build_connectors_only(&config)
+            .unwrap_or_else(|e| {
+                panic!("connectors-only build should skip the missing module: {e}")
+            });
+
+        // Half 2: the same shape, but the source's own config carries a key
+        // its factory does not recognise. `build_connectors_only` must still
+        // run that connector's own validation and name it in the error —
+        // skipping the processor must not mean skipping the connectors too.
+        let mut bad = ConfigMap::new();
+        bad.insert(
+            "no_such_key".to_string(),
+            ConfigValue::String("x".to_string()),
+        );
+        let config = base_config(workflow_naming_a_missing_module(ConfigValue::Object(bad)));
+        let err = ServiceBuilder::new()
+            .register_source(StrictSourceFactory)
+            .register_sink(NoopSinkFactory)
+            .build_connectors_only(&config)
+            .expect_err(
+                "an unknown key in a connector's config must fail connectors-only validation",
+            );
+        assert!(
+            err.message().contains("StrictSource") && err.message().contains("no_such_key"),
+            "error should name the connector and the offending key: {err}"
+        );
+    }
+
     #[test]
     fn test_boxed_system_runs_on_runtime() {
         let mut pipeline = Pipeline::new("test");

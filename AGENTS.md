@@ -146,7 +146,8 @@ build still cannot write a compressed record batch and must reject one.
 
 Tests run through [`cargo-nextest`](https://nexte.st), not bare `cargo test`, via
 `.config/nextest.toml`. `cargo install cargo-nextest --locked --version 0.9.143` installs it. Two
-profiles exist, and which one to reach for depends on why you're running tests:
+nextest profiles cover most of the workspace, plus one suite that neither runs by default; which
+to reach for depends on why you're running tests:
 
 - `cargo nextest run --workspace --all-features` (the `default` profile): the everyday command.
   It compiles the same `--all-features` closure as always, but skips every test that needs a

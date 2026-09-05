@@ -99,11 +99,10 @@ test-group = "heavy-docker"
 
 # pcs-service::connector_matrix's full_matrix runs four container startups
 # end to end behind the whole source x sink x transformer x processor-runtime
-# product. A measured run took about 1250s on a fast 16-core local box,
-# printing "(1 slow)" against the previous 900s override, and a GitHub
-# Actions runner is slower still, so raise this well past that measured
-# figure for headroom; with no override at all every run would be flagged
-# SLOW for reporting a real result, not a hang. Placed before the
+# product. A measured run takes about 1250s on a fast 16-core local box, and a
+# GitHub Actions runner is slower still, so this threshold sits well past that
+# measured figure for headroom; with no override at all every run would be
+# flagged SLOW for reporting a real result, not a hang. Placed before the
 # heavy-docker override below so it wins `slow-timeout`: that override still
 # supplies `test-group`, because nextest resolves each setting independently
 # against the first matching override that specifies it.

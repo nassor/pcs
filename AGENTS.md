@@ -30,7 +30,7 @@ cargo audit                                                  # Security audit (n
 cargo xtask polyglot                                         # Build the six polyglot processors
 cargo xtask quickstart                                       # Build the two Quick Start processors
 cargo xtask ui                                               # Rebuild the /ui dashboard bundle
-cargo xtask validate                                         # Validate every runnable example config
+cargo xtask validate                                         # Validate example configs: build+run the registry, parse-check the rest
 cargo xtask demo <name>                                      # Build and run an example pipeline
 cargo xtask --help                                           # Every task the runner carries
 ```
@@ -396,6 +396,9 @@ xtask/                            # The task runner behind `cargo xtask <command
                                   # codes are documented per module and CI reads them.
                                   # validate and demo (examples.rs) inject a `variables` block
                                   # into example configs, so they run with no OS env export.
+                                  # validate also parses every examples/configs/*.kdl file
+                                  # through pcs-service validate --connectors-only, discovered
+                                  # from the directory rather than a hand-maintained list.
 ```
 
 ## Feature flags

@@ -99,6 +99,15 @@ pub struct ValidateArgs {
     /// types cause a non-zero exit.
     #[arg(long)]
     pub strict: bool,
+    /// Build only sources, sinks and transformers; skip processor nodes and
+    /// the workflow-graph check that needs their built components.
+    ///
+    /// For a config naming a processor module not present on disk (a
+    /// template, or one built by a separate step), this still exercises
+    /// every connector's own `deny_unknown_fields` config and its
+    /// `validate()`, with no live service and no processor artifact needed.
+    #[arg(long)]
+    pub connectors_only: bool,
 }
 
 /// Arguments for the `status` subcommand.

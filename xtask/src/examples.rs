@@ -190,17 +190,34 @@ pub fn service_binary(ctx: &Ctx) -> PathBuf {
         .join(format!("target/debug/pcs-service{EXE_SUFFIX}"))
 }
 
+/// Write a copy of `config` with a `variables { ... }` block prepended,
+/// resolving each `(name, value)` pair. The copy goes to `out` and needs no
+/// OS env export to load.
+pub fn inject_variables(
+    ctx: &Ctx,
+    config: &Path,
+    pairs: &[(&str, String)],
+    out: &Path,
+) -> Result<()> {
+    let text = ctx.read(config)?;
+    let mut vars = String::new();
+    for (name, value) in pairs {
+        vars.push_str(&format!("    {name} \"{value}\"\n"));
+    }
+    ctx.write(out, &format!("variables {{\n{vars}}}\n\n{text}"))?;
+    Ok(())
+}
+
 /// Write a copy of an example's config with a `variables { ... }` block
 /// prepended, resolving every name in its registry entry. The copy goes to
 /// `out` and needs no OS env export to load.
 pub fn inject(ctx: &Ctx, ex: &Example, out: &Path) -> Result<()> {
-    let text = ctx.read(Path::new(ex.config))?;
-    let mut vars = String::new();
-    for (name, value) in ex.variables {
-        vars.push_str(&format!("    {name} \"{}\"\n", value(ctx)));
-    }
-    ctx.write(out, &format!("variables {{\n{vars}}}\n\n{text}"))?;
-    Ok(())
+    let pairs: Vec<(&str, String)> = ex
+        .variables
+        .iter()
+        .map(|(name, value)| (*name, value(ctx)))
+        .collect();
+    inject_variables(ctx, Path::new(ex.config), &pairs, out)
 }
 
 /// Build `pcs-service` with the features `selected` examples need, once.
@@ -220,4 +237,21 @@ pub fn build_service(ctx: &Ctx, selected: &[&Example]) -> Result<()> {
         build = build.args(["--features", &features.join(",")]);
     }
     build.run()
+}
+
+/// Build `pcs-service` with every feature, for the config-only pass over
+/// every `examples/configs/*.kdl` file: that pass exercises every built-in
+/// connector's factory, not just the ones the registry's buildable entries
+/// need.
+pub fn build_service_all_features(ctx: &Ctx) -> Result<()> {
+    ctx.cargo()?
+        .args([
+            "build",
+            "-p",
+            "pcs-service",
+            "--bin",
+            "pcs-service",
+            "--all-features",
+        ])
+        .run()
 }

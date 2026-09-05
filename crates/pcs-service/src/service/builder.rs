@@ -376,6 +376,41 @@ impl ServiceBuilder {
         Ok(out)
     }
 
+    /// Build every declared source, sink and transformer across every
+    /// workflow, skipping processor nodes and the workflow-graph check that
+    /// needs their built components.
+    ///
+    /// Exercises the same connector factories [`build_all`](Self::build_all)
+    /// does: each node's `config` is deserialized into its connector-specific,
+    /// `deny_unknown_fields` struct and run through that struct's own
+    /// `validate()`. Every built-in connector's factory does this
+    /// synchronously with no network or broker connection (`serve` connects
+    /// lazily, on the first read or write), so this check needs no live
+    /// service and, unlike `build_all`, no processor artifact on disk either
+    /// — it is what lets a template config naming a `pipelines/*.wasm`
+    /// placeholder still have its connectors checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcsError::Configuration`] naming the workflow, node id and
+    /// offending key for the first source, sink or transformer that fails to
+    /// build. An unregistered factory type is one such error, exactly as it
+    /// is in `build_all`; the caller distinguishes it the same way
+    /// (`pcs-service validate`'s `is_unknown_factory_error`).
+    pub fn build_connectors_only(mut self, config: &ServiceConfig) -> Result<(), PcsError> {
+        let registry = Arc::new(std::mem::replace(&mut self.registry, Registry::new()));
+        for workflow in &config.workflows {
+            let transformers = build_transformers(&registry, &workflow.transformers)?;
+            for spec in &workflow.sources {
+                self.build_source_node(&spec.id, workflow, &registry, &transformers, false)?;
+            }
+            for spec in &workflow.sinks {
+                self.build_sink_node(&spec.id, workflow, &registry, &transformers)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Assemble a [`BuiltService`] for one declared `workflow`.
     ///
     /// # Errors

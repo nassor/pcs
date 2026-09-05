@@ -18,6 +18,15 @@
 //! `node.data_dir`, which exists only once the cluster runner has opened it, so
 //! `pcs-service serve` applies it at cluster startup.
 //!
+//! ## `--connectors-only`
+//!
+//! Runs Gate 1, then builds every source, sink and transformer
+//! ([`ServiceBuilder::build_connectors_only`](pcs_service::service::builder::ServiceBuilder::build_connectors_only))
+//! instead of Gate 2: every connector config still gets checked against its
+//! `deny_unknown_fields` struct, but a processor node's module or library is
+//! never touched, so a config naming a build artifact that does not exist on
+//! this machine still validates.
+//!
 //! ## Unknown type handling
 //!
 //! User-defined factory types (sources, sinks) are not in the built-in
@@ -45,18 +54,22 @@ use crate::cli::{GlobalOpts, ValidateArgs};
 /// Entry point for the `validate` subcommand.
 pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsError> {
     let config = ServiceConfig::load(&global.config)?;
+    let builder = register_builtin_factories(ServiceBuilder::new());
+
+    if args.connectors_only {
+        return run_connectors_only(builder, &config, args);
+    }
 
     // Building with the built-in registry also compiles any WASM module,
     // verifies its WIT world, and validates the workflow graph. Unknown type
     // names surface as configuration errors naming the missing factory.
-    let builder = register_builtin_factories(ServiceBuilder::new());
     let build_result = builder.build_all(&config);
 
     // Unknown-type errors become warnings; every other error is fatal
     // regardless of --strict.
     let (unknown_warnings, built) = match build_result {
         Ok(built) => (vec![], Some(built)),
-        Err(ref e) if is_unknown_factory_error(e) => (vec![e.message().to_string()], None),
+        Err(e) if is_unknown_factory_error(&e) => (vec![e.message().to_string()], None),
         Err(e) => {
             return Err(PcsError::configuration(format!(
                 "factory build failed: {}",
@@ -103,28 +116,70 @@ pub async fn run(global: &GlobalOpts, args: &ValidateArgs) -> Result<(), PcsErro
     }
     println!("  http.bind: {}", config.http.bind);
     println!("  log_level: {}", config.observability.log_level);
-    if unknown_warnings.is_empty() {
-        println!("OK: all declared types resolved in built-in registry");
-    } else {
-        for warn in &unknown_warnings {
-            eprintln!("WARNING: {warn}");
-        }
-        eprintln!(
-            "NOTE: {} unknown type(s) above are not in the built-in registry. \
-             They may be user-defined types registered at serve time. \
-             Use --strict to treat these as errors.",
-            unknown_warnings.len()
-        );
+    report_unknown_warnings(&unknown_warnings, args)
+}
 
-        if args.strict {
+/// `--connectors-only`: Gate 1, then every source, sink and transformer,
+/// skipping the processor and workflow-graph gate entirely.
+fn run_connectors_only(
+    builder: ServiceBuilder,
+    config: &ServiceConfig,
+    args: &ValidateArgs,
+) -> Result<(), PcsError> {
+    let (unknown_warnings, built) = match builder.build_connectors_only(config) {
+        Ok(()) => (vec![], true),
+        Err(e) if is_unknown_factory_error(&e) => (vec![e.message().to_string()], false),
+        Err(e) => {
             return Err(PcsError::configuration(format!(
-                "{} unknown factory type(s) found (--strict mode). \
-                 Register the factory or fix the type name in the config.",
-                unknown_warnings.len()
+                "factory build failed: {}",
+                e.message()
             )));
         }
+    };
+
+    println!("OK: config is structurally valid");
+    if built {
+        println!("OK: every source, sink and transformer built");
+    }
+    for workflow in &config.workflows {
+        println!(
+            "  workflow: {} (sources: {}, sinks: {})",
+            workflow.id,
+            workflow.sources.len(),
+            workflow.sinks.len()
+        );
+    }
+    report_unknown_warnings(&unknown_warnings, args)
+}
+
+/// Shared tail of both validation paths: print unknown-factory warnings, or
+/// the all-resolved line, and fail under `--strict` when there were any.
+fn report_unknown_warnings(
+    unknown_warnings: &[String],
+    args: &ValidateArgs,
+) -> Result<(), PcsError> {
+    if unknown_warnings.is_empty() {
+        println!("OK: all declared types resolved in built-in registry");
+        return Ok(());
     }
 
+    for warn in unknown_warnings {
+        eprintln!("WARNING: {warn}");
+    }
+    eprintln!(
+        "NOTE: {} unknown type(s) above are not in the built-in registry. \
+         They may be user-defined types registered at serve time. \
+         Use --strict to treat these as errors.",
+        unknown_warnings.len()
+    );
+
+    if args.strict {
+        return Err(PcsError::configuration(format!(
+            "{} unknown factory type(s) found (--strict mode). \
+             Register the factory or fix the type name in the config.",
+            unknown_warnings.len()
+        )));
+    }
     Ok(())
 }
 

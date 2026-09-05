@@ -181,11 +181,14 @@ async fn start_rustfs() -> Option<(ContainerAsync<GenericImage>, S3ConnectionCon
 
     // Readiness is the retry loop: a signed CreateBucket (via the container's
     // own curl, which the project's compose healthcheck uses too) succeeds only
-    // once the server is up.
+    // once the server is up. It also creates the bucket the test uses.
     let deadline = Instant::now() + Duration::from_secs(90);
     let user = format!("{ACCESS_KEY}:{SECRET_KEY}");
     loop {
-        let url = format!("http://127.0.0.1:{port}/{}", connection.bucket);
+        // Inside the container the server listens on 9000; the mapped port
+        // exists only on the host, so a probe run through `docker exec` names
+        // the container's own port.
+        let url = format!("http://127.0.0.1:9000/{}", connection.bucket);
         let cmd = ExecCommand::new([
             "curl",
             "-fsS",
@@ -199,13 +202,18 @@ async fn start_rustfs() -> Option<(ContainerAsync<GenericImage>, S3ConnectionCon
             user.as_str(),
             url.as_str(),
         ]);
-        let result = match container.exec(cmd).await {
+        let mut result = match container.exec(cmd).await {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("SKIP: rustfs exec failed: {e}");
                 return None;
             }
         };
+        // The exit code is only final once the exec's output streams have been
+        // consumed; reading it straight away reports `None` for a command that
+        // has in fact succeeded.
+        let _ = result.stdout_to_vec().await;
+        let _ = result.stderr_to_vec().await;
         match result.exit_code().await {
             Ok(Some(0)) => return Some((container, connection)),
             Ok(_) => {}

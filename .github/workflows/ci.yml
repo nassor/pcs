@@ -140,6 +140,56 @@ jobs:
     - name: Full-stack distributed chaos test
       run: cargo nextest run -p pcs-service --features distributed-raft --test distributed_integration_chaos --run-ignored ignored-only
 
+  # Isolated in its own job because it holds four containers (Kafka, NATS,
+  # PostgreSQL, MinIO/S3) for its entire run and walks the full connector x
+  # sink x transformer x processor-runtime product, so its runtime must not
+  # sit on the `test` job's critical path.
+  connector_matrix:
+    name: Connector Matrix
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0  # Rust minimum version
+
+    # pcs-service's dev-dependencies pull in pcs-connector-kafka, whose
+    # rdkafka-sys cmake build compiles rdkafka_conf.c's `#include
+    # <curl/curl.h>` on POSIX even with `-DWITH_CURL=0`; see AGENTS.md.
+    - name: Install librdkafka build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: target
+        key: ${{ runner.os }}-connector-matrix-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install wasm32-wasip2 target
+      run: rustup target add wasm32-wasip2
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@0.9.143
+
+    - name: Build smoketest WASM component
+      run: cargo build --release -p pcs-processor-smoketest --target wasm32-wasip2
+
+    - name: Build smoketest native plugin
+      run: cargo build -p pcs-plugin-smoketest
+
+    - name: Connector/transformer/processor matrix
+      run: cargo nextest run -p pcs-service --all-features --profile ci --test connector_matrix --run-ignored ignored-only
+
   wasm_processor:
     name: WASM Processor (wasm32-wasip2)
     runs-on: ubuntu-latest

@@ -162,9 +162,11 @@ profiles exist, and which one to reach for depends on why you're running tests:
   `tests/common/memory_store.rs`.
 - `cargo nextest run --workspace --all-features --profile ci --run-ignored all` (the `ci`
   profile): the full suite, including everything `default` skips and any `#[ignore]`d test (today,
-  only `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
+  `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
   Raft-cluster-behind-Toxiproxy chaos run asserting that every node converges on the same applied
-  index and that the term advances under combined latency, bandwidth, reset and partition faults).
+  index and that the term advances under combined latency, bandwidth, reset and partition faults,
+  plus `connector_matrix.rs`'s `full_matrix`: `ci`'s `default-filter = "all()"` carries none of
+  `default`'s exclusions, so this command also pays for the matrix's four containers).
   This is the full suite to run as the last verification step of a plan, not something to reach
   for on every edit. `ci.yml` splits it in two: the `test`
   job runs `--profile ci` without `--run-ignored`, and a separate `distributed_chaos` job runs
@@ -173,6 +175,28 @@ profiles exist, and which one to reach for depends on why you're running tests:
   reordering the Docker/chaos exclusion list itself lives only in `.config/nextest.toml`; nothing
   here restates it, so that file is the one place to update when a test moves between the two
   profiles.
+- `crates/pcs-service/tests/connector_matrix.rs` (the `heavy-docker` test group, `ci.yml`'s
+  `connector_matrix` job): covers 1152 cases, one per `{source connector, sink connector, byte
+  format, processor runtime}` tuple over 8 connectors on each end, 6 formats (the five
+  transformers plus the absence of one, for the two connectors that carry `RecordBatch`es
+  natively) and 3 processor runtimes (native pipeline, WASM component, native plugin), plus one
+  maximal workflow declaring every node kind at once. It is one single test, `full_matrix`, in
+  one binary, because nextest gives each test binary its own process; the suite starts exactly
+  one container per external resource (Kafka, NATS, PostgreSQL, MinIO/S3) for its whole run,
+  isolating every case by a unique topic, subject, table, object prefix, file path or OS-assigned
+  port and running them all concurrently in-process. A rejected case asserts both the refusal and
+  where it lands: `build` (`ServiceConfig::load` or `ServiceBuilder::build_all` returns an error
+  containing a predicted fragment), `run` (the service builds but the runner reports a non-fatal
+  error and no row reaches the sink), or `no rows` (a clean run delivering nothing, the way a
+  `tcp` source does when it cannot build a decoder for its format). A build refusal touches no
+  live resource, so that coverage holds with no Docker daemon at all; a case whose resource has
+  no reachable container is skipped individually instead, so Docker-free combinations still run.
+  It is excluded from the `default` profile and `#[ignore]`d, so `--profile ci` skips it too; it
+  reaches CI only through the `connector_matrix` job (`cargo nextest run -p pcs-service
+  --all-features --profile ci --test connector_matrix --run-ignored ignored-only`). `--profile
+  ci` is required there: `--test` selects a cargo build target, not a nextest filter, so it
+  cannot bypass `default`'s exclusion of the binary. The job builds both the wasm and the
+  native-plugin smoketest fixtures first.
 
 `cargo test --workspace --all-features --doc` remains a separate, always-bare-`cargo-test` step in
 both this file and `ci.yml`: nextest does not run doctests.
@@ -199,15 +223,17 @@ binaries each get their own turn; nextest schedules every test from every binary
 thread pool (`test-threads`, default `num-cpus`), so Docker-backed tests from different crates run
 alongside each other instead of one binary finishing before the next starts.
 
-The Raft chaos suites are the exception, and the one place a runner feature does the work. The
-`raft-chaos` test group caps `max-threads = 1` over `transport_chaos`, `raft_consensus_chaos`,
-`distributed_harness_smoke` and `distributed_integration_chaos`, so those four take the machine one
-test at a time. Unlike a connector test, which needs only its own container, each of these contends
-for the Docker daemon, for host ports, and for enough CPU to run 3 to 5 raft nodes while asserting
-on election and log-convergence deadlines. The group is declared once and applied through an
-override in **both** profiles: `distributed_integration_chaos` is in it even though `default` never
-reaches that binary, because `ci` does. Adding a fifth chaos binary means adding it to both
-`filter` expressions.
+The Raft chaos suites and the connector matrix are the exception, and the one place a runner
+feature does the work. The `heavy-docker` test group caps `max-threads = 1` over
+`transport_chaos`, `raft_consensus_chaos`, `distributed_harness_smoke`,
+`distributed_integration_chaos` and `connector_matrix`, so those five take the machine one test at
+a time. Unlike a connector test, which needs only its own container, each Raft chaos binary
+contends for the Docker daemon, for host ports, and for enough CPU to run 3 to 5 raft nodes while
+asserting on election and log-convergence deadlines; `connector_matrix` holds four containers
+(Kafka, NATS, PostgreSQL, MinIO/S3) at once for its whole run instead. The group is declared once
+and applied through an override in **both** profiles: `distributed_integration_chaos` and
+`connector_matrix` are in it even though `default` never reaches either binary, because `ci` does.
+Adding another heavy-Docker binary to the group means adding it to both `filter` expressions.
 
 ## Workspace layout
 
@@ -854,6 +880,10 @@ collector, a scraper or external storage. Nothing leaves the process.
 - Tests live in `#[cfg(test)]` modules within each source file; integration tests are in each crate's
   `tests/`, run through `cargo nextest`. See "Testing" for the fast/full profile split, the
   Docker soft-skip convention, and why testcontainers-backed tests are safe to run in parallel.
+- Every new source connector, sink connector, transformer, and processor runtime must be added to
+  `crates/pcs-service/tests/connector_matrix.rs`'s dimension lists in the same change that
+  introduces it: its entry in the capability table (supported or rejected-at-build) and its node
+  in the maximal workflow. A connector or transformer not in the matrix is not considered wired.
 - Benchmarks use Criterion in each crate's `benches/`. Run them through `cargo xtask bench`, never
   bare `cargo bench`. The harness fixes `RUSTFLAGS`, compiles as a separate step so criterion does
   not share the machine with rustc, and takes the benchmark binary from cargo's own `Executable`

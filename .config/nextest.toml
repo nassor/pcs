@@ -99,7 +99,7 @@ test-group = "heavy-docker"
 
 # pcs-service::connector_matrix's full_matrix runs four container startups
 # end to end behind the whole source x sink x transformer x processor-runtime
-# product. A measured run takes about 828-877s on a fast 16-core local box, and a
+# product. A measured run takes about 920s on a fast 16-core local box, and a
 # GitHub Actions runner is slower still, so this threshold sits well past that
 # measured figure for headroom; with no override at all every run would be
 # flagged SLOW for reporting a real result, not a hang. Placed before the
@@ -111,7 +111,7 @@ test-group = "heavy-docker"
 # is the report it prints: the per-case matrix, the per-processor grids, the
 # supported/rejected/skipped/FAILED totals and the maximal workflow all go to
 # stdout, and nextest shows a passing test's output to nobody by default. A
-# green tick with no report says nothing about what the 14 minute run covered.
+# green tick with no report says nothing about what the run covered.
 [[profile.ci.overrides]]
 filter = 'binary_id(=pcs-service::connector_matrix)'
 slow-timeout = "2400s"

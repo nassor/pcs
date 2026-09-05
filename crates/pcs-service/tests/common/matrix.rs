@@ -28,9 +28,8 @@
 //! against 1152, and a mixed pair adds no connector or transformer coverage
 //! over the two paired cases that already cover both halves.
 //!
-//! The transformer dimension is not reduced: all 1152 cases run, in about six
-//! minutes of wall clock on a 16-core host with no Docker daemon, so nothing is
-//! traded away to fit the budget.
+//! The transformer dimension is not reduced either: every one of the 1152
+//! cases runs, so nothing is traded away to fit a time budget.
 //!
 //! # Row schema per processor
 //!
@@ -1285,8 +1284,8 @@ impl Resources {
     ///
     /// Lazily starting them from inside a case would put every readiness poll
     /// on the same task that is driving a thousand other case futures, so a
-    /// server that needs twenty seconds can miss a ninety-second budget for
-    /// want of being polled.
+    /// slow server could miss the readiness deadline its own `try_start_*`
+    /// sets for want of being polled.
     pub async fn warm(&self) -> Vec<(Resource, bool)> {
         let mut up = Vec::new();
         for resource in [

@@ -41,10 +41,15 @@
     feature = "transformer-parquet",
 ))]
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use pcs_core::error::PcsError;
 use pcs_service::service::builder::ServiceBuilder;
 use pcs_service::service::factories::register_builtin_factories;
+use pcs_transformer::{ConfigMap, ConfigValue, unsupported};
 use tokio::sync::Semaphore;
 
 #[path = "common/matrix.rs"]
@@ -183,4 +188,96 @@ fn dimensions_cover_the_registry() {
          common/matrix.rs's FORMATS names {expected_formats:?}; add the missing format's key to \
          FORMATS (or drop a stale entry) so the matrix covers every registered format",
     );
+}
+
+/// A one-column, one-row batch. `Transformer::encode_messages` needs a batch to
+/// answer at all, and a single non-null `Int64` column is what every format
+/// with an encoder can write.
+fn probe_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))])
+        .expect("probe batch matches its own schema")
+}
+
+/// Is `err` the `Transformer` contract's refusal of `capability`, rather than a
+/// real failure from a format that does implement it?
+///
+/// A transformer that has the method answers: `Ok`, or its own error. Only the
+/// trait's default body produces `unsupported`, so that exact message is what
+/// separates "no such surface" from "surface present, this input rejected".
+fn refuses(err: &PcsError, format: &str, capability: &str) -> bool {
+    err.message() == unsupported(format, capability).message()
+}
+
+/// Every registered transformer's [`Transformer::message_shape`] must agree
+/// with whether it really answers both message calls.
+///
+/// `message_shape()` is a declaration, and six connector call sites
+/// (`KafkaSource`, `KafkaSink`, `NatsSource`, `NatsSink`, `TcpIngestSource`,
+/// `TcpSink`) refuse a config at *build* time on its `is_none()`. Nothing in
+/// the type system ties that declaration to the methods: a transformer
+/// declaring `Some` without an encoder passes a message sink's gate and fails
+/// on the first batch, and one declaring `None` with both methods is refused
+/// for no reason. This test is what ties them together, for every transformer
+/// the registry can build.
+///
+/// The surfaces are probed rather than read off each `impl` block: calling
+/// both methods and asking whether the answer is the contract's [`unsupported`]
+/// refusal is the only check that cannot be fooled by an override that forwards
+/// to a default.
+///
+/// One `message_shape()` answers for both directions, so a transformer that
+/// implements exactly one of the two message methods cannot be declared
+/// honestly at all; that is the first assertion, and it fails loudly instead of
+/// letting a half surface hide behind `None`.
+///
+/// Docker-free and not `#[ignore]`d, like [`dimensions_cover_the_registry`]: it
+/// builds transformers straight from the registry, with no config, container or
+/// running service involved.
+///
+/// [`Transformer`]: pcs_transformer::Transformer
+/// [`Transformer::message_shape`]: pcs_transformer::Transformer::message_shape
+/// [`unsupported`]: pcs_transformer::unsupported
+#[test]
+fn message_shape_agrees_with_the_message_surface() {
+    let builder = register_builtin_factories(ServiceBuilder::new());
+    let transformers = builder.registry().transformers();
+    let batch = probe_batch();
+
+    for format in transformers.formats() {
+        let transformer = transformers
+            .get(format)
+            .expect("a format the registry lists resolves to its factory")
+            .build(&ConfigValue::Object(ConfigMap::new()))
+            .unwrap_or_else(|e| panic!("transformer '{format}' builds from empty options: {e}"));
+
+        let decodes = match transformer.open_message_decoder(batch.schema()) {
+            Ok(_) => true,
+            Err(e) => !refuses(&e, format, "decoding discrete messages"),
+        };
+        let encodes = match transformer.encode_messages(&batch) {
+            Ok(_) => true,
+            Err(e) => !refuses(&e, format, "encoding discrete messages"),
+        };
+        let declared = transformer.message_shape();
+
+        assert_eq!(
+            decodes, encodes,
+            "transformer '{format}' implements open_message_decoder={decodes} and \
+             encode_messages={encodes}: half a message surface. One message_shape() answers \
+             for both directions, so no declaration describes this transformer; implement the \
+             missing method, or make message_shape() direction-aware and split the connector \
+             gates that read it",
+        );
+        assert_eq!(
+            declared.is_some(),
+            decodes,
+            "transformer '{format}' declares message_shape()={declared:?} but implements \
+             open_message_decoder={decodes} and encode_messages={encodes}; a message connector \
+             refuses a config at build on message_shape().is_none(), so a Some declaration \
+             without the methods fails on the first batch and a None declaration with them \
+             refuses a config that would work. Fix whichever of the two is wrong in \
+             pcs-transformer-{format}",
+        );
+    }
 }

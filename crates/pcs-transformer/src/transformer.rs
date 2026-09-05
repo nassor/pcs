@@ -88,6 +88,25 @@ pub trait Transformer: Send + Sync + 'static {
 
     /// How this transformer splits a batch into messages, `None` when it has
     /// no message surface.
+    ///
+    /// This is a declaration about the other two message methods, and an
+    /// implementor must keep it true: return `Some` only when both
+    /// [`open_message_decoder`](Self::open_message_decoder) and
+    /// [`encode_messages`](Self::encode_messages) are implemented, `None` only
+    /// when neither is. One answer serves both directions, so a transformer
+    /// that implements exactly one of the two has no honest declaration to
+    /// make.
+    ///
+    /// Every message connector — the Kafka, NATS and TCP sources and sinks —
+    /// refuses its config at build time when this returns `None`, before a
+    /// socket is opened or a batch written. So a `Some` that outruns the
+    /// methods turns a configuration error into a first-batch failure with the
+    /// pipeline already live, and a `None` that understates them refuses a
+    /// config that would have worked.
+    ///
+    /// `message_shape_agrees_with_the_message_surface`
+    /// (`crates/pcs-service/tests/connector_matrix.rs`) probes both methods on
+    /// every registered transformer and fails on any disagreement.
     fn message_shape(&self) -> Option<MessageShape> {
         None
     }

@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
-    use pcs_transformer::MessageShape;
+    use pcs_transformer::{MessageDecoder, MessageShape};
     use pcs_transformer_arrow_ipc::ArrowIpcTransformer;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -239,13 +239,21 @@ mod tests {
 
     /// A format that encodes every batch to no messages at all, which is the
     /// only way to observe "no payloads, no frames" without a real codec that
-    /// does it. It declares a shape because it has an encoder: that is what
-    /// [`Transformer::message_shape`] is for.
+    /// does it. It declares a shape, so it must carry a whole message surface:
+    /// the decoder half is `arrow-ipc`'s, unexercised here but real, because
+    /// [`Transformer::message_shape`] answers for both directions at once.
     struct NoMessages;
 
     impl Transformer for NoMessages {
         fn format(&self) -> &'static str {
             "no-messages"
+        }
+
+        fn open_message_decoder(
+            &self,
+            schema: Arc<Schema>,
+        ) -> Result<Box<dyn MessageDecoder>, PcsError> {
+            ArrowIpcTransformer::new().open_message_decoder(schema)
         }
 
         fn encode_messages(&self, _batch: &RecordBatch) -> Result<Vec<Vec<u8>>, PcsError> {

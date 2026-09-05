@@ -304,6 +304,14 @@ the server to confirm each ack, and needs an ack policy: `double_ack` with `ack_
 refused. The sink waits for every publish ack by default, so a returned `write_batch` means the
 stream holds the rows.
 
+A message is acknowledged only once its window has been handed to the caller: each one carries its
+own ack until then, so a dropped `next_batch` future leaves the window on the source rather than
+acknowledging rows nobody received. A window the format cannot decode is therefore never
+acknowledged either — the source reports the decode error and the server redelivers that window
+after `ack_wait`, which repeats for as long as the payload stays undecodable. Bound it with
+`max_deliver`, which retires a message the consumer keeps failing on instead of letting it stall
+the stream.
+
 Core NATS is at-most-once and has no ack at all: a message consumed while the pipeline later fails
 is gone. A core sink's `flush_every_batch` waits for the server to acknowledge the whole write,
 which is the strongest boundary the protocol offers.

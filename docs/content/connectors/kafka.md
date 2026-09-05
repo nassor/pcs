@@ -143,10 +143,12 @@ in quotes is ignored and the source stays live.
 
 With `stop_at_end=#true` a window closes as soon as every assigned partition has reported
 end-of-partition, so a source that has read the whole topic hands its rows over at once instead of
-waiting out `poll_timeout_ms`; that window bounds only a poll that never reaches the end. Messages
-the consumer has already taken from the broker are held on the source, so a caller that drops a
-`next_batch` future — as the stream runner's one-second source prime does — gets them from the next
-call rather than losing them.
+waiting out `poll_timeout_ms`. The poll that reports EOF still costs one whole window: librdkafka
+reports end-of-partition once per fetch position and not again while that position is unchanged, so
+the drained source has nothing left to break on and ends on its deadline. Messages the consumer has
+already taken from the broker are held on the source, so a caller that drops a `next_batch` future
+— as the stream runner's one-second source prime does — gets them from the next call rather than
+losing them.
 
 ## Delivery
 

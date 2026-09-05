@@ -16,6 +16,13 @@
 //! Core NATS is at-most-once and has no ack at all: a message consumed while the
 //! pipeline later fails is gone. A `queue_group` spreads one core subject across
 //! several PCS instances.
+//!
+//! [`next_batch`](Source::next_batch) is cancel-safe either way: the collected
+//! window lives on the source rather than in the future, and a message's ack
+//! travels beside it until the window is handed over. Dropping that future — as
+//! `run_stream`'s one-second source prime does — therefore loses no message
+//! that core NATS would never send again, and acknowledges none that no caller
+//! has seen.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,10 +72,16 @@ enum Origin {
     Sequence(u64),
 }
 
-/// One collected message: its payload, and enough to name it in an error.
+/// One collected message: its payload, enough to name it in an error, and the
+/// acknowledgement that belongs to it.
 struct Received {
     origin: Origin,
     payload: Bytes,
+    /// This message's `Acker`, kept beside the payload rather than on the
+    /// source's pending list so a window nobody received cannot be
+    /// acknowledged. `None` in core mode, which has no acks at all, and under
+    /// `ack_policy = "none"`.
+    ack: Option<Acker>,
 }
 
 /// What the pull consumer needs per window, resolved once at start.
@@ -123,6 +136,14 @@ pub struct NatsSource {
     /// which has no acks at all.
     ack_mode: AckMode,
     state: Option<Started>,
+    /// The window collected but not yet handed to the caller, each message
+    /// still carrying its own `Acker`. It lives here rather than in
+    /// [`next_batch`](Source::next_batch)'s future so dropping that future —
+    /// as `run_stream`'s one-second source prime does — neither loses the
+    /// messages, which core NATS would never redeliver, nor acknowledges
+    /// them: an `Acker` reaches `pending_acks` only when its message reaches
+    /// the caller.
+    buffer: Vec<Received>,
     /// Ackers for the batch already handed to the caller, sent at the start of
     /// the next call. This is what makes JetStream delivery at-least-once.
     pending_acks: Vec<Acker>,
@@ -163,6 +184,7 @@ impl NatsSource {
             transformer,
             ack_mode,
             state: None,
+            buffer: Vec::new(),
             pending_acks: Vec::new(),
             last_pending: None,
         })
@@ -265,12 +287,14 @@ impl NatsSource {
         Ok(())
     }
 
-    async fn collect(&mut self) -> Result<Vec<Received>, PcsError> {
+    /// Fill [`self.buffer`](Self::buffer) with a window, resuming whatever a
+    /// cancelled call left in it.
+    async fn collect(&mut self) -> Result<(), PcsError> {
         let Self {
             cfg,
             ack_mode,
             state,
-            pending_acks,
+            buffer,
             last_pending,
             ..
         } = self;
@@ -278,7 +302,7 @@ impl NatsSource {
             .as_mut()
             .ok_or_else(|| PcsError::generic(format!("{WHAT}: collect before start")))?;
         match state {
-            Started::Core { subscribers, .. } => collect_core(subscribers, cfg).await,
+            Started::Core { subscribers, .. } => collect_core(subscribers, cfg, buffer).await,
             Started::Jetstream {
                 consumer, window, ..
             } => {
@@ -287,7 +311,7 @@ impl NatsSource {
                     window,
                     cfg,
                     *ack_mode,
-                    pending_acks,
+                    buffer,
                     last_pending,
                 )
                 .await
@@ -336,19 +360,21 @@ impl NatsSource {
     }
 }
 
-/// Collect a window off the merged core subscription.
+/// Collect a window off the merged core subscription into `buffer`, resuming
+/// whatever a cancelled call left in it.
 ///
 /// A live source blocks on its first message with no deadline, then keeps taking
-/// messages until `batch_size` or one `poll_timeout_ms` window. A `stop_at_end`
+/// messages until `batch_size` or one `poll_timeout_ms` window; a message a
+/// cancelled call already took satisfies that blocking phase. A `stop_at_end`
 /// source bounds every receive by that window: core NATS has no end-of-stream
 /// signal, so "the window elapsed with nothing on it" is the only EOF a
 /// subscription can offer.
 async fn collect_core(
     subscribers: &mut SelectAll<Subscriber>,
     cfg: &NatsSourceConfig,
-) -> Result<Vec<Received>, PcsError> {
-    let mut buffer = Vec::new();
-    if !cfg.stop_at_end {
+    buffer: &mut Vec<Received>,
+) -> Result<(), PcsError> {
+    if !cfg.stop_at_end && buffer.is_empty() {
         match subscribers.next().await {
             Some(message) => buffer.push(received_core(message)),
             None => return Err(closed_error()),
@@ -366,13 +392,14 @@ async fn collect_core(
             Err(_elapsed) => break,
         }
     }
-    Ok(buffer)
+    Ok(())
 }
 
 fn received_core(message: async_nats::Message) -> Received {
     Received {
         origin: Origin::Subject(message.subject),
         payload: message.payload,
+        ack: None,
     }
 }
 
@@ -429,7 +456,9 @@ impl Outstanding {
     }
 }
 
-/// Collect a window off the pull consumer.
+/// Collect a window off the pull consumer into `buffer`, resuming whatever a
+/// cancelled call left in it. Each message keeps its own `Acker`, so a window
+/// this returns has been acknowledged by nobody yet.
 ///
 /// `stop_at_end` uses `fetch`, which sets `no_wait` and returns only what is
 /// already there. An empty window is not EOF on its own: a consumer that has
@@ -446,18 +475,26 @@ async fn collect_jetstream(
     window: &PullWindow,
     cfg: &NatsSourceConfig,
     ack_mode: AckMode,
-    pending_acks: &mut Vec<Acker>,
+    buffer: &mut Vec<Received>,
     last_pending: &mut Option<usize>,
-) -> Result<Vec<Received>, PcsError> {
-    let mut buffer = Vec::new();
+) -> Result<(), PcsError> {
+    // What a cancelled call left behind goes over as it stands: a bounded
+    // source that asked again would pay another whole `fetch_expires_ms`
+    // window before handing over messages already in hand.
+    if cfg.stop_at_end && !buffer.is_empty() {
+        return Ok(());
+    }
     let mut confirm_deadline: Option<Instant> = None;
     loop {
         {
+            // What this window still has room for, so a window resumed after a
+            // cancel asks for the rest of `batch_size` rather than for another
+            // whole one. Never zero: a request for no messages is not a
+            // request, and the `stop_at_end` path above already returned a
+            // full carried window.
+            let room = cfg.batch_size.saturating_sub(buffer.len()).max(1);
             let batch = if cfg.stop_at_end {
-                let mut builder = consumer
-                    .fetch()
-                    .max_messages(cfg.batch_size)
-                    .expires(window.expires);
+                let mut builder = consumer.fetch().max_messages(room).expires(window.expires);
                 if window.max_bytes > 0 {
                     builder = builder.max_bytes(window.max_bytes);
                 }
@@ -468,7 +505,7 @@ async fn collect_jetstream(
             } else {
                 let mut builder = consumer
                     .batch()
-                    .max_messages(cfg.batch_size)
+                    .max_messages(room)
                     .expires(Duration::from_millis(cfg.poll_timeout_ms));
                 if window.max_bytes > 0 {
                     builder = builder.max_bytes(window.max_bytes);
@@ -505,22 +542,22 @@ async fn collect_jetstream(
                 };
                 *last_pending = Some(usize::try_from(pending).unwrap_or(usize::MAX));
 
-                let payload = if ack_mode == AckMode::Never {
-                    message.message.payload
+                let (payload, ack) = if ack_mode == AckMode::Never {
+                    (message.message.payload, None)
                 } else {
                     let (message, acker) = message.split();
-                    pending_acks.push(acker);
-                    message.payload
+                    (message.payload, Some(acker))
                 };
                 buffer.push(Received {
                     origin: Origin::Sequence(sequence),
                     payload,
+                    ack,
                 });
             }
         }
 
         if !buffer.is_empty() {
-            return Ok(buffer);
+            return Ok(());
         }
         if !cfg.stop_at_end {
             // `batch` completing empty means the window expired with nothing
@@ -531,7 +568,7 @@ async fn collect_jetstream(
         let outstanding = Outstanding::read(consumer, window).await?;
         *last_pending = Some(usize::try_from(outstanding.pending).unwrap_or(usize::MAX));
         if outstanding.is_drained() {
-            return Ok(buffer);
+            return Ok(());
         }
         let deadline =
             *confirm_deadline.get_or_insert_with(|| Instant::now() + outstanding.budget(cfg));
@@ -553,15 +590,27 @@ impl Source for NatsSource {
         Arc::clone(&self.schema)
     }
 
+    /// Cancel-safe: the collected window lives on the source, and a message's
+    /// `Acker` joins `pending_acks` only once that message is on its way to
+    /// the caller, so a dropped future neither loses a window nor
+    /// acknowledges one.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
         self.ensure_started().await?;
         self.flush_pending_acks().await?;
 
-        let received = self.collect().await?;
-        if received.is_empty() {
+        self.collect().await?;
+        if self.buffer.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.decode_window(&received)?))
+
+        let window = std::mem::take(&mut self.buffer);
+        let batch = self.decode_window(&window)?;
+        // Handed over, so this window's acks become the ones the next call
+        // sends. A decode error instead drops them here, and the server
+        // redelivers what it never saw acknowledged.
+        self.pending_acks
+            .extend(window.into_iter().filter_map(|message| message.ack));
+        Ok(Some(batch))
     }
 
     /// JetStream's own count of messages still waiting for this consumer, which

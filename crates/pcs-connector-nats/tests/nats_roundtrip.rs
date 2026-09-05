@@ -759,6 +759,66 @@ async fn an_empty_window_is_not_eof_while_the_consumer_still_owes_messages() {
 }
 
 #[tokio::test]
+async fn a_cancelled_window_keeps_the_messages_already_pulled() {
+    let Some(nats) = common::try_start().await else {
+        return;
+    };
+    let stream = nats.stream("JS_CANCEL");
+    let subject = nats.subject("js-cancel");
+    let schema = schema();
+
+    let mut sink = NatsSink::new(
+        js_sink_cfg(&nats.url(), &stream, &subject),
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("sink builds");
+    // Live rather than `stop_at_end`, and `batch_size` 2: a window this source
+    // cannot close on one message is a window that can be cancelled while it
+    // holds that message.
+    let mut source = NatsSource::new(
+        NatsSourceConfig {
+            batch_size: 2,
+            poll_timeout_ms: 5_000,
+            stop_at_end: false,
+            ..js_source_cfg(&nats.url(), &stream, "pcs-cancel")
+        },
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+
+    sink.write_batch(&batch_of(schema.clone(), &[1], &["a"], &[1.0]))
+        .await
+        .expect("write_batch");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), source.next_batch())
+            .await
+            .is_err(),
+        "a window one message short of batch_size must still be open, \
+         or this test cancels nothing"
+    );
+
+    // Two more, so the resumed window has to ask for the one place it has
+    // left rather than for another whole `batch_size`.
+    sink.write_batch(&batch_of(schema.clone(), &[2, 3], &["b", "c"], &[2.0, 3.0]))
+        .await
+        .expect("write_batch");
+    let resumed = tokio::time::timeout(Duration::from_secs(15), source.next_batch())
+        .await
+        .expect("the resumed poll must finish inside its own window")
+        .expect("the resumed poll must not error")
+        .expect("a live source blocks until it has rows");
+    assert_eq!(
+        ids_of(&resumed),
+        vec![1, 2],
+        "message 1 was pulled by the cancelled call, so it must be handed over \
+         by this one rather than acknowledged unseen, and the resumed window \
+         must still hold at most batch_size rows"
+    );
+}
+
+#[tokio::test]
 async fn a_missing_stream_names_itself_when_provisioning_is_off() {
     let Some(nats) = common::try_start().await else {
         return;

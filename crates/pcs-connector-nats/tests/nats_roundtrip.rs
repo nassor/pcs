@@ -695,6 +695,70 @@ async fn stop_at_end_reports_eof_once_the_stream_is_drained() {
 }
 
 #[tokio::test]
+async fn an_empty_window_is_not_eof_while_the_consumer_still_owes_messages() {
+    let Some(nats) = common::try_start().await else {
+        return;
+    };
+    let stream = nats.stream("JS_OWED");
+    let subject = nats.subject("js-owed");
+    let schema = schema();
+
+    let mut sink = NatsSink::new(
+        js_sink_cfg(&nats.url(), &stream, &subject),
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("sink builds");
+    sink.write_batch(&sample_batch(schema.clone()))
+        .await
+        .expect("write_batch");
+    sink.finish().await.expect("finish");
+
+    // `ack_wait` deliberately outlasts one `fetch_expires_ms` window: a
+    // redelivery therefore cannot land inside the single window a source that
+    // trusts an empty window would have asked for.
+    let cfg = |url: &str| NatsSourceConfig {
+        mode: SourceMode::Jetstream(Box::new(JetstreamSourceMode {
+            stream: stream.clone(),
+            durable_name: Some("pcs-owed".to_string()),
+            fetch_expires_ms: 1_000,
+            ack_wait_ms: 4_000,
+            ..JetstreamSourceMode::default()
+        })),
+        poll_timeout_ms: 3_000,
+        ..js_source_cfg(url, &stream, "pcs-owed")
+    };
+
+    // One source takes the whole stream and is dropped without ever
+    // acknowledging it: the server counts all three messages as delivered and
+    // holds them until `ack_wait` expires. That is the state a window nobody
+    // read leaves behind, and from the next consumer's side it is
+    // indistinguishable from a drained stream until the server is asked.
+    let mut abandoned =
+        NatsSource::new(cfg(&nats.url()), schema.clone(), ndjson()).expect("source builds");
+    let taken = abandoned
+        .next_batch()
+        .await
+        .expect("first next_batch")
+        .expect("three messages are waiting");
+    assert_eq!(ids_of(&taken), vec![1, 2, 3]);
+    drop(abandoned);
+
+    let mut resumed =
+        NatsSource::new(cfg(&nats.url()), schema.clone(), ndjson()).expect("source builds");
+    let redelivered = tokio::time::timeout(Duration::from_secs(20), resumed.next_batch())
+        .await
+        .expect("the confirm-drained budget covers one ack_wait")
+        .expect("next_batch")
+        .expect("a stream that still owes three messages must not report EOF");
+    assert_eq!(
+        ids_of(&redelivered),
+        vec![1, 2, 3],
+        "every message the consumer still owed must come back"
+    );
+}
+
+#[tokio::test]
 async fn a_missing_stream_names_itself_when_provisioning_is_off() {
     let Some(nats) = common::try_start().await else {
         return;

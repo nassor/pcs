@@ -285,9 +285,16 @@ and the source stays live.
 </p>
 </div>
 
-With `stop_at_end=#true` a JetStream source uses a `no_wait` pull, so an empty result is EOF. A
-core source has no end-of-stream signal at all, so one elapsed `poll_timeout_ms` window with
-nothing on it is the only EOF a subscription can offer.
+With `stop_at_end=#true` a JetStream source uses a `no_wait` pull, and an empty window is EOF only
+once the server confirms it: the source reads the consumer's `num_pending` and `num_ack_pending`,
+and reports end of stream only when both are zero. A consumer that has not started serving yet,
+and one whose delivered window never reached the caller, both answer a pull exactly like a drained
+stream does, so an empty window on its own is not enough. While either counter is non-zero the
+source asks again, for `poll_timeout_ms` plus, when messages are held unacknowledged, one
+`ack_wait` — the time until the server redelivers them. If nothing arrives in that budget the
+source raises an error rather than reporting an end of stream it cannot vouch for. A core source
+has no end-of-stream signal at all, so one elapsed `poll_timeout_ms` window with nothing on it is
+the only EOF a subscription can offer.
 
 ## Delivery
 

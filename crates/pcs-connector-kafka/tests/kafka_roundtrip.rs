@@ -29,6 +29,24 @@ use pcs_transformer_ndjson::NdjsonTransformer;
 
 const COMPONENT: &str = "TestRow";
 
+/// The window `run_stream`'s source prime gives a source's first
+/// `next_batch` before it drops the future.
+const PRIME_WINDOW: Duration = Duration::from_secs(1);
+
+/// A poll window wide enough that idling one out is unmistakable next to
+/// [`DRAINED_BOUND`].
+const CANCEL_POLL_MS: u64 = 45_000;
+
+/// What a `stop_at_end` source that has read everything may take to hand it
+/// over. Three times a cold subscribe-and-fetch, a third of the poll window
+/// it must not sit through.
+const DRAINED_BOUND: Duration = Duration::from_secs(15);
+
+/// The poll window the live-mode cancellation test gives its source. A poll
+/// bounded above it observes what a source that lost a message returns,
+/// instead of ending on a timeout that says only "slow".
+const LIVE_POLL_MS: u64 = 20_000;
+
 /// The payload format most of these tests use. The factories are handed the
 /// transformer the host resolved; a direct construction like these tests'
 /// builds it here.
@@ -178,6 +196,26 @@ async fn drain_compacted(
         }
     }
     (rows, sizes)
+}
+
+/// Produce one wave of rows to `topic` and flush it, the way a producer feeds
+/// a live source between two of its polls.
+async fn produce_wave(brokers: &str, topic: &str, batch: &RecordBatch) {
+    let mut sink =
+        KafkaSink::new(sink_cfg(brokers, topic), batch.schema(), ndjson()).expect("sink builds");
+    sink.write_batch(batch).await.expect("write_batch");
+    sink.finish().await.expect("finish");
+}
+
+/// The `id` column of `batch`, in row order.
+fn ids_of(batch: &RecordBatch) -> Vec<i64> {
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column is Int64")
+        .values()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -480,6 +518,214 @@ async fn offsets_commit_between_drains() {
         second, 0,
         "a second consumer in the same group must see no rows after offsets were committed"
     );
+}
+
+#[tokio::test]
+async fn a_cancelled_first_poll_hands_its_messages_to_the_next_call() {
+    let Some(kafka) = common::try_start().await else {
+        return;
+    };
+    let topic = kafka.topic("cancel-safe-prime");
+    let schema = schema();
+    produce_wave(kafka.brokers(), &topic, &sample_batch(schema.clone())).await;
+
+    let mut source = KafkaSource::new(
+        KafkaSourceConfig {
+            poll_timeout_ms: CANCEL_POLL_MS,
+            ..source_cfg(kafka.brokers(), &topic, "cancel-safe-prime-group")
+        },
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+
+    // Exactly what the stream runner's source prime does: one bounded first
+    // poll, with the future dropped when the bound elapses. Whatever the cold
+    // consumer has taken off the broker by then is inside that dropped call.
+    let mut rows = match tokio::time::timeout(PRIME_WINDOW, source.next_batch()).await {
+        Ok(primed) => primed
+            .expect("the primed poll must not error")
+            .map_or(0, |batch| batch.num_rows()),
+        Err(_elapsed) => 0,
+    };
+
+    while rows < 3 {
+        let next = tokio::time::timeout(DRAINED_BOUND, source.next_batch())
+            .await
+            .expect(
+                "a drained stop_at_end source must hand over what it holds, \
+                 not idle out its poll window",
+            )
+            .expect("a poll after a cancelled one must not error");
+        let Some(batch) = next else { break };
+        rows += batch.num_rows();
+    }
+    assert_eq!(
+        rows, 3,
+        "a cancelled next_batch must not lose the messages the consumer had already fetched"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_window_keeps_the_messages_already_fetched() {
+    let Some(kafka) = common::try_start().await else {
+        return;
+    };
+    let topic = kafka.topic("cancel-safe-window");
+    let schema = schema();
+
+    // Live rather than `stop_at_end`, and `batch_size` 2: a window this
+    // source cannot close until a second message arrives is a window that can
+    // be cancelled while it holds the first.
+    let mut source = KafkaSource::new(
+        KafkaSourceConfig {
+            batch_size: 2,
+            poll_timeout_ms: LIVE_POLL_MS,
+            stop_at_end: false,
+            ..source_cfg(kafka.brokers(), &topic, "cancel-safe-window-group")
+        },
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+
+    // A full window first, so the consumer is subscribed and its partitions
+    // assigned before the window that gets cancelled. Delivery is immediate
+    // from then on, which is what makes the cancellation below certain to
+    // land on a source that is holding a message.
+    produce_wave(
+        kafka.brokers(),
+        &topic,
+        &batch_of(schema.clone(), &[1, 2], &["a", "b"], &[1.0, 2.0]),
+    )
+    .await;
+    let first = tokio::time::timeout(DRAINED_BOUND, source.next_batch())
+        .await
+        .expect("a window filled to batch_size must not wait on poll_timeout_ms")
+        .expect("the first poll must not error")
+        .expect("a live source blocks until it has rows");
+    assert_eq!(ids_of(&first), vec![1, 2]);
+
+    // Half of what `batch_size` asks for, so the window stays open holding
+    // row 3 while it waits for a second row.
+    produce_wave(
+        kafka.brokers(),
+        &topic,
+        &batch_of(schema.clone(), &[3], &["c"], &[3.0]),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), source.next_batch())
+            .await
+            .is_err(),
+        "a half-filled window must still be open after 3 s, or this test cancels nothing"
+    );
+
+    // Bounded above `poll_timeout_ms`, so a source that dropped row 3 along
+    // with the cancelled future is caught returning the wrong rows rather
+    // than merely being slow.
+    produce_wave(
+        kafka.brokers(),
+        &topic,
+        &batch_of(schema.clone(), &[4], &["d"], &[4.0]),
+    )
+    .await;
+    let resumed = tokio::time::timeout(Duration::from_secs(30), source.next_batch())
+        .await
+        .expect("the resumed poll must finish inside its own poll window")
+        .expect("the resumed poll must not error")
+        .expect("a live source blocks until it has rows");
+    assert_eq!(
+        ids_of(&resumed),
+        vec![3, 4],
+        "row 3 was taken off the broker by the cancelled call and must survive it"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_poll_commits_nothing_it_did_not_hand_over() {
+    let Some(kafka) = common::try_start().await else {
+        return;
+    };
+    let topic = kafka.topic("cancel-safe-commit");
+    let schema = schema();
+    let group_id = "cancel-safe-commit-group";
+    produce_wave(kafka.brokers(), &topic, &sample_batch(schema.clone())).await;
+
+    // Two windows in a row that cannot close on three messages, both
+    // cancelled: the source takes all three off the broker, hands no batch
+    // over, and still runs the commit every call makes on entry.
+    let mut source = KafkaSource::new(
+        KafkaSourceConfig {
+            batch_size: 4,
+            poll_timeout_ms: LIVE_POLL_MS,
+            stop_at_end: false,
+            ..source_cfg(kafka.brokers(), &topic, group_id)
+        },
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+    for _ in 0..2 {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), source.next_batch())
+                .await
+                .is_err(),
+            "a window short of batch_size must still be open after 5 s, \
+             or this test cancels nothing"
+        );
+    }
+    drop(source);
+
+    // `commit_on_drain` commits asynchronously, so a commit that must not
+    // exist is given the same time to reach the broker that a real one needs.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut second = KafkaSource::new(
+        source_cfg(kafka.brokers(), &topic, group_id),
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+    let mut dataset = Dataset::new();
+    dataset.register_raw_component(COMPONENT, schema);
+    let rows = drain_into_dataset(&mut second, &mut dataset, COMPONENT)
+        .await
+        .expect("second drain");
+    assert_eq!(
+        rows, 3,
+        "a poll that handed no batch to its caller must have acked nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_drained_source_returns_its_rows_without_idling_out_its_poll_window() {
+    let Some(kafka) = common::try_start().await else {
+        return;
+    };
+    let topic = kafka.topic("drained-no-idle");
+    let schema = schema();
+    produce_wave(kafka.brokers(), &topic, &sample_batch(schema.clone())).await;
+
+    let mut source = KafkaSource::new(
+        KafkaSourceConfig {
+            poll_timeout_ms: CANCEL_POLL_MS,
+            ..source_cfg(kafka.brokers(), &topic, "drained-no-idle-group")
+        },
+        schema.clone(),
+        ndjson(),
+    )
+    .expect("source builds");
+
+    let batch = tokio::time::timeout(DRAINED_BOUND, source.next_batch())
+        .await
+        .expect(
+            "every seeded message is on the topic and every partition reports EOF, \
+             so the window must end on that and not on poll_timeout_ms",
+        )
+        .expect("the first poll must not error")
+        .expect("the seeded rows must come back");
+    assert_sample_values(&batch);
 }
 
 #[tokio::test]

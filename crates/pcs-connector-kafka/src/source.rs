@@ -6,6 +6,11 @@
 //! `stop_at_end = true` makes it usable from the batch run modes: once every
 //! assigned partition has reported end-of-partition, it reports EOF.
 //!
+//! [`next_batch`](Source::next_batch) is cancel-safe: the messages the
+//! consumer has taken from the broker live on the source, not in the future,
+//! so dropping that future — as `run_stream`'s one-second source prime does —
+//! hands them to the next call instead of losing them.
+//!
 //! `compacted = true` reads the topic as the keyed log a compacted topic is:
 //! one bounded pass over every partition, from its log start to the high
 //! watermark captured when the pass began, reduced to the newest value per
@@ -195,6 +200,14 @@ pub struct KafkaSource {
     /// Set once the topic has been provisioned and `subscribe` has been
     /// called, so both happen exactly once.
     started: bool,
+    /// Messages taken from the broker and not yet handed to the caller. They
+    /// live here rather than in [`next_batch`](Source::next_batch)'s future
+    /// so dropping that future loses nothing: the broker's fetch position has
+    /// already moved past them, and librdkafka re-delivers neither the
+    /// messages nor a second `PartitionEOF` for a position it has already
+    /// reported. Always empty while `pending_commit` is set, which is what
+    /// keeps a commit from acking a message the caller has not seen.
+    buffer: Vec<ReceivedMessage>,
     /// Set once a batch has been handed to the caller and cleared once its
     /// offsets are committed at the start of the next call. This is what
     /// makes delivery at-least-once: a crash between the two replays the
@@ -285,6 +298,7 @@ impl KafkaSource {
             transformer,
             cfg,
             started: false,
+            buffer: Vec::new(),
             pending_commit: false,
             eof: HashSet::new(),
             decode_schema,
@@ -384,19 +398,17 @@ impl KafkaSource {
         }
     }
 
-    /// Collect messages for a live (non-`stop_at_end`) source: the first
-    /// message blocks indefinitely, exactly like `TcpIngestSource` idling for
-    /// a connection; the rest are bounded by one `poll_timeout_ms` window.
-    async fn collect_live(&mut self) -> Result<Vec<ReceivedMessage>, PcsError> {
-        let mut buffer = Vec::new();
+    /// Collect into [`self.buffer`](Self::buffer) for a live
+    /// (non-`stop_at_end`) source: the first message blocks indefinitely,
+    /// exactly like `TcpIngestSource` idling for a connection; the rest are
+    /// bounded by one `poll_timeout_ms` window. Messages a cancelled call
+    /// left behind already satisfy the blocking phase.
+    async fn collect_live(&mut self) -> Result<(), PcsError> {
         let unknown_topic_deadline =
             Instant::now() + Duration::from_millis(self.cfg.poll_timeout_ms);
-        loop {
+        while self.buffer.is_empty() {
             match self.consumer.recv().await {
-                Ok(message) => {
-                    buffer.push(Self::take_message(&message));
-                    break;
-                }
+                Ok(message) => self.buffer.push(Self::take_message(&message)),
                 // Meaningless for a live source: more data may still arrive.
                 Err(KafkaError::PartitionEOF(_)) => continue,
                 Err(e) if is_unknown_topic(&e) => {
@@ -410,9 +422,9 @@ impl KafkaSource {
         }
 
         let deadline = Instant::now() + Duration::from_millis(self.cfg.poll_timeout_ms);
-        while buffer.len() < self.cfg.batch_size {
+        while self.buffer.len() < self.cfg.batch_size {
             match timeout_at(deadline, self.consumer.recv()).await {
-                Ok(Ok(message)) => buffer.push(Self::take_message(&message)),
+                Ok(Ok(message)) => self.buffer.push(Self::take_message(&message)),
                 Ok(Err(KafkaError::PartitionEOF(_))) => {}
                 Ok(Err(e)) if is_unknown_topic(&e) => {
                     tokio::time::sleep(UNKNOWN_TOPIC_RETRY_BACKOFF).await;
@@ -423,25 +435,36 @@ impl KafkaSource {
                 Err(_elapsed) => break,
             }
         }
-        Ok(buffer)
+        Ok(())
     }
 
-    /// Collect messages for a `stop_at_end` source: every receive is bounded
-    /// by one `poll_timeout_ms` window, and `PartitionEOF` is bookkeeping,
-    /// not an error. Returns an empty buffer when the topic is fully
-    /// drained; returns an error, not a silent empty buffer, when the window
+    /// Collect into [`self.buffer`](Self::buffer) for a `stop_at_end` source:
+    /// every receive is bounded by one `poll_timeout_ms` window, and
+    /// `PartitionEOF` is bookkeeping, not an error. Leaves the buffer empty
+    /// when the topic is fully drained and no cancelled call left anything
+    /// behind; returns an error, not a silent empty buffer, when the window
     /// elapses while the topic's metadata never resolved (e.g.
     /// `provision.create = false` against a topic that does not exist).
-    async fn collect_bounded(&mut self) -> Result<Vec<ReceivedMessage>, PcsError> {
-        let mut buffer = Vec::new();
+    ///
+    /// The fully-drained break does not wait for an empty buffer: a source
+    /// that has read everything hands over what it holds at once rather than
+    /// idling out the rest of its window for messages that cannot come.
+    async fn collect_bounded(&mut self) -> Result<(), PcsError> {
+        // What a cancelled call left behind, after every partition had
+        // already reported EOF to it. librdkafka reports one EOF per fetch
+        // position, so polling for a second one would idle out the whole
+        // window before handing over messages already in hand.
+        if !self.buffer.is_empty() && self.fully_drained()? {
+            return Ok(());
+        }
         let mut saw_unknown_topic = false;
         let deadline = Instant::now() + Duration::from_millis(self.cfg.poll_timeout_ms);
-        while buffer.len() < self.cfg.batch_size {
+        while self.buffer.len() < self.cfg.batch_size {
             match timeout_at(deadline, self.consumer.recv()).await {
-                Ok(Ok(message)) => buffer.push(Self::take_message(&message)),
+                Ok(Ok(message)) => self.buffer.push(Self::take_message(&message)),
                 Ok(Err(KafkaError::PartitionEOF(partition))) => {
                     self.eof.insert(partition);
-                    if buffer.is_empty() && self.fully_drained()? {
+                    if self.fully_drained()? {
                         break;
                     }
                 }
@@ -455,10 +478,10 @@ impl KafkaSource {
                 Err(_elapsed) => break,
             }
         }
-        if buffer.is_empty() && saw_unknown_topic {
+        if self.buffer.is_empty() && saw_unknown_topic {
             return Err(self.unknown_topic_error());
         }
-        Ok(buffer)
+        Ok(())
     }
 
     /// Feed a whole window through one decoder and take the batch out.
@@ -853,6 +876,8 @@ impl Source for KafkaSource {
         Arc::clone(&self.schema)
     }
 
+    /// Cancel-safe: every message the consumer has taken from the broker is
+    /// held on the source, so a dropped future hands them to the next call.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>, PcsError> {
         // A snapshot of a compacted topic keeps its whole state across calls
         // and reports EOF for good once it is out, so it shares nothing with
@@ -862,19 +887,23 @@ impl Source for KafkaSource {
         }
 
         self.ensure_started().await?;
+        // Safe to commit here: `pending_commit` is set only by a call that
+        // handed its whole buffer to the caller, so the consumer's position
+        // covers nothing the caller has not seen.
         self.commit_pending()?;
 
-        let buffer = if self.cfg.stop_at_end {
-            self.collect_bounded().await?
+        if self.cfg.stop_at_end {
+            self.collect_bounded().await?;
         } else {
-            self.collect_live().await?
-        };
+            self.collect_live().await?;
+        }
 
-        if buffer.is_empty() {
+        if self.buffer.is_empty() {
             return Ok(None);
         }
 
-        let batch = self.decode_window(&buffer)?;
+        let window = std::mem::take(&mut self.buffer);
+        let batch = self.decode_window(&window)?;
         self.pending_commit = true;
         Ok(Some(batch))
     }

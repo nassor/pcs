@@ -41,6 +41,11 @@ use crate::provision::resolve_stream;
 
 const WHAT: &str = "NatsSource";
 
+/// How long to wait between a `stop_at_end` window that came back empty and
+/// the next attempt, while the server still reports messages outstanding for
+/// this consumer.
+const DRAIN_CONFIRM_BACKOFF: Duration = Duration::from_millis(50);
+
 /// How a collected JetStream message is acknowledged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckMode {
@@ -277,8 +282,15 @@ impl NatsSource {
             Started::Jetstream {
                 consumer, window, ..
             } => {
-                collect_jetstream(consumer, window, cfg, *ack_mode, pending_acks, last_pending)
-                    .await
+                collect_jetstream(
+                    consumer.as_mut(),
+                    window,
+                    cfg,
+                    *ack_mode,
+                    pending_acks,
+                    last_pending,
+                )
+                .await
             }
         }
     }
@@ -370,14 +382,67 @@ fn closed_error() -> PcsError {
     ))
 }
 
+/// What the server says this consumer still owes.
+struct Outstanding {
+    /// Messages waiting to be delivered.
+    pending: u64,
+    /// Messages the server counts as delivered but unacknowledged. Its own
+    /// pull request may have been answered into a window the caller never
+    /// read, so these are not necessarily in anyone's hands.
+    ack_pending: usize,
+    /// The consumer's effective `ack_wait`, which is how long until an
+    /// unacknowledged message is redelivered.
+    ack_wait: Duration,
+}
+
+impl Outstanding {
+    async fn read(consumer: &mut PullConsumer, window: &PullWindow) -> Result<Self, PcsError> {
+        let info = consumer.info().await.map_err(|e| {
+            PcsError::generic(format!(
+                "{WHAT}: cannot read consumer info on stream '{}': {e}",
+                window.stream
+            ))
+        })?;
+        Ok(Self {
+            pending: info.num_pending,
+            ack_pending: info.num_ack_pending,
+            ack_wait: info.config.ack_wait,
+        })
+    }
+
+    fn is_drained(&self) -> bool {
+        self.pending == 0 && self.ack_pending == 0
+    }
+
+    /// How long to keep asking before giving up on a stream that will not
+    /// hand over what it says it holds. A message waiting to be delivered
+    /// arrives on the next request, so `poll_timeout_ms` covers it; one the
+    /// server counts as delivered comes back only when `ack_wait` expires, so
+    /// that window is added rather than assumed.
+    fn budget(&self, cfg: &NatsSourceConfig) -> Duration {
+        let poll = Duration::from_millis(cfg.poll_timeout_ms);
+        if self.ack_pending == 0 {
+            poll
+        } else {
+            poll + self.ack_wait
+        }
+    }
+}
+
 /// Collect a window off the pull consumer.
 ///
 /// `stop_at_end` uses `fetch`, which sets `no_wait` and returns only what is
-/// already there, so an empty result is EOF. A live source uses `batch`, which
-/// waits up to `poll_timeout_ms` per request and loops until a window carries at
-/// least one message.
+/// already there. An empty window is not EOF on its own: a consumer that has
+/// not started serving yet, and one whose delivered messages went into a
+/// window nobody read, both answer exactly like a drained stream does. The
+/// server's own counters are what tell them apart, so EOF is reported only
+/// once it agrees this consumer has nothing [`Outstanding`]; until then the
+/// window is asked again, for [`Outstanding::budget`] at most.
+///
+/// A live source uses `batch`, which waits up to `poll_timeout_ms` per request
+/// and loops until a window carries at least one message.
 async fn collect_jetstream(
-    consumer: &PullConsumer,
+    consumer: &mut PullConsumer,
     window: &PullWindow,
     cfg: &NatsSourceConfig,
     ack_mode: AckMode,
@@ -385,78 +450,100 @@ async fn collect_jetstream(
     last_pending: &mut Option<usize>,
 ) -> Result<Vec<Received>, PcsError> {
     let mut buffer = Vec::new();
+    let mut confirm_deadline: Option<Instant> = None;
     loop {
-        let batch = if cfg.stop_at_end {
-            let mut builder = consumer
-                .fetch()
-                .max_messages(cfg.batch_size)
-                .expires(window.expires);
-            if window.max_bytes > 0 {
-                builder = builder.max_bytes(window.max_bytes);
+        {
+            let batch = if cfg.stop_at_end {
+                let mut builder = consumer
+                    .fetch()
+                    .max_messages(cfg.batch_size)
+                    .expires(window.expires);
+                if window.max_bytes > 0 {
+                    builder = builder.max_bytes(window.max_bytes);
+                }
+                if !window.heartbeat.is_zero() {
+                    builder = builder.heartbeat(window.heartbeat);
+                }
+                builder.messages().await
+            } else {
+                let mut builder = consumer
+                    .batch()
+                    .max_messages(cfg.batch_size)
+                    .expires(Duration::from_millis(cfg.poll_timeout_ms));
+                if window.max_bytes > 0 {
+                    builder = builder.max_bytes(window.max_bytes);
+                }
+                if !window.heartbeat.is_zero() {
+                    builder = builder.heartbeat(window.heartbeat);
+                }
+                builder.messages().await
             }
-            if !window.heartbeat.is_zero() {
-                builder = builder.heartbeat(window.heartbeat);
-            }
-            builder.messages().await
-        } else {
-            let mut builder = consumer
-                .batch()
-                .max_messages(cfg.batch_size)
-                .expires(Duration::from_millis(cfg.poll_timeout_ms));
-            if window.max_bytes > 0 {
-                builder = builder.max_bytes(window.max_bytes);
-            }
-            if !window.heartbeat.is_zero() {
-                builder = builder.heartbeat(window.heartbeat);
-            }
-            builder.messages().await
-        }
-        .map_err(|e| {
-            PcsError::generic(format!(
-                "{WHAT}: pull request on stream '{}' failed: {e}",
-                window.stream
-            ))
-        })?;
-
-        let mut batch = std::pin::pin!(batch);
-        while let Some(item) = batch.next().await {
-            let message = item.map_err(|e| {
+            .map_err(|e| {
                 PcsError::generic(format!(
-                    "{WHAT}: pull on stream '{}' failed: {e}",
+                    "{WHAT}: pull request on stream '{}' failed: {e}",
                     window.stream
                 ))
             })?;
-            // `info` parses the reply subject, with no round-trip.
-            let (sequence, pending) = {
-                let info = message.info().map_err(|e| {
+
+            let mut batch = std::pin::pin!(batch);
+            while let Some(item) = batch.next().await {
+                let message = item.map_err(|e| {
                     PcsError::generic(format!(
-                        "{WHAT}: message on stream '{}' carries no JetStream metadata: {e}",
+                        "{WHAT}: pull on stream '{}' failed: {e}",
                         window.stream
                     ))
                 })?;
-                (info.stream_sequence, info.pending)
-            };
-            *last_pending = Some(usize::try_from(pending).unwrap_or(usize::MAX));
+                // `info` parses the reply subject, with no round-trip.
+                let (sequence, pending) = {
+                    let info = message.info().map_err(|e| {
+                        PcsError::generic(format!(
+                            "{WHAT}: message on stream '{}' carries no JetStream metadata: {e}",
+                            window.stream
+                        ))
+                    })?;
+                    (info.stream_sequence, info.pending)
+                };
+                *last_pending = Some(usize::try_from(pending).unwrap_or(usize::MAX));
 
-            let payload = if ack_mode == AckMode::Never {
-                message.message.payload
-            } else {
-                let (message, acker) = message.split();
-                pending_acks.push(acker);
-                message.payload
-            };
-            buffer.push(Received {
-                origin: Origin::Sequence(sequence),
-                payload,
-            });
+                let payload = if ack_mode == AckMode::Never {
+                    message.message.payload
+                } else {
+                    let (message, acker) = message.split();
+                    pending_acks.push(acker);
+                    message.payload
+                };
+                buffer.push(Received {
+                    origin: Origin::Sequence(sequence),
+                    payload,
+                });
+            }
         }
 
-        // `fetch` completing empty is EOF; `batch` completing empty means the
-        // window expired with nothing on the stream, so a live source asks
-        // again.
-        if cfg.stop_at_end || !buffer.is_empty() {
+        if !buffer.is_empty() {
             return Ok(buffer);
         }
+        if !cfg.stop_at_end {
+            // `batch` completing empty means the window expired with nothing
+            // on the stream, so a live source asks again.
+            continue;
+        }
+
+        let outstanding = Outstanding::read(consumer, window).await?;
+        *last_pending = Some(usize::try_from(outstanding.pending).unwrap_or(usize::MAX));
+        if outstanding.is_drained() {
+            return Ok(buffer);
+        }
+        let deadline =
+            *confirm_deadline.get_or_insert_with(|| Instant::now() + outstanding.budget(cfg));
+        if Instant::now() >= deadline {
+            return Err(PcsError::generic(format!(
+                "{WHAT}: stream '{}' reports {} message(s) waiting and {} delivered but \
+                 unacknowledged for this consumer, and none of them arrived; refusing to \
+                 report end of stream",
+                window.stream, outstanding.pending, outstanding.ack_pending
+            )));
+        }
+        tokio::time::sleep(DRAIN_CONFIRM_BACKOFF).await;
     }
 }
 

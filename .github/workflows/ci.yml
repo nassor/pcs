@@ -130,13 +130,15 @@ jobs:
       with:
         tool: cargo-nextest@0.9.143
 
-    # The only #[ignore]d test in crates/: a five-node Raft cluster behind
+    # One of two #[ignore]d tests in crates/: a five-node Raft cluster behind
     # Toxiproxy, chaos-injecting latency/bandwidth/reset-peer/partition
     # faults for ~70-100s. Isolated in its own job so its runtime never sits
     # on the `test` job's critical path. `--test` scopes discovery to this
-    # one binary so `--run-ignored ignored-only` can't pick up the unrelated
-    # `#[ignore]`d test in `pcs-service`'s lib unit tests
-    # (`test_second_init_returns_error`, a global-tracing-subscriber race).
+    # one binary so `--run-ignored ignored-only` can't pick up the other two
+    # unrelated `#[ignore]`d tests: `pcs-service`'s lib unit test
+    # `test_second_init_returns_error` (a global-tracing-subscriber race) and
+    # connector_matrix.rs's full_matrix, run by the `connector_matrix` job
+    # below.
     - name: Full-stack distributed chaos test
       run: cargo nextest run -p pcs-service --features distributed-raft --test distributed_integration_chaos --run-ignored ignored-only
 

@@ -133,21 +133,37 @@ impl Source for S3Source {
 
         loop {
             // 2. Drain the object currently being decoded before opening the
-            //    next one.
+            //    next one. Only a clean end of that object's stream (`None`)
+            //    pops its location from `pending`: an error leaves the
+            //    location at the front so a caller's retry re-attempts the
+            //    same object instead of silently skipping past it.
             if let Some(rx) = &mut self.current {
                 match rx.recv().await {
                     Some(Ok(batch)) => return Ok(Some(batch)),
-                    Some(Err(e)) => return Err(e),
-                    None => self.current = None,
+                    Some(Err(e)) => {
+                        self.current = None;
+                        return Err(e);
+                    }
+                    None => {
+                        self.current = None;
+                        self.pending
+                            .as_mut()
+                            .expect("pending was just set")
+                            .pop_front();
+                    }
                 }
             }
 
-            // 3. Next object, or EOF once the listing is exhausted.
+            // 3. Next object, or EOF once the listing is exhausted. Peeked,
+            //    not popped: opening or decoding it below may still fail, and
+            //    step 2 above is the only place that removes a location, once
+            //    it is fully and successfully drained.
             let Some(location) = self
                 .pending
-                .as_mut()
+                .as_ref()
                 .expect("pending was just set")
-                .pop_front()
+                .front()
+                .cloned()
             else {
                 return Ok(None);
             };
@@ -185,7 +201,7 @@ impl Source for S3Source {
             #[cfg(feature = "tracing")]
             tracing::info!(key = %location, bytes = size, "S3Source: object spooled");
             #[cfg(not(feature = "tracing"))]
-            let _ = (location, size);
+            let _ = (&location, size);
 
             // 5. Open the reader off the executor — a parquet footer read is
             //    disk IO — and check the object's own schema against the config
@@ -248,4 +264,55 @@ fn render_fields(fields: &Fields) -> String {
         .map(|f| format!("{}: {}", f.name(), f.data_type()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::Schema;
+    use object_store::PutPayload;
+    use object_store::memory::InMemory;
+
+    use pcs_transformer_parquet::ParquetTransformer;
+
+    use super::*;
+
+    /// A permanently unreadable object (invalid Parquet bytes) must fail
+    /// every attempt, never a clean EOF: `next_batch` peeks the front of
+    /// `pending` rather than popping it, and only removes a location once
+    /// its object has been fully and successfully drained, so a caller
+    /// retrying after an error re-attempts the same object instead of
+    /// silently advancing past it.
+    #[tokio::test]
+    async fn a_source_whose_object_fails_to_open_reports_an_error_not_eof() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = Path::from("prefix/broken.parquet");
+        store
+            .put(
+                &location,
+                PutPayload::from(b"not a parquet file".as_slice()),
+            )
+            .await
+            .expect("seed put succeeds");
+
+        let mut source = S3Source {
+            store,
+            prefix: Path::from("prefix"),
+            transformer: Arc::new(ParquetTransformer::new()),
+            declared: Arc::new(Schema::empty()),
+            // `Object` so the malformed bytes fail inside the Parquet
+            // reader builder itself, not the earlier "declared schema
+            // rejected" configuration check.
+            schema_from: SchemaFrom::Object,
+            pending: None,
+            current: None,
+        };
+
+        source
+            .next_batch()
+            .await
+            .expect_err("a malformed object must not silently succeed");
+        source.next_batch().await.expect_err(
+            "retrying after a failed attempt must surface an error again, not a clean EOF",
+        );
+    }
 }

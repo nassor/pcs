@@ -43,6 +43,8 @@
 
 use std::time::Instant;
 
+use pcs_service::service::builder::ServiceBuilder;
+use pcs_service::service::factories::register_builtin_factories;
 use tokio::sync::Semaphore;
 
 #[path = "common/matrix.rs"]
@@ -50,7 +52,9 @@ mod matrix;
 #[path = "common/smoketest.rs"]
 mod smoketest;
 
-use matrix::{Case, Fixtures, Report, Resources, run_case, run_maximal};
+use matrix::{
+    CONNECTORS, Case, FORMATS, Fixtures, Format, Report, Resources, run_case, run_maximal,
+};
 
 /// How many cases build and run at once.
 ///
@@ -119,4 +123,64 @@ async fn full_matrix() {
         report.cases.len()
     );
     maximal.expect("the maximal workflow must build and deliver rows");
+}
+
+/// The registered factories `register_builtin_factories` wires up must match
+/// this file's own [`CONNECTORS`]/[`FORMATS`] dimension lists exactly.
+///
+/// Without this test, registering a ninth connector or a sixth transformer
+/// format compiles and runs clean: the matrix simply never builds a case for
+/// it. This test builds the real registry the way [`run_case`] does and
+/// compares its shape against the matrix's own lists, so a factory
+/// registered outside them fails here instead of silently losing coverage.
+///
+/// [`Registry`] and [`TransformerRegistry`] expose counts, and, for
+/// transformers only, the sorted list of registered format names
+/// ([`TransformerRegistry::formats`]); there is no equivalent enumeration for
+/// source or sink type names, so those two dimensions are checked by count
+/// instead.
+///
+/// Docker-free and not `#[ignore]`d: it inspects the registry alone, with no
+/// config, container, or running service involved.
+///
+/// [`Registry`]: pcs_service::service::registry::Registry
+/// [`TransformerRegistry`]: pcs_transformer::TransformerRegistry
+/// [`TransformerRegistry::formats`]: pcs_transformer::TransformerRegistry::formats
+#[test]
+fn dimensions_cover_the_registry() {
+    let builder = register_builtin_factories(ServiceBuilder::new());
+    let registry = builder.registry();
+
+    let source_count = registry.source_count();
+    let sink_count = registry.sink_count();
+    let expected_connectors = CONNECTORS.len();
+    assert_eq!(
+        source_count, expected_connectors,
+        "register_builtin_factories registered {source_count} source factories but \
+         common/matrix.rs's CONNECTORS lists {expected_connectors}; a source connector was \
+         registered outside that array (or one listed there no longer registers); update \
+         CONNECTORS to match",
+    );
+    assert_eq!(
+        sink_count, expected_connectors,
+        "register_builtin_factories registered {sink_count} sink factories but \
+         common/matrix.rs's CONNECTORS lists {expected_connectors}; a sink connector was \
+         registered outside that array (or one listed there no longer registers); update \
+         CONNECTORS to match",
+    );
+
+    let mut expected_formats: Vec<&str> = FORMATS
+        .iter()
+        .copied()
+        .map(Format::label)
+        .filter(|label| *label != "none")
+        .collect();
+    expected_formats.sort_unstable();
+    let actual_formats = registry.transformers().formats();
+    assert_eq!(
+        actual_formats, expected_formats,
+        "register_builtin_factories registered transformer formats {actual_formats:?} but \
+         common/matrix.rs's FORMATS names {expected_formats:?}; add the missing format's key to \
+         FORMATS (or drop a stale entry) so the matrix covers every registered format",
+    );
 }

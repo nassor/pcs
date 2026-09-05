@@ -141,6 +141,13 @@ in quotes is ignored and the source stays live.
 </p>
 </div>
 
+With `stop_at_end=#true` a window closes as soon as every assigned partition has reported
+end-of-partition, so a source that has read the whole topic hands its rows over at once instead of
+waiting out `poll_timeout_ms`; that window bounds only a poll that never reaches the end. Messages
+the consumer has already taken from the broker are held on the source, so a caller that drops a
+`next_batch` future — as the stream runner's one-second source prime does — gets them from the next
+call rather than losing them.
+
 ## Delivery
 
 At-least-once. The source commits the previous batch's offsets at the start of the next poll, so a

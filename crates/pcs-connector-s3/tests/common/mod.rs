@@ -110,7 +110,10 @@ async fn start() -> anyhow::Result<S3Container> {
     let deadline = Instant::now() + Duration::from_secs(90);
     let user = format!("{ACCESS_KEY}:{SECRET_KEY}");
     loop {
-        let url = format!("http://127.0.0.1:{port}/{bucket}");
+        // Inside the container the server listens on 9000; the mapped port
+        // exists only on the host, so a probe run through `docker exec` names
+        // the container's own port.
+        let url = format!("http://127.0.0.1:9000/{bucket}");
         let cmd = ExecCommand::new([
             "curl",
             "-fsS",
@@ -124,7 +127,12 @@ async fn start() -> anyhow::Result<S3Container> {
             user.as_str(),
             url.as_str(),
         ]);
-        let result = container.exec(cmd).await?;
+        let mut result = container.exec(cmd).await?;
+        // The exit code is only final once the exec's output streams have
+        // been consumed; reading it straight away reports `None` for a
+        // command that has in fact succeeded.
+        let _ = result.stdout_to_vec().await;
+        let _ = result.stderr_to_vec().await;
         if result.exit_code().await? == Some(0) {
             break;
         }

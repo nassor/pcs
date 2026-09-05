@@ -131,12 +131,11 @@
 //! processor reports the source's missing transformer, not the PostgreSQL
 //! node's unsigned column.
 //!
-//! An `s3` source declares `retry max_attempts=1`. `S3Source::next_batch` pops
-//! the object off its listing before it opens a reader over it, so a retried
-//! call finds the listing empty and reports EOF: under the default four
-//! attempts every refusal this source raises reaches the runner as a clean run
-//! with no rows. One attempt is what makes the refusal observable, and
-//! retrying cannot recover the object in any case.
+//! An `s3` source keeps its refusal under the default four attempts:
+//! `S3Source::next_batch` peeks the front of its listing and pops a location
+//! only once that object has been fully and successfully drained, so a retry
+//! re-attempts the same object and raises the same error rather than finding
+//! an empty listing and reporting EOF.
 //!
 //! [`StandaloneStats`] counts non-fatal errors without keeping their text, so
 //! a [`Site::Run`] refusal that names a message fragment is asserted against a
@@ -219,34 +218,19 @@
 //! that silently delivered nothing fails the sink comparison even when every
 //! other source's rows are present. The per-sink counts are printed.
 //!
-//! `kafka` is a maximal *sink* but not a maximal *source*, and it is the only
-//! connector this workflow does not hold on both ends, because
-//! `KafkaSource::next_batch` is not cancel-safe and `run_stream` cancels it.
-//! The runner primes every source's first `next_batch` under
-//! `SOURCE_PRIME_TIMEOUT` (one second) and drops the future when that elapses.
-//! `collect_bounded` keeps polling until it has `batch_size` messages (1000 by
-//! default) or its `poll_timeout_ms` window ends, and its `PartitionEOF` arm
-//! breaks early only while the buffer is still empty. A cold consumer reads all
-//! three seeded messages inside that first second, holds them in a local
-//! buffer, and keeps waiting for the other 997; the prime's timeout then drops
-//! the future, and the messages go with it. The broker's fetch position has
-//! advanced, so the first rotation poll gets nothing and no second
-//! `PartitionEOF`, idles out its whole `poll_timeout_ms` window, breaks at
-//! `collect_bounded`'s `Err(_elapsed)` arm with an empty buffer, and returns
-//! `Ok(None)`, which `run_stream` treats as EOF and drops from the rotation.
-//! Three rows short, no error anywhere. `kafka` is covered as a source by its
-//! per-case combinations, which run `one_shot` and never cancel a first poll.
-//!
-//! `nats` is a source here. With `stop_at_end #true`, `collect_jetstream` uses
-//! `fetch`, which sets `no_wait` and returns what is already on the stream, so
-//! a cancelled prime poll costs it nothing.
+//! Every available connector is a source here as well as a sink, and the two
+//! sources whose first poll the prime can cancel tolerate that. `KafkaSource`
+//! holds the messages it has taken from the broker on the source itself, so
+//! the dropped prime future hands them to the rotation; with `stop_at_end
+//! #true` it returns them as soon as every partition reports EOF instead of
+//! waiting out `poll_timeout_ms`. `NatsSource` with `stop_at_end #true` uses
+//! `fetch`, which sets `no_wait` and returns what is already on the stream.
 //!
 //! The rotation itself is serial: after the prime, `run_stream` awaits one
 //! source's `next_batch` to completion with only cancellation racing it, so a
 //! source that idles out its poll window holds up every source behind it. For a
 //! cancel-safe source that costs wall clock and nothing else, because a source
-//! polled during the prime hands its prefetched batch to the rotation. The rows
-//! `kafka` loses are lost to the prime's cancellation, not to the rotation.
+//! polled during the prime hands its prefetched batch to the rotation.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -2305,14 +2289,8 @@ async fn prepare_source(
                 schema: row.schema(),
                 schema_from,
             });
-            // One attempt, because retrying an `S3Source` cannot recover:
-            // `next_batch` pops the object off its listing before it opens a
-            // reader over it, so the second attempt finds the listing empty and
-            // reports EOF. The default four attempts turn every refusal this
-            // source raises into a clean run with no rows.
             side.kdl = format!(
                 "    source \"in\" type=\"S3Source\" component=\"{component}\"{transformer_key} {{\n\
-                 \x20       retry max_attempts=1\n\
                  \x20       config {{\n            prefix \"{prefix}\"{schema_from_kdl}\n{}\n{fields}\n        }}\n    }}",
                 s3_connection_kdl(&endpoints.s3, "            ")
             );
@@ -3339,9 +3317,9 @@ struct MaxNode {
 /// processor therefore gets its own sources and its own sinks inside the one
 /// workflow, which is participation rather than a node left unlinked.
 ///
-/// Every connector appears on both ends except `kafka`, whose cold consumer
-/// loses its seeded messages to the stream runner's cancelled prime poll; the
-/// returned [`MaximalReport::excluded`] names the reason.
+/// Every available connector appears on both ends; a connector whose external
+/// resource had no reachable container is named in the returned
+/// [`MaximalReport::excluded`].
 pub async fn run_maximal(
     resources: &Resources,
     fixtures: &Fixtures,
@@ -3369,37 +3347,6 @@ pub async fn run_maximal(
         }
     }
 
-    // `kafka` is the one connector this workflow cannot hold on both ends,
-    // because `KafkaSource::next_batch` is not cancel-safe and `run_stream`
-    // cancels it. The runner's source prime runs every source's first
-    // `next_batch` under `SOURCE_PRIME_TIMEOUT` (one second) and drops the
-    // future when that elapses. `collect_bounded` keeps polling until it holds
-    // `batch_size` messages (1000 by default) or its `poll_timeout_ms` window
-    // ends, and its `PartitionEOF` arm breaks early only while the buffer is
-    // still empty, so a cold consumer that reads all three seeded messages
-    // inside that first second is still waiting for the other 997 when the
-    // prime drops the future, and the messages go with it. The broker's fetch
-    // position has advanced, so the first rotation poll gets nothing and no
-    // second `PartitionEOF`, idles out its whole window, breaks at
-    // `collect_bounded`'s `Err(_elapsed)` arm with an empty buffer, and
-    // returns `Ok(None)`, which `run_stream` treats as EOF. No error is raised
-    // anywhere.
-    //
-    // `nats` has no such problem: with `stop_at_end #true`,
-    // `collect_jetstream` uses `fetch`, which sets `no_wait` and returns what
-    // is already on the stream, so a cancelled prime poll costs it nothing.
-    if available.contains(&Connector::Kafka) {
-        excluded.push(
-            "kafka source: KafkaSource::next_batch is not cancel-safe, and run_stream's \
-             one-second source prime drops the future holding the messages the cold consumer \
-             had already fetched; the next poll then idles out its own poll_timeout_ms window \
-             with an empty buffer and reports EOF, so the source is dropped from the rotation \
-             having delivered nothing; covered as a source by its one_shot per-case \
-             combinations"
-                .to_string(),
-        );
-    }
-
     // Each processor's own transport assignment: a format every listed
     // connector admits, and a row type its runtime declares. Every connector
     // not excluded above appears on both ends.
@@ -3413,7 +3360,12 @@ pub async fn run_maximal(
         (
             ProcessorKind::Wasm,
             Format::Ndjson,
-            &[Connector::Http, Connector::Nats, Connector::S3],
+            &[
+                Connector::Http,
+                Connector::Kafka,
+                Connector::Nats,
+                Connector::S3,
+            ],
             &[
                 Connector::Http,
                 Connector::Kafka,
@@ -3640,23 +3592,27 @@ observability log_level="error"
             }
             let _ = tokio::io::AsyncWriteExt::flush(&mut producer).await;
         }
-        // Wait for every source's rows before cancelling. Two things make this
-        // slow rather than wrong, so the ceiling is large and reaching it is
-        // not an error.
+        // Wait for every source's rows before cancelling. The ceiling is a
+        // bound on that wait, not an expectation of it: reaching it is not an
+        // error, and it normally is reached.
         //
-        // The rotation is serial: `run_stream` awaits one source's
-        // `next_batch` to completion, so the empty poll a source ends on is
-        // paid by every source behind it. A `nats` source's is its whole
-        // 15 s `fetch_expires_ms` window.
-        //
-        // And this reads the runner's live snapshot, which is published after
-        // an item only once 100 ms have passed since the last publish, plus
-        // once at exit. When the last items land inside that window the
-        // snapshot stays short of `expected_rows` until the run exits, which
-        // cancellation has to cause: the wait then runs to its ceiling and the
-        // settle loop below ends the run. The assertions are made against the
+        // This reads the runner's live snapshot, which `run_stream` publishes
+        // after an item only once 100 ms have passed since the last publish,
+        // plus once at exit. Every source here is seeded before the run, so
+        // the rotation delivers all of them back to back and the last items
+        // land inside one throttle window: the snapshot can stop well short
+        // of `expected_rows` (measured: 12 of 24) and no amount of waiting
+        // advances it, because nothing further is coming. The settle loop
+        // below is what ends the run, and the assertions are made against the
         // final stats the runner returns, which are exact either way.
-        await_stats(&live, Duration::from_secs(240), |stats| {
+        //
+        // Measured: the snapshot stops advancing about a second into the run,
+        // after the case sweep has already had the containers warm for
+        // minutes. The ceiling is what this workflow costs, so it is set for
+        // a loaded host rather than for a poll window: the serial rotation
+        // never pays one here, because it stalls on the first source with
+        // nothing pending (`channel`, on its second visit) until cancellation.
+        await_stats(&live, Duration::from_secs(60), |stats| {
             stats.rows_processed >= expected_rows as u64
         })
         .await;

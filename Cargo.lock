@@ -4567,6 +4567,7 @@ dependencies = [
  "arrow-select",
  "pcs-core",
  "pcs-transformer",
+ "tempfile",
 ]
 
 [[package]]

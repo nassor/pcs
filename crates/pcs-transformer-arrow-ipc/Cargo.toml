@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish.workspace = true
-description = "The arrow-ipc byte format for PCS: a Transformer carrying one whole RecordBatch per message."
+description = "The arrow-ipc byte format for PCS: a Transformer carrying one whole RecordBatch per message, and one Arrow IPC stream per byte stream."
 
 [dependencies]
 pcs-core        = { path = "../pcs-core", version = "0.1.0" }
@@ -19,3 +19,6 @@ arrow-ipc     = { workspace = true }
 arrow-schema  = { workspace = true }
 # `concat_batches` folds a multi-batch payload window into one batch.
 arrow-select  = { workspace = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }

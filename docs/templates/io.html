@@ -709,9 +709,9 @@ let src = CastingSource::new(file, target, CastOptions::default());</code></pre>
 </table>
 
 <p>
-    <code>csv</code>, <code>ndjson</code>, <code>parquet</code> and <code>avro</code> read and
-    write a file stream. <code>arrow-ipc</code> has no stream surface, so it is a TCP, Kafka or
-    NATS format, and <code>ndjson</code> and <code>avro</code> work in both places.
+    Every format reads and writes a file stream. <code>arrow-ipc</code>, <code>ndjson</code>
+    and <code>avro</code> also carry discrete messages, so those three work on a TCP, Kafka or
+    NATS node as well.
 </p>
 
 <p>
@@ -757,7 +757,7 @@ HttpSink::new  (&amp;str, Arc&lt;Schema&gt;, Arc&lt;dyn Transformer&gt;, method:
 CsvTransformer::new(has_headers: bool)   -&gt; Self   // csv
 NdjsonTransformer::new(infer_max: usize) -&gt; Self   // ndjson
 ParquetTransformer::new()                -&gt; Self   // parquet, Snappy
-ArrowIpcTransformer::new()               -&gt; Self   // arrow-ipc, messages only
+ArrowIpcTransformer::new()               -&gt; Self   // arrow-ipc
 AvroTransformer::new(compression: Option&lt;CompressionCodec&gt;, schema_id: Option&lt;u32&gt;) // avro
 
 // pcs-connector-channel. Returns the paired endpoint alongside the source or sink.
@@ -767,8 +767,9 @@ ChannelSink::new  (Arc&lt;Schema&gt;, buffer: usize) -&gt; (Self, mpsc::Receiver
 
 <p>
     Only <code>ndjson</code> infers a schema, and only when <code>schema_fields</code> is
-    absent: <code>csv</code> requires one, and <code>parquet</code> and <code>avro</code>
-    reject one, since the file carries its own. <code>FileSource</code> reports
+    absent: <code>csv</code> requires one, and <code>parquet</code>, <code>avro</code> and
+    <code>arrow-ipc</code> reject one on a read, since the stream carries its own.
+    <code>FileSource</code> reports
     <code>estimated_rows</code> under <code>parquet</code> alone, summed from row-group
     metadata with no data read, and <code>CastingSource</code> forwards whatever it wraps.
     Every other source returns <code>None</code>.
@@ -777,7 +778,8 @@ ChannelSink::new  (Arc&lt;Schema&gt;, buffer: usize) -&gt; (Self, mpsc::Receiver
 <p>
     <code>finish()</code> means different things per sink, and that matters when you decide
     where to call it. <code>FileSink</code> hands it to the transformer:
-    <code>parquet</code> writes the footer and closes the writer, <code>csv</code>,
+    <code>parquet</code> writes the footer and closes the writer, <code>arrow-ipc</code>
+    writes the end-of-stream marker, and <code>csv</code>,
     <code>ndjson</code> and <code>avro</code> flush their buffered writer. After any of them
     a further <code>write_batch</code> is an error, and a second <code>finish</code> is a
     no-op. <code>ChannelSink</code> has nothing to flush.

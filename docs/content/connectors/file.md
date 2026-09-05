@@ -87,14 +87,14 @@ resolves it before the factory runs. Both factories hand-parse `ConfigValue` wit
 
 A source's `schema_fields` is what the format decides on:
 [csv](@/transformers/csv.md) requires it, [ndjson](@/transformers/ndjson.md) infers when it is
-absent, and [parquet](@/transformers/parquet.md) and [avro](@/transformers/avro.md) refuse it
-because the file carries its own. A `FileSink` requires it whatever the transformer, because that
-is the schema the rows are written with.
+absent, and [parquet](@/transformers/parquet.md), [avro](@/transformers/avro.md) and
+[arrow-ipc](@/transformers/arrow-ipc.md) refuse it because the file carries its own. A `FileSink`
+requires it whatever the transformer, because that is the schema the rows are written with.
 
 `parquet` is the only format that reports `estimated_rows`, summed from row-group metadata without
 reading any data.
 
-## Sharp edge: the sink appends, and a footer format cannot
+## Sharp edge: the sink appends, and a terminated format cannot
 
 <div class="note note-warn">
 <span class="note-label">Sharp edge</span>
@@ -102,10 +102,10 @@ reading any data.
 <code>FileSink::create</code> runs during <code>build</code>, <code>pcs-service validate</code>
 included, so the parent directory has to exist already. It creates the file when it is missing and
 keeps every byte already in it, while <code>truncate #true</code> empties it at build instead.
-<code>parquet</code> and <code>avro</code> are container formats with a footer, so a second
-writer's output appended to an existing file does not read back. Those configs want
-<code>truncate #true</code> or a path of their own; <code>ndjson</code>, and <code>csv</code>
-without headers, append cleanly.
+<code>parquet</code>, <code>avro</code> and <code>arrow-ipc</code> each terminate their output
+with a footer or an end-of-stream marker, so a second writer's output appended to an existing
+file does not read back. Those configs want <code>truncate #true</code> or a path of their own;
+<code>ndjson</code>, and <code>csv</code> without headers, append cleanly.
 </p>
 </div>
 

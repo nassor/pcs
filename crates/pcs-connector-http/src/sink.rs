@@ -58,8 +58,8 @@ impl std::io::Write for SharedBuffer {
 /// where an unreachable endpoint surfaces. There is no batching across calls
 /// and no retry: a request the server refuses fails the run.
 ///
-/// A format with no stream write surface, `arrow-ipc`, fails on the first batch
-/// with the transformer contract's own error rather than at build.
+/// A format with no stream write surface fails on the first batch with the
+/// transformer contract's own error rather than at build.
 ///
 /// # Example
 ///
@@ -212,8 +212,9 @@ mod tests {
             .expect("batch")
     }
 
-    /// A transformer with no surfaces at all, which is how `arrow-ipc` looks to
-    /// this sink: the contract's defaulted `open_writer` returns `unsupported`.
+    /// A transformer with no surfaces at all. Every registered format
+    /// implements `open_writer`, so the contract's defaulted refusal is
+    /// reached through a stand-in declared here.
     struct NoStream;
 
     impl Transformer for NoStream {

@@ -222,18 +222,19 @@ source "orders_in" type="FileSource" component="Order" transformer="orders_csv" 
         </tr>
         <tr>
             <td><strong><a href="{{ get_url(path='@/transformers/arrow-ipc.md') }}"><code>arrow-ipc</code></a></strong></td>
-            <td>no</td>
-            <td>no</td>
+            <td><b>yes</b></td>
+            <td><b>yes</b></td>
             <td><b>yes</b></td>
             <td><code>PerBatch</code></td>
-            <td>required</td>
+            <td>refused reading a stream, required on messages</td>
             <td><code>pcs-transformer-arrow-ipc</code></td>
         </tr>
     </tbody>
 </table>
 
 <p>
-    <code>arrow-ipc</code> has no stream surface, so it is a TCP or Kafka format only.
+    <code>arrow-ipc</code> carries the same Arrow stream on both surfaces, so a file and a
+    Kafka topic hold the same bytes.
     <code>csv</code> and <code>parquet</code> have no message codec, so a <code>csv</code>
     transformer on a Kafka source or sink fails at build with
     <code>KafkaSink: format 'csv' has no message codec</code>. <code>parquet</code> is the only

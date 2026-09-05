@@ -76,7 +76,7 @@
 //!
 //! | Format | Stream | Message | `message_shape` |
 //! |---|---|---|---|
-//! | `arrow-ipc` | no | yes | `PerBatch` |
+//! | `arrow-ipc` | yes | yes | `PerBatch` |
 //! | `avro` | yes | yes | `PerRow` |
 //! | `csv` | yes | no | none |
 //! | `ndjson` | yes | yes | `PerRow` |
@@ -86,7 +86,7 @@
 //! and each one was read out of the code it constrains:
 //!
 //! - A stream source of a self-describing format must let the stream carry the
-//!   schema: `avro` and `parquet` both refuse a declared schema in
+//!   schema: `arrow-ipc`, `avro` and `parquet` all refuse a declared schema in
 //!   `open_reader`. `FileSource` passes `schema_fields` straight through, so it
 //!   simply declares none. `S3Source` has `schema_from "object"` and
 //!   `HttpSource` has `schema_from "body"`: both keep the declared schema for
@@ -113,16 +113,17 @@
 //! | Refusal | Site | Evidence |
 //! |---|---|---|
 //! | byte connector with no `transformer` key | build | `ConnectorContext::transformer` |
-//! | a stream-less format on a `file` node | build | `FileSource::open` reads the header and `FileSink::create` opens the writer while the factory builds |
-//! | a stream-less format on an `http` node | run | it spools at drain time and encodes per batch, so nothing touches the format while building |
-//! | a stream-less format on an `s3` **source** | run | the seeded object is real, so the drain reaches `open_reader` and the format refuses to open one |
-//! | a stream-less format on an `s3` **sink** | run | it encodes per batch, so nothing touches the format while building |
 //! | `csv`/`parquet` on a `kafka`/`nats` node | build | explicit `message_shape().is_none()` gate in `new` |
 //! | `csv`/`parquet` on a `tcp` **sink** | build | `message_shape().is_none()` gate in `TcpSink::connect`: there is no encoder to open, and the declaration is the whole answer for every batch |
 //! | `csv`/`parquet` on a `tcp` **source** | build | `open_message_decoder` needs only the declared schema, so `TcpIngestSource::new` opens one and hands the refusal back |
 //! | `avro` + WASM on a `file` source | build | the container file's `Int64` disagrees with `Ping.seq` |
 //! | `avro` + WASM on an `http`/`s3` source | run | the `schema_from` cross-check compares the stream's `Int64` against `Ping.seq` at drain time |
 //! | `uint64` on a `postgresql` node | build | no `PgFieldType` variant |
+//!
+//! Every transformer implements both stream methods, so a `file`, `http` or
+//! `s3` node has exactly one format it refuses, [`Format::None`], and it
+//! refuses it while building. Only the three message connectors can be handed
+//! a format whose surface they cannot drive.
 //!
 //! The order is the order the service checks in, and it decides which refusal
 //! a case observes: every node is built in topological order (source before
@@ -401,9 +402,10 @@ impl Format {
             // A rows connector resolves no transformer, so any declaration is
             // simply unreferenced.
             Surface::Rows => true,
-            Surface::Stream => {
-                matches!(self, Self::Avro | Self::Csv | Self::Ndjson | Self::Parquet)
-            }
+            Surface::Stream => matches!(
+                self,
+                Self::ArrowIpc | Self::Avro | Self::Csv | Self::Ndjson | Self::Parquet
+            ),
             Surface::Message => matches!(self, Self::ArrowIpc | Self::Avro | Self::Ndjson),
         }
     }
@@ -919,15 +921,13 @@ impl Case {
             return None;
         }
         match connector {
-            // The file connector touches the handle while building:
-            // `FileSource::open` reads the format's header and
-            // `FileSink::create` opens the writer, so a format with no stream
-            // surface fails there. `HttpSource`/`S3Source` spool at drain time
-            // and their sinks encode per batch, so those wait for the run.
-            Connector::File => {
-                rejected("the format has no byte-stream surface", "does not support")
+            // Every transformer implements the stream surface, so the only
+            // format a stream connector cannot carry is [`Format::None`],
+            // refused above. Nothing else reaches a `file`, `http` or `s3`
+            // node without the surface it drives.
+            Connector::File | Connector::Http | Connector::S3 => {
+                unreachable!("every format offers the byte-stream surface")
             }
-            Connector::Http | Connector::S3 => None,
             // Kafka and NATS gate on `message_shape` inside `new`.
             Connector::Kafka | Connector::Nats => {
                 rejected("the format has no message codec", "no message codec")
@@ -954,13 +954,6 @@ impl Case {
 
     /// What refuses `connector` once rows are moving.
     fn run_refusal(self, connector: Connector, is_source: bool) -> Option<Expect> {
-        let rejected = |site: Site, reason: &'static str| {
-            Some(Expect::Rejected {
-                site,
-                reason,
-                fragment: "",
-            })
-        };
         let refused_at_run = |reason: &'static str, fragment: &'static str| {
             Some(Expect::Rejected {
                 site: Site::Run,
@@ -972,27 +965,15 @@ impl Case {
         if connector.surface() == Surface::Rows {
             return None;
         }
-        if !self.format.fits(connector) {
-            return match connector {
-                // Both tcp halves settle the format while building:
-                // `TcpIngestSource::new` opens a decoder and `TcpSink::connect`
-                // gates on `message_shape`, so a format neither can carry never
-                // gets this far.
-                Connector::Tcp => {
-                    unreachable!("a tcp node with no message codec is refused while building")
-                }
-                Connector::Http => rejected(Site::Run, "the format has no byte-stream surface"),
-                // The object is real (seeded as ndjson, because the case's own
-                // format has no stream writer to seed with), so the source
-                // reaches `open_reader` and the format refuses to open one.
-                Connector::S3 if is_source => refused_at_run(
-                    "the format has no byte-stream surface",
-                    "does not support reading a byte stream",
-                ),
-                Connector::S3 => rejected(Site::Run, "the format has no byte-stream surface"),
-                _ => unreachable!("every other mismatch is refused while building"),
-            };
-        }
+        // A format its connector's surface cannot carry is settled while the
+        // node builds, for every byte connector: the three message connectors
+        // gate on the codec they need, and every format offers the stream
+        // surface the other three drive.
+        assert!(
+            self.format.fits(connector),
+            "a format {} cannot carry is refused while building",
+            connector.label()
+        );
         if !is_source || !self.format.carries_its_own_schema() {
             return None;
         }
@@ -2213,8 +2194,8 @@ async fn prepare_source(
             let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
             let path = dir.path().join("source.dat");
             std::fs::write(&path, seed_bytes).map_err(|e| format!("file seed: {e}"))?;
-            // `avro` and `parquet` refuse a declared schema, so the file's own
-            // schema is the one the link check sees.
+            // `arrow-ipc`, `avro` and `parquet` refuse a declared schema, so
+            // the file's own schema is the one the link check sees.
             let declared = if format.carries_its_own_schema() {
                 String::new()
             } else {
@@ -2319,13 +2300,13 @@ async fn prepare_source(
         }
         Connector::S3 => {
             let prefix = unique("in");
-            // The object is always real. A format with no stream writer cannot
-            // encode one, so it is seeded as ndjson: `open_reader` is refused
-            // before a byte is parsed, and an empty prefix would make that
-            // refusal indistinguishable from an empty bucket.
-            let seed_format = if seedable { format } else { Format::Ndjson };
+            // The object is always real, and every format a case can name has
+            // a stream writer to encode one with. A node carrying no
+            // transformer at all is refused while building, so `live` is
+            // false there; an empty prefix would make a refusal
+            // indistinguishable from an empty bucket.
             if live {
-                seed_s3(&endpoints.s3, &prefix, seed_format, &batch).await?;
+                seed_s3(&endpoints.s3, &prefix, format, &batch).await?;
             }
             // `schema_from "object"` is the only way a self-describing format
             // reaches an S3 source: the declared schema is cross-checked

@@ -1,13 +1,15 @@
 //! `pcs-transformer-arrow-ipc`: the `arrow-ipc` byte format for PCS.
 //!
-//! One payload is one Arrow IPC stream: a schema header followed by one or more
-//! `RecordBatch`es. This is the format a TCP frame and an Arrow-native Kafka
-//! topic carry, and it is the only one that needs no schema declaration on the
-//! wire while still checking the one it was given.
+//! One payload, and one whole file, is one Arrow IPC stream: a schema message
+//! followed by one message per `RecordBatch` and an end-of-stream marker. This
+//! is the format a TCP frame and an Arrow-native Kafka topic carry, and it is
+//! the only one that needs no schema declaration on the wire while still
+//! checking the one it was given.
 //!
-//! Message surface only. A `.arrows` file source and sink do not exist in PCS,
-//! so [`ArrowIpcTransformer`] leaves the stream surface at the transformer
-//! contract's `unsupported` error rather than inventing one.
+//! Both surfaces, on the one encapsulation. The message surface splits
+//! `PerBatch`; the stream surface reads and writes the same bytes end to end,
+//! so a `file`, `http` or `s3` node carries them too and the stream a sink
+//! wrote decodes through the message decoder unchanged.
 //!
 //! ```kdl
 //! source "wire" type="tcp" {

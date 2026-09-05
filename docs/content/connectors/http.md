@@ -134,17 +134,18 @@ ignored rather than rejected.
 
 On the sink, one batch is one request and one request is one whole document. The transformer opens a
 writer over an empty buffer, takes the batch, and finishes, so `csv` emits its header row every
-time, `ndjson` a block of lines, and `parquet` and `avro` one complete container with its footer.
-Nothing accumulates between batches, which is why `finish` has nothing to do and why there is no
-flush threshold to configure.
+time, `ndjson` a block of lines, `parquet` and `avro` one complete container with its footer, and
+[arrow-ipc](@/transformers/arrow-ipc.md) one complete Arrow stream. Nothing accumulates between
+batches, which is why `finish` has nothing to do and why there is no flush threshold to configure.
 
 On the source, one GET is the whole stream. `schema_from` decides what the format is handed:
 `"config"`, the default, hands over `schema_fields`, which
 [csv](@/transformers/csv.md) requires and [ndjson](@/transformers/ndjson.md) infers without;
 `"body"` hands over nothing, which is the only thing
-[parquet](@/transformers/parquet.md) and [avro](@/transformers/avro.md) accept. In `"body"` mode
-the schema the body turned out to carry must equal `schema_fields` field for field, and the
-mismatch is a configuration error naming both. Decoding runs on a dedicated OS thread feeding a
+[parquet](@/transformers/parquet.md), [avro](@/transformers/avro.md) and
+[arrow-ipc](@/transformers/arrow-ipc.md) accept. In `"body"` mode the schema the body turned out
+to carry must equal `schema_fields` field for field, and the mismatch is a configuration error
+naming both. Decoding runs on a dedicated OS thread feeding a
 bounded channel of four batches, so the executor never blocks on it.
 
 ## Sharp edge: validate does not touch the network
@@ -212,7 +213,7 @@ installed there; a self-signed endpoint reached over a trusted network is a plai
 | `parquet: the file carries its own schema; remove schema_fields` | the first batch, for a self-describing format read with `schema_from "config"` |
 | `HttpSink: cannot {METHOD} {url}: {e}` | the request |
 | `HttpSink: status {status} from {url}` | a response outside 2xx |
-| `format 'arrow-ipc' does not support writing a byte stream` | the sink's first batch, for a format with no stream write surface |
+| `format '{format}' does not support writing a byte stream` | the sink's first batch, for a format with no stream write surface |
 
 ## Where it is exercised
 

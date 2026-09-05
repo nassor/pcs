@@ -28,7 +28,7 @@ time.
 | Command | What it does |
 |---|---|
 | `serve` | Start. `--node-id N` overrides `node.id`; `--port P` overrides the port in `http.bind`, and `--port 0` prints the OS-assigned address on stdout. |
-| `validate` | Load-time gates 1 to 3, then exit. `--strict` promotes unknown factory types to errors. |
+| `validate` | Load-time gates 1 to 3, then exit. `--strict` promotes unknown factory types to errors. `--connectors-only` builds every source, sink and transformer instead of gates 2 and 3, so a config whose processor artifact is missing still validates. |
 | `status --addr URL` | One summary line from `/status`. `--full` prints the whole JSON document. |
 | `cluster init` | Pre-flight only: confirms `mode "cluster"` and `bootstrap #true`, then tells you to run `serve`. It does not start the node. |
 | `cluster status --addr URL` | The `cluster` field of `/status`. |

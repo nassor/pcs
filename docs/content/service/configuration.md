@@ -178,10 +178,16 @@ OK: all declared types resolved in built-in registry
 
 A `type` no registered factory claims is a warning and still exits 0: a config
 aimed at a custom binary names factories the stock binary does not know.
-`--strict` makes those warnings fail. A `FileSink` opens its output file while
-its factory runs, `validate` included, so the parent directory must exist
-first. The file is created when it is missing and appended to when it is not;
-`truncate #true` in the sink's `config` replaces it instead.
+`--strict` makes those warnings fail. `--connectors-only` builds every source,
+sink and transformer, skipping the wasm or plugin load and the workflow-graph
+check, so it validates a config whose processor artifact is not present.
+`cargo xtask validate` uses it to check every file under `examples/configs/`,
+most of which name a placeholder module the repository does not ship.
+
+A `FileSink` opens its output file while its factory runs, `validate`
+included, so the parent directory must exist first. The file is created when
+it is missing and appended to when it is not; `truncate #true` in the sink's
+`config` replaces it instead.
 
 ### Chaining processors
 

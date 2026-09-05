@@ -107,9 +107,16 @@ test-group = "heavy-docker"
 # heavy-docker override below so it wins `slow-timeout`: that override still
 # supplies `test-group`, because nextest resolves each setting independently
 # against the first matching override that specifies it.
+#
+# `success-output` is here for the same binary because this test's whole value
+# is the report it prints: the per-case matrix, the per-processor grids, the
+# supported/rejected/skipped/FAILED totals and the maximal workflow all go to
+# stdout, and nextest shows a passing test's output to nobody by default. A
+# green tick with no report says nothing about what the 14 minute run covered.
 [[profile.ci.overrides]]
 filter = 'binary_id(=pcs-service::connector_matrix)'
 slow-timeout = "2400s"
+success-output = "final"
 
 [[profile.ci.overrides]]
 filter = 'binary_id(=pcs-service::transport_chaos) or (binary_id(=pcs-service::raft_consensus_chaos) and not (test(/^unit::/) or test(/^idempotency::/))) or binary_id(=pcs-service::distributed_harness_smoke) or binary_id(=pcs-service::distributed_integration_chaos) or binary_id(=pcs-service::connector_matrix)'

@@ -203,10 +203,12 @@ to reach for depends on why you're running tests:
   --test connector_matrix --run-ignored ignored-only`). `--profile ci` is required there: `--test`
   selects a cargo build target, not a nextest filter, so it cannot bypass `default`'s exclusion of
   `full_matrix` itself. The job builds both the wasm and the native-plugin smoketest fixtures
-  first. The same file also holds `dimensions_cover_the_registry`, a Docker-free, non-`#[ignore]`d
-  test asserting the real factory registry's source count, sink count and registered transformer
-  formats agree exactly with this file's `CONNECTORS`/`FORMATS` lists above; it starts no
-  container and runs under the `default` profile like any other fast test.
+  first, and prints the test's own report (per-case grids, the supported/rejected/skipped/FAILED
+  totals, the maximal workflow) on a pass as well as a failure. The same file also holds
+  `dimensions_cover_the_registry`, a Docker-free, non-`#[ignore]`d test asserting the real factory
+  registry's source count, sink count and registered transformer formats agree exactly with this
+  file's `CONNECTORS`/`FORMATS` lists above; it starts no container and runs under the `default`
+  profile like any other fast test.
 
 `cargo test --workspace --all-features --doc` remains a separate, always-bare-`cargo-test` step in
 both this file and `ci.yml`: nextest does not run doctests.

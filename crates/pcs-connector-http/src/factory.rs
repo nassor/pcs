@@ -259,21 +259,22 @@ mod tests {
         );
     }
 
+    /// Only a parsed `"body"` reaches the constructor's demand for a declared
+    /// schema, so this is what distinguishes it from the default.
     #[test]
     fn schema_from_body_reaches_the_source() {
         let ctx = ConnectorContext::new(Some(csv_transformer()));
-        let cfg = config(&format!(
-            "url \"https://example.invalid/orders.csv\"\nschema_from \"body\"\n{SCHEMA}"
-        ));
+        let cfg = config("url \"https://example.invalid/orders.csv\"\nschema_from \"body\"");
 
-        let source = HttpSourceFactory
-            .build(&cfg, &ctx)
-            .expect("the source builds with no request made");
-        assert_eq!(
-            source.schema().fields().len(),
-            1,
-            "the declared schema is still what the graph is validated against"
-        );
+        let Err(err) = HttpSourceFactory.build(&cfg, &ctx) else {
+            panic!("a 'body' source has nothing to check the body against");
+        };
+        assert_eq!(err.category(), "configuration");
+        assert!(err.message().contains("schema_fields"), "got: {err}");
+
+        HttpSourceFactory
+            .build(&config("url \"https://example.invalid/orders.csv\""), &ctx)
+            .expect("the default takes no schema at all");
     }
 
     #[test]

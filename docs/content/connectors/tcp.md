@@ -142,9 +142,11 @@ The source settles this while it builds: <code>TcpIngestSource::new</code> opens
 off the declared schema, so a <code>csv</code> transformer fails
 <code>pcs-service validate</code> with
 <code>format 'csv' does not support decoding discrete messages</code> rather than accepting
-connections it can only close. The sink cannot ask the same question, because
-<code>encode_messages</code> needs a batch to encode: <code>TcpSink::connect</code> takes the
-transformer and nothing more, so a <code>csv</code> sink builds and its first write fails with
+connections it can only close. The sink cannot ask the same question:
+<code>encode_messages</code> needs a batch to encode, and the one question available while
+building, <code>message_shape</code>, is a declaration an encoder may omit, so gating on it would
+refuse a working sink. <code>TcpSink::connect</code> therefore takes the transformer and nothing
+more, and a <code>csv</code> sink builds and fails its first write with
 <code>format 'csv' does not support encoding discrete messages</code>. That batch is lost and the
 run reports a non-fatal error. A <code>transformer</code> node naming a format no transformer is
 registered for still fails at build.

@@ -118,7 +118,7 @@
 //! | a stream-less format on an `s3` **source** | run | the seeded object is real, so the drain reaches `open_reader` and the format refuses to open one |
 //! | a stream-less format on an `s3` **sink** | run | it encodes per batch, so nothing touches the format while building |
 //! | `csv`/`parquet` on a `kafka`/`nats` node | build | explicit `message_shape().is_none()` gate in `new` |
-//! | `csv`/`parquet` on a `tcp` **sink** | run | `encode_messages` needs a batch, so `TcpSink::connect` cannot ask; the first write can and does |
+//! | `csv`/`parquet` on a `tcp` **sink** | run | `encode_messages` needs a batch, and `message_shape` is a declaration a working encoder may omit, so `TcpSink::connect` asks nothing; the first write does |
 //! | `csv`/`parquet` on a `tcp` **source** | build | `open_message_decoder` needs only the declared schema, so `TcpIngestSource::new` opens one and hands the refusal back |
 //! | `avro` + WASM on a `file` source | build | the container file's `Int64` disagrees with `Ping.seq` |
 //! | `avro` + WASM on an `http`/`s3` source | run | the `schema_from` cross-check compares the stream's `Int64` against `Ping.seq` at drain time |
@@ -932,11 +932,16 @@ impl Case {
             Connector::Kafka | Connector::Nats => {
                 rejected("the format has no message codec", "no message codec")
             }
-            // The tcp sink defers: `encode_messages` needs a batch, so the
-            // earliest it can ask the transformer anything is the first write.
-            // The source has no such excuse — `open_message_decoder` needs
-            // only the declared schema — and `TcpIngestSource::new` opens one
-            // while building for exactly that reason.
+            // The source asks the transformer for the exact capability it
+            // needs: `open_message_decoder` takes only the declared schema, so
+            // `TcpIngestSource::new` opens one and hands the refusal back. The
+            // sink cannot do the same. `encode_messages` needs a batch, and
+            // the one question it could ask while building, `message_shape`,
+            // is a declaration rather than the capability: this crate's own
+            // `NoMessages` test transformer (`tcp/src/sink.rs`) encodes
+            // messages without declaring a shape, so gating on it would refuse
+            // a sink that works. `TcpSink` therefore refuses on the first
+            // write, where the runner counts and reports it.
             Connector::Tcp if is_source => rejected(
                 "the format has no message decoder",
                 "does not support decoding discrete messages",
@@ -2248,13 +2253,12 @@ async fn prepare_source(
         Connector::Tcp => {
             let bind = format!("127.0.0.1:{}", reserved_port()?);
             // A format with no message decoder is refused while the source
-            // builds, so these frames never leave the harness. They are
-            // encoded as ndjson only because `encode_frames` cannot encode a
-            // format that has no message encoder at all.
+            // builds, so no frame is ever sent: same rule as `seed_bytes`
+            // above.
             let frames = if seedable {
                 encode_frames(format, &batch)?
             } else {
-                encode_frames(Format::Ndjson, &batch)?
+                Vec::new()
             };
             side.kdl = format!(
                 "    source \"in\" type=\"tcp\" component=\"{component}\"{transformer_key} {{\n\

@@ -1112,6 +1112,11 @@ impl Report {
             "source", "sink", "transformer", "runtime", "outcome", "site", "elapsed"
         );
         for report in &self.cases {
+            // A failed case's detail carries the whole config it ran, and the
+            // table is one line per case: printing all of it here buries the
+            // grids and the totals under a config per failure and leaves no
+            // readable table at all. The failure list `full_matrix` builds
+            // prints the rest.
             println!(
                 "{:<12} {:<12} {:<10} {:<8} {:<10} {:<8} {:>8.1?}  {}",
                 report.case.source.label(),
@@ -1121,7 +1126,7 @@ impl Report {
                 report.outcome.label(),
                 report.site.map_or("-", Site::label),
                 report.elapsed,
-                report.detail
+                report.detail.lines().next().unwrap_or_default()
             );
         }
 

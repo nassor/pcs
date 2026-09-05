@@ -40,5 +40,8 @@ rustls        = { version = "0.23", default-features = false, features = ["ring"
 # stream-surface format that also requires a declared schema, so it exercises
 # both the source's `schema_fields` path and the sink's.
 pcs-transformer-csv = { path = "../pcs-transformer-csv" }
+# The self-describing counterpart: it refuses a declared schema, so it is what
+# `schema_from "body"` exists for.
+pcs-transformer-parquet = { path = "../pcs-transformer-parquet" }
 
 tokio         = { workspace = true }

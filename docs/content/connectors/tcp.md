@@ -27,9 +27,10 @@ The source is live: it never reaches EOF, so only the stream runner can drive it
 validation rejects `type="tcp"` on a `source` node in any other mode. That rule reads source nodes
 only, so a `tcp` sink runs in every run mode.
 
-The listener socket is bound inside the source's constructor, so a busy port or a bad address fails
-at config time rather than on the first batch. The sink resolves its address there too, and dials on
-the first batch.
+The listener socket is bound inside the source's constructor, which also opens a message decoder
+off the declared schema, so a busy port, a bad address, or a format with no message decoder fails
+at config time rather than on the first batch. The sink resolves its address there too, and dials
+on the first batch.
 
 ## In Rust
 
@@ -132,20 +133,21 @@ running. Each one is logged: `TcpIngestSource: oversized frame, closing connecti
 batch` and `TcpIngestSource: bad frame, closing connection`. A schema mismatch arrives inside the
 last of those, as `arrow-ipc: received batch with schema {:?}, expected {:?}`.
 
-## Sharp edge: a transformer with no message codec fails per connection
+## Sharp edge: the sink's missing message encoder waits for the first batch
 
 <div class="note note-warn">
 <span class="note-label">Sharp edge</span>
 <p>
-<code>TcpSourceFactory::build</code> takes the transformer the node names and nothing more. It
-never asks for a decoder, so a <code>csv</code> transformer passes
-<code>pcs-service validate</code> as long as <code>transformer-csv</code> is compiled in. The
-missing capability appears when a connection arrives: <code>open_message_decoder</code> fails, the
-connection is closed with <code>TcpIngestSource: cannot decode this format, closing
-connection</code>, and the listener keeps accepting. The sink half fails the same way on its first
-batch, where <code>encode_messages</code> returns
-<code>format 'csv' does not support encoding discrete messages</code>. A
-<code>transformer</code> node naming a format no transformer is registered for still fails at build.
+The source settles this while it builds: <code>TcpIngestSource::new</code> opens a message decoder
+off the declared schema, so a <code>csv</code> transformer fails
+<code>pcs-service validate</code> with
+<code>format 'csv' does not support decoding discrete messages</code> rather than accepting
+connections it can only close. The sink cannot ask the same question, because
+<code>encode_messages</code> needs a batch to encode: <code>TcpSink::connect</code> takes the
+transformer and nothing more, so a <code>csv</code> sink builds and its first write fails with
+<code>format 'csv' does not support encoding discrete messages</code>. That batch is lost and the
+run reports a non-fatal error. A <code>transformer</code> node naming a format no transformer is
+registered for still fails at build.
 </p>
 </div>
 
@@ -170,6 +172,7 @@ that same socket.
 | `tcp source config requires a 'bind' string` | the source factory, before construction |
 | `tcp sink config requires a 'connect' string` | the sink factory, before construction |
 | `tcp moves bytes and needs a 'transformer' key naming a declared transformer` | the shared context, when the node declared none |
+| `format '{format}' does not support decoding discrete messages` | the source's constructor, for a format with no message decoder |
 | `TcpIngestSource: cannot bind '{bind}': {e}` | binding the listener |
 | `TcpSink: cannot resolve 'connect' address '{connect}': {e}` | resolving the sink's address at build |
 | `TcpSink: 'connect' address '{connect}' resolved to no address` | the same, when resolution yields nothing |

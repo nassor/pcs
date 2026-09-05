@@ -88,17 +88,18 @@
 //! - A stream source of a self-describing format must let the stream carry the
 //!   schema: `avro` and `parquet` both refuse a declared schema in
 //!   `open_reader`. `FileSource` passes `schema_fields` straight through, so it
-//!   simply declares none. `S3Source` has `schema_from "object"` for exactly
-//!   this. `HttpSource` has neither: with no `schema_fields` it reports
-//!   `Schema::empty()`, so declaring none fails the link check instead. Its
-//!   `avro`/`parquet` cases therefore declare a schema and are refused by the
-//!   format at drain time.
+//!   simply declares none. `S3Source` has `schema_from "object"` and
+//!   `HttpSource` has `schema_from "body"`: both keep the declared schema for
+//!   the link check, hand the format nothing, and compare the schema the
+//!   stream turned out to carry against the declared one field for field.
 //! - The Avro object container file has no unsigned integer type:
 //!   `arrow-avro` writes `UInt64` as `long` and reads it back as `Int64`. So
 //!   the WASM processor's `Ping.seq: UInt64` cannot survive an `avro` *stream*
-//!   source, while its `avro` message cases round-trip unchanged. `FileSource`
-//!   surfaces this as a build-time link mismatch; `S3Source`'s
-//!   `schema_from "object"` cross-check surfaces it at drain time.
+//!   source, while its `avro` message cases round-trip unchanged, because the
+//!   message decoder casts back to the declared schema and no stream reader
+//!   has one to cast to. `FileSource` surfaces this as a build-time link
+//!   mismatch; the `http` and `s3` sources' `schema_from` cross-check surfaces
+//!   it at drain time.
 //! - `PgFieldType` (`pcs-connector-postgresql/src/config.rs`) has no unsigned
 //!   variant at all, so a `uint64` `schema_fields` entry is not a
 //!   PostgreSQL config. Every `postgresql` x WASM case is rejected while
@@ -117,11 +118,10 @@
 //! | a stream-less format on an `s3` **source** | run | the seeded object is real, so the drain reaches `open_reader` and the format refuses to open one |
 //! | a stream-less format on an `s3` **sink** | run | it encodes per batch, so nothing touches the format while building |
 //! | `csv`/`parquet` on a `kafka`/`nats` node | build | explicit `message_shape().is_none()` gate in `new` |
-//! | `csv`/`parquet` on a `tcp` **sink** | run | `TcpSink::connect` documents "a format with no message encoder fails on the first batch, not here" |
-//! | `csv`/`parquet` on a `tcp` **source** | no rows | `read_connection` logs a warning and closes the connection; nothing reaches the runner |
-//! | `avro`/`parquet` on an `http` source | run | the format refuses the declared schema when the body arrives |
+//! | `csv`/`parquet` on a `tcp` **sink** | run | `encode_messages` needs a batch, so `TcpSink::connect` cannot ask; the first write can and does |
+//! | `csv`/`parquet` on a `tcp` **source** | build | `open_message_decoder` needs only the declared schema, so `TcpIngestSource::new` opens one and hands the refusal back |
 //! | `avro` + WASM on a `file` source | build | the container file's `Int64` disagrees with `Ping.seq` |
-//! | `avro` + WASM on an `s3` source | run | `schema_from "object"` compares the object's `Int64` against `Ping.seq` at drain time |
+//! | `avro` + WASM on an `http`/`s3` source | run | the `schema_from` cross-check compares the stream's `Int64` against `Ping.seq` at drain time |
 //! | `uint64` on a `postgresql` node | build | no `PgFieldType` variant |
 //!
 //! The order is the order the service checks in, and it decides which refusal
@@ -741,6 +741,11 @@ impl RowKind {
 // ── Expectations ─────────────────────────────────────────────────────────────
 
 /// Where a refusal is observed.
+///
+/// There is no "the run was clean and delivered nothing" site: every refusal
+/// in this matrix either fails a build or is reported by the runner. A
+/// combination that ran clean and delivered nothing would be a silent bug, not
+/// a capability, so it gets fixed rather than a site of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
     /// `ServiceConfig::load` or `ServiceBuilder::build_all` returns an error.
@@ -748,8 +753,6 @@ pub enum Site {
     /// The service builds and the runner reports a non-fatal error; no row
     /// reaches the sink.
     Run,
-    /// The service builds and the run is clean, but no row reaches the sink.
-    NoRows,
 }
 
 impl Site {
@@ -757,7 +760,6 @@ impl Site {
         match self {
             Self::Build => "build",
             Self::Run => "run",
-            Self::NoRows => "no-rows",
         }
     }
 }
@@ -861,8 +863,8 @@ impl Case {
         let ends = [(self.source, true), (self.sink, false)];
 
         // 1. Node build, source first.
-        for (connector, _) in ends {
-            if let Some(refusal) = self.node_build_refusal(connector) {
+        for (connector, is_source) in ends {
+            if let Some(refusal) = self.node_build_refusal(connector, is_source) {
                 return refusal;
             }
         }
@@ -890,7 +892,7 @@ impl Case {
     }
 
     /// What refuses `connector`'s own node while the factory builds it.
-    fn node_build_refusal(self, connector: Connector) -> Option<Expect> {
+    fn node_build_refusal(self, connector: Connector, is_source: bool) -> Option<Expect> {
         let rejected = |reason: &'static str, fragment: &'static str| {
             Some(Expect::Rejected {
                 site: Site::Build,
@@ -930,8 +932,15 @@ impl Case {
             Connector::Kafka | Connector::Nats => {
                 rejected("the format has no message codec", "no message codec")
             }
-            // Both tcp halves defer: the source opens its decoder per
-            // connection, the sink encodes on the first batch.
+            // The tcp sink defers: `encode_messages` needs a batch, so the
+            // earliest it can ask the transformer anything is the first write.
+            // The source has no such excuse — `open_message_decoder` needs
+            // only the declared schema — and `TcpIngestSource::new` opens one
+            // while building for exactly that reason.
+            Connector::Tcp if is_source => rejected(
+                "the format has no message decoder",
+                "does not support decoding discrete messages",
+            ),
             Connector::Tcp => None,
             Connector::Channel | Connector::Postgresql => {
                 unreachable!("a rows connector returned above")
@@ -961,12 +970,11 @@ impl Case {
         }
         if !self.format.fits(connector) {
             return match connector {
-                // `read_connection` logs and closes the connection, so the
-                // runner sees no item at all rather than an error.
-                Connector::Tcp if is_source => rejected(
-                    Site::NoRows,
-                    "the tcp source closes a connection it cannot decode",
-                ),
+                // The source opens its decoder in `TcpIngestSource::new`, so a
+                // format it cannot decode never gets this far.
+                Connector::Tcp if is_source => {
+                    unreachable!("a tcp source with no message decoder is refused while building")
+                }
                 Connector::Tcp => rejected(Site::Run, "the tcp sink encodes on the first batch"),
                 Connector::Http => rejected(Site::Run, "the format has no byte-stream surface"),
                 // The object is real (seeded as ndjson, because the case's own
@@ -984,15 +992,15 @@ impl Case {
             return None;
         }
         match connector {
-            // No `schema_from` knob: the declared schema is the only one it
-            // has, and a self-describing format refuses one.
-            Connector::Http => {
-                rejected(Site::Run, "HttpSource cannot take its schema from the body")
-            }
-            // `schema_from "object"` compares the container file's own schema
-            // against the declared one, and `arrow-avro` reads the `long` it
-            // wrote for `Ping.seq` back as `Int64`.
-            Connector::S3 if self.format == Format::Avro && self.row() == RowKind::Ping => {
+            // Both stream sources hand the format nothing and cross-check the
+            // schema the stream turned out to carry: `schema_from "body"` on
+            // an `http` source, `schema_from "object"` on an `s3` one. Every
+            // self-describing format therefore reads, except that `arrow-avro`
+            // reads the `long` it wrote for `Ping.seq` back as `Int64`, which
+            // the cross-check refuses.
+            Connector::Http | Connector::S3
+                if self.format == Format::Avro && self.row() == RowKind::Ping =>
+            {
                 refused_at_run(
                     "the avro container file has no unsigned integer type",
                     "carries schema [seq: Int64] but the config declared [seq: UInt64]",
@@ -1943,34 +1951,66 @@ struct SourceSide {
 
 /// A second, direct build of a source, used to name the refusal the runner
 /// only counts.
-struct SourceProbe {
-    connection: pcs_connector_s3::S3ConnectionConfig,
-    prefix: String,
-    format: Format,
-    schema: Arc<Schema>,
-    schema_from: pcs_connector_s3::SchemaFrom,
+enum SourceProbe {
+    Http {
+        url: String,
+        format: Format,
+        schema: Arc<Schema>,
+    },
+    S3 {
+        connection: pcs_connector_s3::S3ConnectionConfig,
+        prefix: String,
+        format: Format,
+        schema: Arc<Schema>,
+        schema_from: pcs_connector_s3::SchemaFrom,
+    },
 }
 
 impl SourceProbe {
     /// The error the connector itself reports for this source, or `Err` when
     /// it reports none.
     async fn refusal(self) -> Result<String, String> {
-        let transformer = self
-            .format
-            .transformer()
-            .ok_or("a probed source always names a format")?;
-        let source = pcs_connector_s3::S3Source::new(
-            pcs_connector_s3::S3SourceConfig {
-                connection: self.connection,
-                prefix: self.prefix,
-                schema_from: self.schema_from,
-                schema_fields: Vec::new(),
-            },
-            self.schema,
-            transformer,
-        )
-        .map_err(|e| format!("probe source: {e}"))?;
-        match drain(Box::new(source)).await {
+        let source: Box<dyn Source> = match self {
+            Self::Http {
+                url,
+                format,
+                schema,
+            } => Box::new(
+                pcs_connector_http::HttpSource::new(
+                    &url,
+                    Some(schema),
+                    pcs_connector_http::SchemaFrom::Body,
+                    format
+                        .transformer()
+                        .ok_or("a probed source always names a format")?,
+                    Vec::new(),
+                    Duration::from_secs(15),
+                )
+                .map_err(|e| format!("probe source: {e}"))?,
+            ),
+            Self::S3 {
+                connection,
+                prefix,
+                format,
+                schema,
+                schema_from,
+            } => Box::new(
+                pcs_connector_s3::S3Source::new(
+                    pcs_connector_s3::S3SourceConfig {
+                        connection,
+                        prefix,
+                        schema_from,
+                        schema_fields: Vec::new(),
+                    },
+                    schema,
+                    format
+                        .transformer()
+                        .ok_or("a probed source always names a format")?,
+                )
+                .map_err(|e| format!("probe source: {e}"))?,
+            ),
+        };
+        match drain(source).await {
             Err(message) => Ok(message),
             Ok(batches) => Err(format!(
                 "the connector refused nothing: it drained {} batch(es)",
@@ -2185,20 +2225,32 @@ async fn prepare_source(
         Connector::Http => {
             let body = seed_bytes;
             let probe = HttpProbe::spawn(body)?;
+            // `schema_from "body"` is the only way a self-describing format
+            // reaches an http source: the declared schema stays behind for the
+            // link check and is cross-checked against the body's own.
+            let schema_from_kdl = if format.carries_its_own_schema() {
+                "\n            schema_from \"body\""
+            } else {
+                ""
+            };
+            side.probe = format.key().map(|_| SourceProbe::Http {
+                url: probe.url.clone(),
+                format,
+                schema: row.schema(),
+            });
             side.kdl = format!(
                 "    source \"in\" type=\"HttpSource\" component=\"{component}\"{transformer_key} {{\n\
-                 \x20       config {{\n            url \"{}\"\n            timeout_ms 15000\n{fields}\n        }}\n    }}",
+                 \x20       config {{\n            url \"{}\"{schema_from_kdl}\n            timeout_ms 15000\n{fields}\n        }}\n    }}",
                 probe.url
             );
             side._probe = Some(probe);
         }
         Connector::Tcp => {
             let bind = format!("127.0.0.1:{}", reserved_port()?);
-            // A format with no message decoder still gets real frames on the
-            // wire, encoded as ndjson: the source closes the connection while
-            // building its own decoder, before it reads a frame, so the bytes
-            // are never parsed. Sending nothing at all would make the no-rows
-            // expectation true whatever the source did.
+            // A format with no message decoder is refused while the source
+            // builds, so these frames never leave the harness. They are
+            // encoded as ndjson only because `encode_frames` cannot encode a
+            // format that has no message encoder at all.
             let frames = if seedable {
                 encode_frames(format, &batch)?
             } else {
@@ -2282,7 +2334,7 @@ async fn prepare_source(
             } else {
                 (pcs_connector_s3::SchemaFrom::Config, "")
             };
-            side.probe = format.key().map(|_| SourceProbe {
+            side.probe = format.key().map(|_| SourceProbe::S3 {
                 connection: endpoints.s3.clone(),
                 prefix: prefix.clone(),
                 format,
@@ -3001,20 +3053,18 @@ async fn execute(
             .tcp
             .clone()
             .ok_or("a stream-mode case must be tcp-sourced")?;
-        // What the runner must report before the stream may be cancelled. Only
-        // a tcp source's own refusal stops rows; a sink refusal still drains
-        // every row and reports an error instead of writing. The sink target is
-        // one item short of the frame count, because the live snapshot never
-        // shows the last item's write.
+        // What the runner must report before the stream may be cancelled. A
+        // refused stream-mode case is always refused by its sink now that the
+        // tcp source's own refusal lands at build, and a sink refusal still
+        // drains every row and reports an error instead of writing. The sink
+        // target is one item short of the frame count, because the live
+        // snapshot never shows the last item's write.
         let targets = match expect {
             Expect::Supported => StreamTargets {
                 rows: case.expected_rows(),
                 batches: (frames.len() as u64).saturating_sub(1),
                 errors: 0,
             },
-            Expect::Rejected {
-                site: Site::NoRows, ..
-            } => StreamTargets::default(),
             Expect::Rejected { .. } => StreamTargets {
                 rows: 3,
                 batches: 0,
@@ -3082,10 +3132,6 @@ async fn execute(
                     "expected the runner to report an error ({reason}), it reported none [{seen}]\
                      \n--- config ---\n{raw}"
                 )),
-                Site::NoRows if stats.iteration_errors != 0 => Err(format!(
-                    "expected a clean run with no rows ({reason}) [{seen}]\
-                     \n--- config ---\n{raw}"
-                )),
                 // The runner counted the error but kept no message, so the
                 // refusal named in the capability table is asserted against
                 // the connector that raises it.
@@ -3105,7 +3151,7 @@ async fn execute(
                         ))
                     }
                 }
-                Site::Run | Site::NoRows => Ok(()),
+                Site::Run => Ok(()),
             }
         }
     }
@@ -3136,10 +3182,7 @@ fn check_build_refusal(expect: &Expect, message: &str, raw: &str) -> Result<(), 
 }
 
 /// What the runner must have reported before a stream-mode case is cancelled.
-///
-/// All zero means nothing is expected to happen at all, in which case the
-/// driver settles for a fixed window instead of watching for progress.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct StreamTargets {
     rows: u64,
     batches: u64,
@@ -3151,10 +3194,6 @@ impl StreamTargets {
         stats.rows_processed >= self.rows
             && stats.sink_batches_written >= self.batches
             && stats.iteration_errors >= self.errors
-    }
-
-    fn idle(&self) -> bool {
-        self.rows == 0 && self.batches == 0 && self.errors == 0
     }
 }
 
@@ -3216,54 +3255,19 @@ async fn drive_tcp_stream(
             return Err(format!("connecting to the tcp source at {bind} timed out"));
         }
     };
-    // A source that cannot build a decoder for its format closes the
-    // connection before reading a frame, so the writes themselves fail or the
-    // peer reports EOF. That close is the observable the no-rows expectation
-    // rests on, so it is checked rather than treated as a harness error.
-    let mut write_failed = false;
     for frame in &frames {
         if let Err(e) = producer.write_all(frame).await {
-            if !targets.idle() {
-                cancel.cancel();
-                return Err(format!("write frame: {e}"));
-            }
-            write_failed = true;
-            break;
+            cancel.cancel();
+            return Err(format!("write frame: {e}"));
         }
     }
     let _ = producer.flush().await;
 
-    if targets.idle() {
-        if !write_failed {
-            // Nothing was rejected on the write side, so the close has to show
-            // up as EOF on the read side.
-            let mut byte = [0u8; 1];
-            let closed = match tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::io::AsyncReadExt::read(&mut producer, &mut byte),
-            )
-            .await
-            {
-                Ok(Ok(0)) | Ok(Err(_)) => true,
-                Ok(Ok(_)) => false,
-                Err(_) => false,
-            };
-            if !closed {
-                cancel.cancel();
-                return Err(
-                    "the tcp source kept open a connection whose format it cannot decode"
-                        .to_string(),
-                );
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    } else {
-        await_stats(&live, Duration::from_secs(30), |stats| targets.met(stats)).await;
-        // The last item is invisible in the snapshot, so it gets a window
-        // rather than a wait. Wide enough to survive a loaded host: every case
-        // future shares one poll loop with a WASM or plugin call in it.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-    }
+    await_stats(&live, Duration::from_secs(30), |stats| targets.met(stats)).await;
+    // The last item is invisible in the snapshot, so it gets a window rather
+    // than a wait. Wide enough to survive a loaded host: every case future
+    // shares one poll loop with a WASM or plugin call in it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
     drop(producer);
     cancel.cancel();
     Ok(())

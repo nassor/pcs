@@ -110,7 +110,8 @@ Source:
 | `url` | required |
 | `headers` | none |
 | `timeout_ms` | `30000`, the whole-request budget |
-| `schema_fields` | optional, and the format decides |
+| `schema_fields` | optional, and the format decides; required by `schema_from "body"` |
+| `schema_from` | `"config"`, the other value being `"body"`; source only |
 
 Sink:
 
@@ -137,11 +138,14 @@ time, `ndjson` a block of lines, and `parquet` and `avro` one complete container
 Nothing accumulates between batches, which is why `finish` has nothing to do and why there is no
 flush threshold to configure.
 
-On the source, one GET is the whole stream. `schema_fields` is what the format decides on:
-[csv](@/transformers/csv.md) requires it, [ndjson](@/transformers/ndjson.md) infers when it is
-absent, and [parquet](@/transformers/parquet.md) and [avro](@/transformers/avro.md) refuse it
-because the body carries its own. Decoding runs on a dedicated OS thread feeding a bounded channel
-of four batches, so the executor never blocks on it.
+On the source, one GET is the whole stream. `schema_from` decides what the format is handed:
+`"config"`, the default, hands over `schema_fields`, which
+[csv](@/transformers/csv.md) requires and [ndjson](@/transformers/ndjson.md) infers without;
+`"body"` hands over nothing, which is the only thing
+[parquet](@/transformers/parquet.md) and [avro](@/transformers/avro.md) accept. In `"body"` mode
+the schema the body turned out to carry must equal `schema_fields` field for field, and the
+mismatch is a configuration error naming both. Decoding runs on a dedicated OS thread feeding a
+bounded channel of four batches, so the executor never blocks on it.
 
 ## Sharp edge: validate does not touch the network
 
@@ -156,17 +160,20 @@ There is no retry and no reconnect: a request the endpoint refuses fails the run
 </p>
 </div>
 
-## Sharp edge: a self-describing format has no schema to validate against
+## Sharp edge: a self-describing format still needs schema_fields
 
 <div class="note note-warn">
 <span class="note-label">Sharp edge</span>
 <p>
 <code>HttpSource::schema</code> reports the declared schema, and an empty one when the config
-declared none, because nothing can be known about a body that has not arrived. <code>parquet</code>
-and <code>avro</code> refuse a declared schema, so a workflow reading either over HTTP has nothing
-for the graph check to compare, and a link into a processor that declares fields is rejected at
-build. Those two formats belong in a Rust pipeline, where no graph check runs. <code>csv</code>
-always declares a schema and <code>ndjson</code> can, so both work in a config.
+declared none, because nothing can be known about a body that has not arrived. The graph is
+validated against that, so <code>schema_from "body"</code> still requires
+<code>schema_fields</code>: it withholds them from the format, not from the graph check. A
+<code>"body"</code> source without them is
+<code>HttpSource: schema_from "body" needs a 'schema_fields' list to check the body's own schema
+against</code>. Reading <code>parquet</code> or <code>avro</code> with the default
+<code>schema_from "config"</code> fails on the first batch instead, where the format refuses the
+declared schema.
 </p>
 </div>
 
@@ -199,6 +206,10 @@ installed there; a self-signed endpoint reached over a trusted network is a plai
 | `HttpSource: status {status} from {url}` | a response outside 2xx |
 | `HttpSource: spool file: {e}`, `HttpSource: spool write: {e}`, `HttpSource: spool rewind: {e}` | spooling the body to its temp file |
 | `HttpSource: spawn_blocking panic: {e}` | the blocking task that spools and opens the reader |
+| `HttpSource config.schema_from must be "config" or "body"` | the source factory, for any other value |
+| `HttpSource: schema_from "body" needs a 'schema_fields' list to check the body's own schema against` | the source's constructor |
+| `HttpSource: body from {url} carries schema [...] but the config declared [...]` | the first batch, a `schema_from "body"` mismatch |
+| `parquet: the file carries its own schema; remove schema_fields` | the first batch, for a self-describing format read with `schema_from "config"` |
 | `HttpSink: cannot {METHOD} {url}: {e}` | the request |
 | `HttpSink: status {status} from {url}` | a response outside 2xx |
 | `format 'arrow-ipc' does not support writing a byte stream` | the sink's first batch, for a format with no stream write surface |
@@ -207,7 +218,8 @@ installed there; a self-signed endpoint reached over a trusted network is a plai
 
 `crates/pcs-connector-http/tests/round_trip.rs` drives both halves against a hand rolled
 `TcpListener` server: the source reads a served csv body, the sink's captured bodies decode back to
-the rows that went in, and the request count pins one request per batch.
+the rows that went in, and the request count pins one request per batch. A served parquet body
+covers `schema_from "body"`, including a body whose schema is not the declared one.
 
 `crates/pcs-service/tests/http_connector.rs` runs the same pair from one config through
 `run_standalone` in one-shot mode.

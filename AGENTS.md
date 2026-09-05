@@ -192,21 +192,21 @@ to reach for depends on why you're running tests:
   run, isolating every case by a unique topic, subject, table, object prefix, file path or
   OS-assigned port and running them all concurrently in-process. A rejected case asserts both the
   refusal and where it lands: `build` (`ServiceConfig::load` or `ServiceBuilder::build_all`
-  returns an error containing a predicted fragment), `run` (the service builds but the runner
-  reports a non-fatal error and no row reaches the sink), or `no rows` (a clean run delivering
-  nothing, the way a `tcp` source does when it cannot build a decoder for its format). A build
-  refusal touches no live resource, so that coverage holds with no Docker daemon at all; a case
-  whose resource has no reachable container is skipped individually instead, so Docker-free
-  combinations still run. `full_matrix` is excluded from the `default` profile and `#[ignore]`d,
-  so `--profile ci` skips it too; it reaches CI only through the `connector_matrix` job (`cargo
-  nextest run -p pcs-service --all-features --profile ci --test connector_matrix --run-ignored
-  ignored-only`). `--profile ci` is required there: `--test` selects a cargo build target, not a
-  nextest filter, so it cannot bypass `default`'s exclusion of `full_matrix` itself. The job
-  builds both the wasm and the native-plugin smoketest fixtures first. The same file also holds
-  `dimensions_cover_the_registry`, a Docker-free, non-`#[ignore]`d test asserting the real
-  factory registry's source count, sink count and registered transformer formats agree exactly
-  with this file's `CONNECTORS`/`FORMATS` lists above; it starts no container and runs under the
-  `default` profile like any other fast test.
+  returns an error containing a predicted fragment) or `run` (the service builds but the runner
+  reports a non-fatal error and no row reaches the sink). There is deliberately no third site for
+  a clean run that delivers nothing: that is what a silent bug looks like, so such a combination
+  gets fixed rather than recorded. A build refusal touches no live resource, so that coverage
+  holds with no Docker daemon at all; a case whose resource has no reachable container is skipped
+  individually instead, so Docker-free combinations still run. `full_matrix` is excluded from the
+  `default` profile and `#[ignore]`d, so `--profile ci` skips it too; it reaches CI only through
+  the `connector_matrix` job (`cargo nextest run -p pcs-service --all-features --profile ci
+  --test connector_matrix --run-ignored ignored-only`). `--profile ci` is required there: `--test`
+  selects a cargo build target, not a nextest filter, so it cannot bypass `default`'s exclusion of
+  `full_matrix` itself. The job builds both the wasm and the native-plugin smoketest fixtures
+  first. The same file also holds `dimensions_cover_the_registry`, a Docker-free, non-`#[ignore]`d
+  test asserting the real factory registry's source count, sink count and registered transformer
+  formats agree exactly with this file's `CONNECTORS`/`FORMATS` lists above; it starts no
+  container and runs under the `default` profile like any other fast test.
 
 `cargo test --workspace --all-features --doc` remains a separate, always-bare-`cargo-test` step in
 both this file and `ci.yml`: nextest does not run doctests.
@@ -895,8 +895,8 @@ collector, a scraper or external storage. Nothing leaves the process.
   Docker soft-skip convention, and why testcontainers-backed tests are safe to run in parallel.
 - Every new source connector, sink connector, transformer, and processor runtime must be added to
   `crates/pcs-service/tests/connector_matrix.rs`'s dimension lists in the same change that
-  introduces it: its entry in the capability table (supported, or rejected at build, at run, or
-  with no rows) and its node in the maximal workflow. A connector or transformer not in the matrix
+  introduces it: its entry in the capability table (supported, or rejected at build or at run)
+  and its node in the maximal workflow. A connector or transformer not in the matrix
   is not considered wired; that same file's `dimensions_cover_the_registry` test fails when a
   registered factory or transformer format falls outside the matrix's `CONNECTORS`/`FORMATS`
   lists, so an omission here is caught, not just documented.

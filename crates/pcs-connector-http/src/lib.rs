@@ -53,4 +53,4 @@ pub mod source;
 
 pub use factory::{HttpSinkFactory, HttpSourceFactory};
 pub use sink::HttpSink;
-pub use source::HttpSource;
+pub use source::{HttpSource, SchemaFrom};

@@ -43,9 +43,12 @@ Writing takes the columns of each batch it is handed. The writer stores no schem
 
 ## Surfaces
 
-Stream read and write. There is no message codec, so a Kafka source or sink naming a `csv`
-transformer fails at build with `KafkaSink: format 'csv' has no message codec`, and a `tcp` source
-fails per connection instead, because its factory never asks the transformer for a decoder.
+Stream read and write. There is no message codec, so a Kafka, NATS or `tcp` source or sink naming
+a `csv` transformer fails at build: `KafkaSink: format 'csv' has no message codec` from the
+`message_shape` gate, and `format 'csv' does not support decoding discrete messages` from the
+decoder `TcpIngestSource::new` opens. A `tcp` sink is the one that waits, because
+`encode_messages` needs a batch: its first write fails with
+`format 'csv' does not support encoding discrete messages`.
 
 ## Header rows
 

@@ -4248,6 +4248,7 @@ dependencies = [
  "pcs-core",
  "pcs-transformer",
  "pcs-transformer-csv",
+ "pcs-transformer-parquet",
  "reqwest 0.13.4",
  "rustls",
  "tempfile",

@@ -18,7 +18,7 @@ use pcs_connector::{
 use pcs_core::error::PcsError;
 use pcs_core::io::{sink::Sink, source::Source};
 
-use crate::{HttpSink, HttpSource};
+use crate::{HttpSink, HttpSource, SchemaFrom};
 
 /// Whole-request budget when `timeout_ms` is absent.
 const DEFAULT_TIMEOUT_MS: i64 = 30_000;
@@ -77,6 +77,29 @@ fn headers(config: &ConfigValue, what: &str) -> Result<Vec<(String, String)>, Pc
         .collect()
 }
 
+/// Where the source takes the schema it hands the format from.
+///
+/// Absent means [`SchemaFrom::Config`], which is what every schemaless format
+/// wants.
+///
+/// # Errors
+///
+/// Returns [`PcsError::Configuration`] when `schema_from` is present and is
+/// neither `"config"` nor `"body"`: a misspelling silently read as the default
+/// would hand `parquet` a declared schema it refuses.
+fn schema_from(config: &ConfigValue, what: &str) -> Result<SchemaFrom, PcsError> {
+    let Some(value) = config.get("schema_from") else {
+        return Ok(SchemaFrom::Config);
+    };
+    match value.as_str() {
+        Some("config") => Ok(SchemaFrom::Config),
+        Some("body") => Ok(SchemaFrom::Body),
+        _ => Err(PcsError::configuration(format!(
+            "{what} config.schema_from must be \"config\" or \"body\""
+        ))),
+    }
+}
+
 /// Factory for [`HttpSource`].
 ///
 /// Config fields:
@@ -84,7 +107,13 @@ fn headers(config: &ConfigValue, what: &str) -> Result<Vec<(String, String)>, Pc
 /// - `headers` (table, optional): request headers, `name "value"` per entry.
 /// - `timeout_ms` (integer, optional, default `30000`): whole-request budget.
 /// - `schema_fields` (list, optional): the declared Arrow schema. Required by
-///   `csv`, rejected by `parquet` and `avro`, inferred by `ndjson` when absent.
+///   `csv`, and by any `schema_from "body"` source; `parquet` and `avro` refuse
+///   it, so those read with `schema_from "body"` instead; `ndjson` infers it
+///   when absent.
+/// - `schema_from` (`"config"` or `"body"`, optional, default `"config"`):
+///   where the schema handed to the format comes from. `"body"` withholds
+///   `schema_fields` from the format and checks the body's own schema against
+///   it field for field.
 ///
 /// The byte format is whatever transformer the `source` node's `transformer`
 /// key names; see [`ConnectorContext::transformer`].
@@ -106,6 +135,7 @@ impl SourceFactory for HttpSourceFactory {
         Ok(Box::new(HttpSource::new(
             url,
             declared,
+            schema_from(config, "HttpSource")?,
             transformer,
             headers(config, "HttpSource")?,
             timeout(config),
@@ -207,6 +237,42 @@ mod tests {
         assert_eq!(
             err.message(),
             "HttpSink config requires a 'url' string field"
+        );
+    }
+
+    /// A misspelling read as the default would hand a self-describing format a
+    /// declared schema it refuses, on the first batch, in production.
+    #[test]
+    fn an_unknown_schema_from_is_a_configuration_error() {
+        let ctx = ConnectorContext::new(Some(csv_transformer()));
+        let cfg = config(&format!(
+            "url \"https://example.invalid/orders.csv\"\nschema_from \"object\"\n{SCHEMA}"
+        ));
+
+        let Err(err) = HttpSourceFactory.build(&cfg, &ctx) else {
+            panic!("'object' is the s3 spelling, not this connector's");
+        };
+        assert_eq!(err.category(), "configuration");
+        assert_eq!(
+            err.message(),
+            "HttpSource config.schema_from must be \"config\" or \"body\""
+        );
+    }
+
+    #[test]
+    fn schema_from_body_reaches_the_source() {
+        let ctx = ConnectorContext::new(Some(csv_transformer()));
+        let cfg = config(&format!(
+            "url \"https://example.invalid/orders.csv\"\nschema_from \"body\"\n{SCHEMA}"
+        ));
+
+        let source = HttpSourceFactory
+            .build(&cfg, &ctx)
+            .expect("the source builds with no request made");
+        assert_eq!(
+            source.schema().fields().len(),
+            1,
+            "the declared schema is still what the graph is validated against"
         );
     }
 

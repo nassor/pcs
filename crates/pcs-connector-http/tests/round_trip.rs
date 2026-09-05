@@ -16,11 +16,12 @@ use std::time::Duration;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
-use pcs_connector_http::{HttpSink, HttpSource};
+use pcs_connector_http::{HttpSink, HttpSource, SchemaFrom};
 use pcs_core::io::sink::Sink;
 use pcs_core::io::source::Source;
 use pcs_transformer::Transformer;
 use pcs_transformer_csv::CsvTransformer;
+use pcs_transformer_parquet::ParquetTransformer;
 
 // ── the test server ─────────────────────────────────────────────────────────
 
@@ -188,9 +189,32 @@ fn decode_body(body: &[u8]) -> Vec<RecordBatch> {
     batches
 }
 
+fn parquet() -> Arc<dyn Transformer> {
+    Arc::new(ParquetTransformer::new())
+}
+
+/// One whole parquet document, the way a real endpoint would serve one: the
+/// format carries its own schema, so nothing outside the bytes describes it.
+fn parquet_body(schema: Arc<Schema>, batch: &RecordBatch) -> Vec<u8> {
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    let mut writer = parquet()
+        .open_writer(Box::new(file.reopen().expect("reopen")), schema)
+        .expect("writer");
+    writer.write_batch(batch).expect("write");
+    writer.finish().expect("finish");
+    std::fs::read(file.path()).expect("read back the document")
+}
+
 fn source(url: &str, headers: Vec<(String, String)>) -> HttpSource {
-    HttpSource::new(url, Some(schema()), csv(), headers, Duration::from_secs(5))
-        .expect("source builds")
+    HttpSource::new(
+        url,
+        Some(schema()),
+        SchemaFrom::Config,
+        csv(),
+        headers,
+        Duration::from_secs(5),
+    )
+    .expect("source builds")
 }
 
 fn sink(url: &str, method: &str) -> HttpSink {
@@ -272,6 +296,105 @@ async fn a_refused_connection_names_the_url() {
             .starts_with(&format!("HttpSource: cannot GET {url}")),
         "got: {err}"
     );
+}
+
+/// `parquet` and `avro` refuse a declared schema, so the only way to read one
+/// over HTTP is to let the body carry it. The declared schema is still what
+/// the graph is validated against, so it is checked rather than dropped.
+#[tokio::test]
+async fn a_self_describing_body_is_read_with_its_own_schema() {
+    let (url, server) = serve(1, "200 OK", parquet_body(schema(), &batch(&[1, 2, 3])));
+    let mut source = HttpSource::new(
+        &url,
+        Some(schema()),
+        SchemaFrom::Body,
+        parquet(),
+        Vec::new(),
+        Duration::from_secs(5),
+    )
+    .expect("source builds");
+
+    let batch = source
+        .next_batch()
+        .await
+        .expect("read")
+        .expect("the body holds rows");
+    assert_eq!(column(&batch, "id"), vec![1, 2, 3]);
+    assert_eq!(column(&batch, "total"), vec![10, 20, 30]);
+    assert_eq!(
+        source.schema().fields(),
+        schema().fields(),
+        "the declared schema is what the graph was validated against"
+    );
+    server.join().expect("server thread");
+}
+
+/// The declared schema is a promise about the body. A body that carries
+/// something else is a configuration error naming both, not rows cast into
+/// shape.
+#[tokio::test]
+async fn a_body_schema_that_differs_from_the_declared_one_is_a_configuration_error() {
+    let wide = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("total", DataType::Int64, false),
+        Field::new("extra", DataType::Int64, false),
+    ]));
+    let body = parquet_body(
+        Arc::clone(&wide),
+        &RecordBatch::try_new(
+            wide,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![100])),
+            ],
+        )
+        .expect("batch"),
+    );
+    let (url, server) = serve(1, "200 OK", body);
+    let mut source = HttpSource::new(
+        &url,
+        Some(schema()),
+        SchemaFrom::Body,
+        parquet(),
+        Vec::new(),
+        Duration::from_secs(5),
+    )
+    .expect("source builds");
+
+    let Err(err) = source.next_batch().await else {
+        panic!("a body carrying another schema is not rows to deliver");
+    };
+    assert_eq!(err.category(), "configuration", "got: {err}");
+    assert!(
+        err.message()
+            .contains("carries schema [id: Int64, total: Int64, extra: Int64]"),
+        "got: {err}"
+    );
+    assert!(
+        err.message()
+            .contains("the config declared [id: Int64, total: Int64]"),
+        "got: {err}"
+    );
+    server.join().expect("server thread");
+}
+
+/// With no declared schema there is nothing for the graph check to compare, so
+/// the source refuses while it builds rather than failing the link later.
+#[test]
+fn schema_from_body_without_a_declared_schema_is_a_configuration_error() {
+    let Err(err) = HttpSource::new(
+        "https://example.invalid/orders.parquet",
+        None,
+        SchemaFrom::Body,
+        parquet(),
+        Vec::new(),
+        Duration::from_secs(5),
+    ) else {
+        panic!("schema_from body needs a schema to check against");
+    };
+    assert_eq!(err.category(), "configuration", "got: {err}");
+    assert!(err.message().contains("schema_fields"), "got: {err}");
 }
 
 // ── the sink half ───────────────────────────────────────────────────────────

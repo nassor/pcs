@@ -7,13 +7,20 @@
 //! parquet reads its footer before any row group. One dedicated OS thread then
 //! drives the [`BatchReader`](pcs_transformer::BatchReader) and pushes batches
 //! down a bounded channel, so the executor never blocks on the decode.
+//!
+//! [`SchemaFrom`] decides what the format is handed: `schema_fields` verbatim,
+//! which is what `csv` needs, or nothing at all, which is the only thing
+//! `parquet` and `avro` accept. The declared schema is still what
+//! [`Source::schema`] reports either way, because the graph is validated
+//! before a request is made; with [`SchemaFrom::Body`] it is checked field for
+//! field against the schema the body turned out to carry.
 
 use std::io::{Seek, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Fields, Schema};
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use tokio::sync::mpsc;
@@ -28,6 +35,19 @@ use crate::client;
 /// `pcs-connector-file`'s.
 const CHANNEL_CAPACITY: usize = 4;
 
+/// Where the Arrow schema a source hands the format comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemaFrom {
+    /// `schema_fields` is handed to the format, including nothing when the
+    /// config declared none. What `csv` and `ndjson` want.
+    #[default]
+    Config,
+    /// The format reads its own schema out of the response body, and that
+    /// schema must then equal `schema_fields` field for field. What `parquet`
+    /// and `avro` want, both of which reject a declared schema outright.
+    Body,
+}
+
 /// HTTP [`Source`]: one GET, decoded by a transformer, then EOF.
 ///
 /// The body is fetched once, on the first batch, and the source reports EOF
@@ -37,10 +57,10 @@ const CHANNEL_CAPACITY: usize = 4;
 ///
 /// [`schema`](Source::schema) reports the declared schema, or an empty one when
 /// the config declared none, and never changes: nothing can be known about a
-/// body that has not arrived. A workflow whose format carries its own schema
-/// (`parquet`, `avro`) therefore has no schema to validate the graph against,
-/// so a link into a processor that declares fields is rejected at build. Those
-/// formats belong in a Rust pipeline, where no graph check runs.
+/// body that has not arrived. A format that carries its own schema (`parquet`,
+/// `avro`) refuses a declared one, so it needs [`SchemaFrom::Body`]: the
+/// declared schema stays behind for the graph check and the body's own schema
+/// is compared against it once the body arrives.
 ///
 /// # Example
 ///
@@ -49,7 +69,7 @@ const CHANNEL_CAPACITY: usize = 4;
 /// use std::time::Duration;
 ///
 /// use arrow_schema::{DataType, Field, Schema};
-/// use pcs_connector_http::HttpSource;
+/// use pcs_connector_http::{HttpSource, SchemaFrom};
 /// use pcs_transformer_csv::CsvTransformer;
 ///
 /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -57,6 +77,7 @@ const CHANNEL_CAPACITY: usize = 4;
 /// let src = HttpSource::new(
 ///     "https://example.invalid/orders.csv",
 ///     Some(schema),
+///     SchemaFrom::Config,
 ///     Arc::new(CsvTransformer::new(true)),
 ///     vec![("accept".to_string(), "text/csv".to_string())],
 ///     Duration::from_secs(30),
@@ -69,10 +90,12 @@ pub struct HttpSource {
     /// Cloned onto every request: reqwest's `headers` takes the map by value.
     headers: HeaderMap,
     transformer: Arc<dyn Transformer>,
-    /// The schema the config declared, `None` when it declared none. Handed to
-    /// the format verbatim: csv requires it, parquet refuses it, ndjson infers
-    /// without it.
+    /// The schema the config declared, `None` when it declared none. What the
+    /// format is handed depends on [`SchemaFrom`]: `Config` hands it over
+    /// verbatim, `Body` withholds it so the body's own schema governs.
     declared: Option<Arc<Schema>>,
+    /// Where the schema handed to the format comes from.
+    schema_from: SchemaFrom,
     /// What [`Source::schema`] reports: `declared` when there is one, an empty
     /// schema when there is not. Resolved here so the accessor is one
     /// `Arc::clone`, and fixed for the source's lifetime.
@@ -89,20 +112,33 @@ impl HttpSource {
     ///
     /// `url` is fetched once, on the first batch. `declared` is the schema the
     /// config named, `None` when it named none; what that means is the
-    /// format's business. `headers` are sent with the request, and `timeout`
-    /// is the whole-request budget, connect through body.
+    /// format's business, and `schema_from` decides whether the format sees it
+    /// at all. `headers` are sent with the request, and `timeout` is the
+    /// whole-request budget, connect through body.
     ///
     /// # Errors
     ///
-    /// Returns [`PcsError::Configuration`] when a header name or value is
-    /// malformed, or when the HTTP client cannot be built. No request is made.
+    /// Returns [`PcsError::Configuration`] when [`SchemaFrom::Body`] is asked
+    /// for without a declared schema to check the body against, when a header
+    /// name or value is malformed, or when the HTTP client cannot be built. No
+    /// request is made.
     pub fn new(
         url: &str,
         declared: Option<Arc<Schema>>,
+        schema_from: SchemaFrom,
         transformer: Arc<dyn Transformer>,
         headers: Vec<(String, String)>,
         timeout: Duration,
     ) -> Result<Self, PcsError> {
+        // Without a declared schema there is nothing for `Source::schema` to
+        // report, so `validate_workflow_graph` would reject the link before a
+        // request is ever made. Refusing here names the missing key instead.
+        if schema_from == SchemaFrom::Body && declared.is_none() {
+            return Err(PcsError::configuration(
+                "HttpSource: schema_from \"body\" needs a 'schema_fields' list to check the \
+                 body's own schema against",
+            ));
+        }
         Ok(Self {
             client: client::build_client("HttpSource", timeout)?,
             url: url.to_string(),
@@ -113,6 +149,7 @@ impl HttpSource {
                 None => Arc::new(Schema::empty()),
             },
             declared,
+            schema_from,
             batches: None,
             estimated_rows: None,
         })
@@ -151,8 +188,11 @@ impl HttpSource {
         // Spooling and the metadata read are disk IO, and a parquet footer read
         // is a seek, so both happen off the executor.
         let transformer = Arc::clone(&self.transformer);
-        let declared = self.declared.clone();
-        let (mut reader, estimated_rows) = tokio::task::spawn_blocking(move || {
+        let declared = match self.schema_from {
+            SchemaFrom::Config => self.declared.clone(),
+            SchemaFrom::Body => None,
+        };
+        let (mut reader, body_schema, estimated_rows) = tokio::task::spawn_blocking(move || {
             // Unnamed: the OS reclaims the file when the last handle closes,
             // which is when the reader below is dropped.
             let mut spool = tempfile::tempfile()
@@ -164,11 +204,24 @@ impl HttpSource {
                 .rewind()
                 .map_err(|e| PcsError::generic(format!("HttpSource: spool rewind: {e}")))?;
             let reader = transformer.open_reader(spool, declared)?;
+            let schema = reader.schema();
             let estimated_rows = reader.estimated_rows();
-            Ok::<_, PcsError>((reader, estimated_rows))
+            Ok::<_, PcsError>((reader, schema, estimated_rows))
         })
         .await
         .map_err(|e| PcsError::generic(format!("HttpSource: spawn_blocking panic: {e}")))??;
+
+        // The graph was validated against the declared schema before the body
+        // existed, so a body carrying anything else is a configuration error
+        // rather than rows to cast.
+        if self.schema_from == SchemaFrom::Body && body_schema.fields() != self.schema.fields() {
+            return Err(PcsError::configuration(format!(
+                "HttpSource: body from {} carries schema [{}] but the config declared [{}]",
+                self.url,
+                render_fields(body_schema.fields()),
+                render_fields(self.schema.fields()),
+            )));
+        }
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         std::thread::spawn(move || {
@@ -199,6 +252,16 @@ impl HttpSource {
     fn transport_error(&self, error: &reqwest::Error) -> PcsError {
         PcsError::generic(format!("HttpSource: cannot GET {}: {error}", self.url))
     }
+}
+
+/// `Fields`'s own `Debug` is unreadable in an error a config author has to act
+/// on; this renders `name: data_type` pairs.
+fn render_fields(fields: &Fields) -> String {
+    fields
+        .iter()
+        .map(|f| format!("{}: {}", f.name(), f.data_type()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[async_trait]

@@ -23,6 +23,14 @@
 //! only that connection; the listener stays up and other producers are
 //! unaffected. Concurrent connections are accepted; ordering holds within a
 //! connection but not across them.
+//!
+//! Whether the format can decode a message at all is not a protocol violation
+//! but a property of the config, and the answer is the same for every
+//! connection. [`new`](TcpIngestSource::new) therefore asks the transformer
+//! for a decoder while building and hands the refusal back, the way
+//! `FileSource::open` asks its transformer for a reader. A source that
+//! deferred that answer would accept every connection, close it, and deliver
+//! nothing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,11 +75,13 @@ impl TcpIngestSource {
     /// backpressure reaches the producers. `max_frame_bytes` caps a single
     /// frame; a producer that announces more has its connection closed.
     /// `transformer` decodes each frame's payload; every accepted connection
-    /// opens its own decoder from it.
+    /// opens its own decoder from it, and one is opened here to settle whether
+    /// this format can decode a message against `schema` at all.
     ///
     /// # Errors
     ///
-    /// Returns [`PcsError::Configuration`] if `bind` cannot be bound.
+    /// Returns [`PcsError::Configuration`] if `transformer` cannot open a
+    /// message decoder for `schema`, or if `bind` cannot be bound.
     pub fn new(
         bind: &str,
         schema: Arc<Schema>,
@@ -79,6 +89,13 @@ impl TcpIngestSource {
         max_frame_bytes: usize,
         transformer: Arc<dyn Transformer>,
     ) -> Result<Self, PcsError> {
+        // Opening a decoder reads `schema` and nothing else, so every
+        // connection would get this same answer. Asking here is what makes a
+        // format with no message decoder a config error the caller is told
+        // about, rather than a listener that accepts, closes, and delivers
+        // nothing at all.
+        transformer.open_message_decoder(Arc::clone(&schema))?;
+
         let listener = std::net::TcpListener::bind(bind).map_err(|e| {
             PcsError::configuration(format!("TcpIngestSource: cannot bind '{bind}': {e}"))
         })?;
@@ -153,7 +170,9 @@ impl TcpIngestSource {
 /// the protocol.
 ///
 /// One decoder serves the whole connection: `flush` resets it, so a frame's
-/// batch never leaks into the next frame's.
+/// batch never leaks into the next frame's. [`TcpIngestSource::new`] already
+/// opened one off the same schema, so the open below fails only for a
+/// transformer that answers differently twice.
 async fn read_connection(
     mut stream: TcpStream,
     tx: mpsc::Sender<RecordBatch>,
@@ -281,5 +300,28 @@ mod tests {
             .err()
             .expect("bind must fail");
         assert_eq!(err.category(), "configuration", "got: {err}");
+    }
+
+    /// A stream-only format: every message method keeps the trait's
+    /// `unsupported` default, exactly as `csv` and `parquet` do.
+    struct StreamOnly;
+
+    impl Transformer for StreamOnly {
+        fn format(&self) -> &'static str {
+            "stream-only"
+        }
+    }
+
+    #[test]
+    fn new_rejects_a_format_with_no_message_decoder() {
+        let err = TcpIngestSource::new("127.0.0.1:0", test_schema(), 4, 1024, Arc::new(StreamOnly))
+            .err()
+            .expect("a format with no message decoder must be refused");
+        assert_eq!(err.category(), "configuration", "got: {err}");
+        assert!(
+            err.message()
+                .contains("does not support decoding discrete messages"),
+            "got: {err}"
+        );
     }
 }

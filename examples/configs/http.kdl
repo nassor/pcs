@@ -62,10 +62,11 @@ workflow "orders" {
                 // authorization "Bearer ${PCS_HTTP_TOKEN:-unset}"
             }
 
-            // csv carries no schema, so the declared one is required. A format
-            // that carries its own (parquet, avro) refuses this key, and with
-            // it the workflow graph has no source schema to check, so those
-            // formats want a Rust pipeline rather than a config.
+            // csv carries no schema, so the declared one is handed to it. A
+            // format that carries its own (parquet, avro) refuses this key, so
+            // a source over one adds schema_from "body": the fields below stay
+            // behind for the workflow graph check and are compared against the
+            // schema the body turned out to carry.
             schema_fields "id" type="int64" nullable=#false
             schema_fields "total" type="float64" nullable=#true
         }

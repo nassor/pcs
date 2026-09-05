@@ -164,19 +164,20 @@ to reach for depends on why you're running tests:
   `tests/common/memory_store.rs`.
 - `cargo nextest run --workspace --all-features --profile ci --run-ignored all` (the `ci`
   profile): the full suite, including everything `default` skips and any `#[ignore]`d test (today,
-  `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
+  `pcs-service`'s lib unit test `test_second_init_returns_error` (a global-tracing-subscriber
+  race), `distributed_integration_chaos.rs`'s `full_stack_chaos_monkey_60s`, a ~70-100s five-node
   Raft-cluster-behind-Toxiproxy chaos run asserting that every node converges on the same applied
   index and that the term advances under combined latency, bandwidth, reset and partition faults,
   plus `connector_matrix.rs`'s `full_matrix`: `ci`'s `default-filter = "all()"` carries none of
   `default`'s exclusions, so this command also pays for the matrix's four containers).
   This is the full suite to run as the last verification step of a plan, not something to reach
-  for on every edit. `ci.yml` splits it in two: the `test`
-  job runs `--profile ci` without `--run-ignored`, and a separate `distributed_chaos` job runs
-  only `full_stack_chaos_monkey_60s` (`--test distributed_integration_chaos --run-ignored
-  ignored-only`), so that one ~70-100s test never sits on `test`'s critical path. Regenerating or
-  reordering the Docker/chaos exclusion list itself lives only in `.config/nextest.toml`; nothing
-  here restates it, so that file is the one place to update when a test moves between the two
-  profiles.
+  for on every edit. `ci.yml` splits it into three: the `test` job runs `--profile ci` without
+  `--run-ignored`, a separate `distributed_chaos` job runs only `full_stack_chaos_monkey_60s`
+  (`--test distributed_integration_chaos --run-ignored ignored-only`), and a separate
+  `connector_matrix` job runs only `full_matrix`, so that neither test ever sits on `test`'s
+  critical path. Regenerating or reordering the Docker/chaos exclusion list itself lives only in
+  `.config/nextest.toml`; nothing here restates it, so that file is the one place to update when a
+  test moves between the two profiles.
 - `crates/pcs-service/tests/connector_matrix.rs` (the `heavy-docker` test group, `ci.yml`'s
   `connector_matrix` job): covers 1152 cases, one per `{source connector, sink connector, byte
   format, processor runtime}` tuple over 8 connectors on each end, 6 formats (the five

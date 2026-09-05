@@ -16,6 +16,7 @@ target needs `-p <crate>`.
 cargo build                                                  # Build (workspace default members)
 cargo nextest run --workspace --all-features                 # Fast suite: skips Docker/chaos tests, run this constantly
 cargo nextest run --workspace --all-features --profile ci --run-ignored all  # Full suite, what CI runs; last step of a plan
+cargo nextest run -p pcs-service --all-features --profile ci --test connector_matrix --run-ignored ignored-only  # Connector matrix; --profile ci required since --test can't bypass default's exclusion, see Testing below
 cargo test --workspace --all-features --doc                  # Doc tests (nextest does not run these)
 cargo fmt --all -- --check                                   # Check formatting
 cargo clippy --all-targets --all-features -- -D warnings     # Lint (warnings are errors)
